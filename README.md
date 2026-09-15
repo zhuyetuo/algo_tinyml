@@ -61,6 +61,7 @@ tests/                   C ↔ Python 逐位对照（现场用 gcc 编）
 docs/chip_choice.md      芯片选型
 docs/rf_size.md          RF 体积怎么算、要不要量化剪枝
 docs/frameworks.md       Cortex-M4F 上有哪些推理框架、为什么我们都没用
+docs/market.md           市面上的项圈（FitBark/Fi/Tractive/Maven/Whistle）是不是端侧推理
 ```
 
 **训练框架跟板上那一侧是隔离的**：`train_torch.py` 最后只交出一个
