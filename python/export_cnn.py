@@ -27,6 +27,7 @@ from tinyml import export, forward_int, forward_int_batch, quantize  # noqa: E40
 from tinyml.progress import bar, chunks  # noqa: E402
 from tinyml.export_c import _arena_bytes  # noqa: E402
 from tinyml.torch_import import load_cnn, normalize  # noqa: E402
+from event_eval import check_ordered, match_events, prf, to_events  # noqa: E402
 
 
 def _need(path, flag):
@@ -59,6 +60,9 @@ def main():
     ap.add_argument("--calib", type=int, default=256,
                     help="拿多少条做量化校准。**从留出集里分层抽**，不是取前 N 条")
     ap.add_argument("--golden", type=int, default=16)
+    ap.add_argument("--focus", default="抓挠", help="事件级指标盯哪一类")
+    ap.add_argument("--min-windows", type=int, default=3)
+    ap.add_argument("--max-gap", type=int, default=2)
     args = ap.parse_args()
 
     net, meta = load_cnn(_need(args.pt, "--pt"), args.json or None)
@@ -117,6 +121,35 @@ def main():
     print(f"输入饱和比例 {sat:.4f}"
           + ("   ← 偏高，校准集可能没覆盖到剧烈动作" if sat > 0.02 else ""))
 
+    # ── 事件级 ────────────────────────────────────────────────────────────
+    # 窗口级的 F1 跟产品关心的事情不是一回事。产品问的是"这次抓挠报到了吗"，
+    # 而一次抓挠横跨好几个窗口——窗口级把它算成好几次，事件级算一次。
+    # **RF 那边报的是事件级 0.788**，不换成同一口径就没法比。
+    if args.focus in classes:
+        fc = classes.index(args.focus)
+        run, err = check_ordered(y, fc)
+        if err:
+            print(f"\n事件级跳过：{err}")
+        elif run < 1.5:
+            # 打乱过的数据做事件聚合毫无意义：每个窗口都是独立的一段，
+            # 聚合出来的"事件"是伪造的。宁可不报，也不能报一个假的数
+            print(f"\n事件级跳过：目标类别平均游程只有 {run:.2f} 个窗口，"
+                  "留出集看起来不是按时间排的")
+        else:
+            print(f"\n事件级（min_windows={args.min_windows}, "
+                  f"max_gap={args.max_gap}，目标「{args.focus}」）：")
+            true_ev = to_events(y == fc, args.min_windows, args.max_gap)
+            print(f"{'':<8}{'报':>5}{'真值':>6}{'对':>5}{'误报':>6}{'漏':>5}"
+                  f"{'事件P':>8}{'事件R':>8}{'事件F1':>9}")
+            for tag, pred in (("float", f_pred), ("int8", q_pred)):
+                ev = to_events(pred == fc, args.min_windows, args.max_gap)
+                tp, fp, fn = match_events(ev, true_ev)
+                p, r, f1 = prf(tp, fp, fn)
+                print(f"{tag:<8}{len(ev):>5}{len(true_ev):>6}{tp:>5}{fp:>6}{fn:>5}"
+                      f"{p:>8.3f}{r:>8.3f}{f1:>9.3f}")
+    else:
+        print(f"\n事件级跳过：--focus「{args.focus}」不在类别里（{','.join(classes)}）")
+
     # ── 体积和 RAM ────────────────────────────────────────────────────────
     n_w = sum(int(l.w.size) for l in qnet.layers if hasattr(l, "w"))
     n_b = sum(int(l.bias.size) * 3 for l in qnet.layers if hasattr(l, "bias"))  # bias+mult+shift
@@ -127,22 +160,39 @@ def main():
     print(f"推理 RAM（乒乓缓冲）：{arena:,} B（{arena / 1024:.1f} KB）")
     print("  权重是 const，进 flash 不占 RAM。这里的 RAM 只有中间张量。")
 
+    # 逐层拆开。**不拆的话"模型太大"只能靠砍整体宽度来解决**，而实际上
+    # 一维卷积的权重是 out_ch × in_ch × k，最后一层通常一家独大——
+    # 只动那一层能省掉大部分体积，前面几层的感受野和通道数都不用动。
+    print(f"\n逐层：{'层':<16}{'权重 B':>12}{'占比':>8}")
+    for i, l in enumerate(qnet.layers):
+        if not hasattr(l, "w"):
+            continue
+        nm = f"dense {l.w.shape[1]}→{l.w.shape[0]}" if l.w.ndim == 2 else \
+            f"conv {l.w.shape[1]}→{l.w.shape[0]} k{l.w.shape[2]}"
+        print(f"      {nm:<16}{l.w.size:>12,}{100.0 * l.w.size / n_w:>7.1f}%")
+    if flash > 131072:
+        print(f"\n⚠ 超出 128 KB 预算 {flash - 131072:,} B。占比最大的那一层"
+              "减半，体积大约也减半——但那要**重训**，不是导出时能做的。")
+
     os.makedirs(args.out, exist_ok=True)
     picked = [qnet.quantize_input(Xn[i]) for i in
               rng.choice(len(Xn), size=min(args.golden, len(Xn)), replace=False)]
     if len({int(np.argmax(forward_int(qnet, x)[0])) for x in picked}) < 2:
         print("⚠ golden vector 全落在同一类上——逐位比对仍然有效，但验不到不同判决路径")
-    for name, content in export(qnet, golden_x_i8=np.stack(picked)).items():
+    for name, content in export(qnet, golden_x_i8=np.stack(picked),
+                            prep=meta).items():
         p = os.path.join(args.out, name)
         with open(p, "w", encoding="utf-8") as f:
             f.write(content)
         print("写出", p)
 
-    print(f"""
-注意 **ch_mean / ch_std 没有导进 C**：端上要在量化之前做同一套逐通道 z-score，
-否则输入分布跟训练时对不上——效果明显下降但不报错。这两个数组在
-{os.path.splitext(args.pt)[0]}.json 里，下一步要把它和输入量化一起做成
-一个定点算子。在那之前，这里导出的 C 只有网络本身，**不是完整的端侧管线**。""")
+    print("""
+端上的调用顺序（ch_mean/ch_std 已经导进 tm_model.c 了）：
+    tm_prep(&tm_model_prep, window_float, x_i8);   /* 逐通道 z-score + 量化 */
+    tm_invoke(&tm_model, x_i8, out, arena, TM_ARENA_BYTES);
+    int cls = tm_argmax(out, TM_N_CLASSES);
+tm_prep 跟 Python 侧逐位一致（tests/test_prep_c.py 钉着），少了它输入分布
+会跟训练时对不上——效果掉一截而且不报错。""")
 
 
 if __name__ == "__main__":
