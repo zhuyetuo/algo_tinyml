@@ -138,7 +138,14 @@ ARCH_FLAGS := -mcpu=cortex-m4 -mthumb -mthumb-interwork -mapcs-frame \
 # -fno-fast-math / -fno-unsafe-math-optimizations：显式写出来，防止以后有人在
 # 上层 Makefile 里塞 -ffast-math。-ffast-math 会假定没有 NaN/Inf、允许重排浮点
 # 运算，那时候 golden vector 会全红，而人第一反应多半是去怀疑模型。
+#
+# -fno-math-errno：让 sqrtf 编译成单条 vsqrt.f32 指令，而不是调 libm。
+# 实测代码小 72 字节、还少一次函数调用，而且 **结果一个 bit 都不变**——
+# IEEE 规定 sqrt 必须正确舍入，硬件指令和 libm 给的是同一个数。
+# 这一条在 tests/test_features_c.py 的编译选项里也加了，所以"不变"是验过的不是猜的。
+# 注意它跟 -ffast-math **不是一回事**：那个会重排浮点运算，golden vector 会全红。
 FP_FLAGS := -ffp-contract=off -fno-fast-math -fno-unsafe-math-optimizations
+FP_FLAGS += -fno-math-errno
 
 # -Os 而不是 -O2：实测 tm_features.c 在 -O2 下代码大 23%（3884 vs 3152 字节），
 # 而这段一两秒才跑一次，快那点没意义。要改先量，别凭感觉。

@@ -206,3 +206,47 @@ def test_剪得越狠节点数只减不增():
     counts = [len(from_sklearn(m, max_depth=d).node_feature) for d in (1, 2, 3, 4, 5, 6)]
     assert counts == sorted(counts), counts
     assert len(from_sklearn(m).node_feature) == counts[-1], "不限深应该等于剪到最深"
+
+
+def test_特征分组完整覆盖且不重叠():
+    """砍特征只能按计算组砍。分组表要是漏了或者重叠了，"砍掉第 N 组"就会
+    砍到不相干的维度上，而且不会报错——只会让模型输入悄悄变形。"""
+    from tinyml.features import feature_groups, n_features
+    for n_ch in (6, 8):
+        groups = feature_groups(n_ch)
+        covered = []
+        for _, a, b, _ in groups:
+            covered.extend(range(a, b))
+        assert covered == sorted(covered), "分组的下标没有按顺序排"
+        assert covered == list(range(n_features(n_ch))), (
+            f"{n_ch} 通道：分组覆盖 {len(covered)} 维，总共 {n_features(n_ch)} 维")
+
+
+def test_分组的边界跟实际拼接顺序一致():
+    """分组表是手写的，extract_one 的拼接顺序是代码里的。两者分家的话，
+    "acc_x 频域"那一组实际指向的可能是别的东西。这里用一个可辨识的构造去对：
+    把某一组之外的输入全置零，看该组的特征是不是真的只跟那一段输入有关。"""
+    import numpy as np
+    from tinyml.features import extract_one, feature_groups
+    n_ch, n_t, hz = 8, 32, 16.0
+    rng = np.random.default_rng(0)
+    base = rng.normal(0, 1, size=(n_t, n_ch)).astype(np.float32)
+    f_base = extract_one(base, hz)
+
+    groups = {nm: (a, b) for nm, a, b, _ in feature_groups(n_ch)}
+    # 只改 gyr_x（通道 3），那么 gyr_x 的时域/频域组必须变，
+    # 而 acc_x 的时域组必须一点都不变
+    mod = base.copy()
+    mod[:, 3] += np.float32(5.0)
+    f_mod = extract_one(mod, hz)
+
+    a, b = groups["gyr_x 时域"]
+    assert not np.array_equal(f_base[a:b], f_mod[a:b]), "改了 gyr_x，它的时域组却没变"
+    a, b = groups["gyr_x 频域"]
+    assert not np.array_equal(f_base[a:b], f_mod[a:b]), "改了 gyr_x，它的频域组却没变"
+    a, b = groups["acc_x 时域"]
+    assert np.array_equal(f_base[a:b], f_mod[a:b]), "改了 gyr_x，acc_x 的时域组不该变"
+    a, b = groups["acc 模长 时域"]
+    assert np.array_equal(f_base[a:b], f_mod[a:b]), "改了 gyr_x，acc 模长不该变"
+    a, b = groups["gyro 模长 时域"]
+    assert not np.array_equal(f_base[a:b], f_mod[a:b]), "改了 gyr_x，gyro 模长该变"
