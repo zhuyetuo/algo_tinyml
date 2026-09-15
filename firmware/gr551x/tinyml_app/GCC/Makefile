@@ -36,6 +36,8 @@ GEN_DIR     ?= ../../../generated
 ### 我们自己的源文件
 #########################################################################################
 PRJ_C_SRC_FILES := \
+    ../Src/platform/user_periph_setup.c \
+    ../Src/user/main.c \
     $(TINYML_ROOT)/tm_runtime.c \
     $(TINYML_ROOT)/tm_window.c \
     $(TINYML_ROOT)/tm_forest.c \
@@ -49,9 +51,54 @@ PRJ_C_SRC_FILES += $(wildcard $(GEN_DIR)/tm_model.c)
 PRJ_C_SRC_FILES += $(wildcard $(GEN_DIR)/tm_forest_model.c)
 PRJ_C_SRC_FILES += $(wildcard $(GEN_DIR)/tm_feat_cfg.c)
 
+#########################################################################################
+### SDK 侧的源文件。这一串抄自 SDK 示例工程 ble_app_hrs 的 Makefile，砍掉了这个工程
+### 用不到的（各种 profile、GUI、按键）。**一个文件都不复制进仓库**，全部用
+### SDK_ROOT 指过去。
+#########################################################################################
+S := $(SDK_ROOT)
+SDK_C_SRC_FILES := \
+    $(S)/platform/soc/common/gr_system.c \
+    $(S)/platform/soc/common/gr_interrupt.c \
+    $(S)/platform/soc/common/gr_platform.c \
+    $(S)/platform/soc/src/gr_soc.c \
+    $(S)/platform/boards/board_SK.c \
+    $(S)/drivers/src/app_dma.c \
+    $(S)/drivers/src/app_gpiote.c \
+    $(S)/drivers/src/app_io.c \
+    $(S)/drivers/src/app_pwr_mgmt.c \
+    $(S)/drivers/src/app_uart.c \
+    $(S)/drivers/src/app_uart_dma.c \
+    $(S)/components/libraries/utility/utility.c \
+    $(S)/components/libraries/app_timer/app_timer.c \
+    $(S)/components/libraries/app_key/app_key.c \
+    $(S)/components/libraries/app_key/app_key_core.c \
+    $(S)/components/libraries/hal_flash/hal_flash.c \
+    $(S)/components/libraries/app_log/app_log.c \
+    $(S)/components/libraries/app_assert/app_assert.c \
+    $(S)/components/libraries/app_error/app_error.c \
+    $(S)/components/libraries/app_error/cortex_backtrace.c \
+    $(S)/components/libraries/ring_buffer/ring_buffer.c \
+    $(S)/components/libraries/pmu_calibration/pmu_calibration.c \
+    $(S)/components/libraries/fault_trace/fault_trace.c \
+    $(S)/components/sdk/ble.c \
+    $(S)/external/segger_rtt/SEGGER_RTT.c
+
+SDK_INC := \
+    $(S)/components/boards $(S)/components/libraries/app_assert \
+    $(S)/components/libraries/app_error $(S)/components/libraries/app_log \
+    $(S)/components/libraries/app_timer $(S)/components/libraries/fault_trace \
+    $(S)/components/libraries/app_key \
+    $(S)/components/libraries/hal_flash $(S)/components/libraries/pmu_calibration \
+    $(S)/components/libraries/ring_buffer $(S)/components/libraries/utility \
+    $(S)/components/patch/ind $(S)/components/profiles/common $(S)/components/sdk \
+    $(S)/drivers/inc $(S)/drivers/inc/hal $(S)/external/segger_rtt \
+    $(S)/platform/arch/arm/cortex-m/cmsis/core/include \
+    $(S)/platform/boards $(S)/platform/include $(S)/platform/soc/include
+
 PRJ_C_INCLUDE_PATH := \
     ../Src/config ../Src/platform ../Src/user \
-    $(TINYML_ROOT) $(GEN_DIR)
+    $(TINYML_ROOT) $(GEN_DIR) $(SDK_INC)
 
 # 带哪条路线由**导出了哪些文件**决定，不用手工改宏。手工改的话迟早出现
 # "导了 RF 但宏还指着 CNN"，而那时候自检会报 NO_VECTORS 而不是编译错——
@@ -64,6 +111,9 @@ ROUTE_DEFINES += -DTM_HAS_RF
 endif
 ifneq ($(wildcard $(GEN_DIR)/tm_forest_golden.h),)
 ROUTE_DEFINES += -DTM_HAS_RF_GOLDEN
+endif
+ifneq ($(wildcard $(GEN_DIR)/tm_pipeline_golden.h),)
+ROUTE_DEFINES += -DTM_HAS_PIPELINE_GOLDEN
 endif
 
 #########################################################################################
@@ -96,7 +146,9 @@ OPT ?= -Os
 
 CFLAGS  = -std=gnu99 $(ARCH_FLAGS) $(FP_FLAGS) $(OPT)
 CFLAGS += -ffunction-sections -fdata-sections -gdwarf-2 -MD
-CFLAGS += -Wall -Wextra
+# 警告只对**我们自己的**代码开。SDK 的一大堆 unused-parameter 不是我们该修的，
+# 混在一起只会把自己的警告淹掉——而自己的警告才是会咬人的那些
+OUR_WARN := -Wall -Wextra
 CFLAGS += $(foreach inc,$(PRJ_C_INCLUDE_PATH),-I$(inc))
 CFLAGS += $(ROUTE_DEFINES)
 
@@ -120,7 +172,18 @@ SELFTEST_SRC := $(TINYML_ROOT)/tm_runtime.c $(TINYML_ROOT)/tm_forest.c \
                 $(wildcard $(GEN_DIR)/tm_forest_model.c) \
                 $(wildcard $(GEN_DIR)/tm_feat_cfg.c)
 
-.PHONY: all selftest size clean objs
+LDFLAGS += -Wl,--gc-sections
+LDFLAGS += -L$(S)/components/libraries/app_crypto/gcc/ -lapp_crypto
+LDFLAGS += -L$(S)/platform/soc/linker/gcc/ -lble_sdk
+LDFLAGS += --specs=nano.specs --specs=nosys.specs
+
+LINK_SCRIPT := $(S)/platform/soc/linker/gcc/gcc_linker_$(CHIP).lds
+PATCH_FILE  := $(S)/platform/soc/linker/gcc/rom_symbol_gcc.txt
+STARTUP_ASM := $(S)/platform/arch/arm/cortex-m/gcc/startup_gr55xx.s
+
+ALL_C_SRC := $(PRJ_C_SRC_FILES) $(SDK_C_SRC_FILES)
+
+.PHONY: all selftest size clean objs firmware
 
 ## 只编译成 .o 并报体积。完整链接需要 SDK 的启动文件、链接脚本和 libble_sdk.a，
 ## 那一步在有 SDK 的机器上做；这里先把"我们这部分编不编得过、占多少"确定下来。
@@ -128,7 +191,7 @@ objs:
 	@mkdir -p $(BUILD)
 	@for f in $(PRJ_C_SRC_FILES); do \
 	    echo "  CC $$f"; \
-	    $(CC) $(CFLAGS) -c $$f -o $(BUILD)/$$(basename $$f .c).o || exit 1; \
+	    $(CC) $(CFLAGS) $(OUR_WARN) -c $$f -o $(BUILD)/$$(basename $$f .c).o || exit 1; \
 	done
 	@echo ""
 	@$(SIZE) $(BUILD)/*.o
@@ -139,14 +202,30 @@ objs:
 
 size: objs
 
-all: objs
+## 完整固件：链出 .elf / .bin / .hex
+firmware:
+	@mkdir -p $(BUILD)/obj
+	@for f in $(PRJ_C_SRC_FILES); do \
+	    o=$(BUILD)/obj/$$(echo $$f | md5sum | cut -c1-8)_$$(basename $$f .c).o; \
+	    $(CC) $(CFLAGS) $(OUR_WARN) -c $$f -o $$o || exit 1; \
+	done
+	@for f in $(SDK_C_SRC_FILES); do \
+	    o=$(BUILD)/obj/$$(echo $$f | md5sum | cut -c1-8)_$$(basename $$f .c).o; \
+	    $(CC) $(CFLAGS) -w -c $$f -o $$o || exit 1; \
+	done
+	@$(CC) $(CFLAGS) -c $(STARTUP_ASM) -o $(BUILD)/obj/startup.o
+	@$(CC) $(CFLAGS) -T $(LINK_SCRIPT) $(PATCH_FILE) $(BUILD)/obj/*.o $(LDFLAGS) \
+	    -Wl,-Map=$(BUILD)/$(MAKE_TARGET_NAME).map -o $(BUILD)/$(MAKE_TARGET_NAME).elf
+	@$(OBJCOPY) -O binary $(BUILD)/$(MAKE_TARGET_NAME).elf $(BUILD)/$(MAKE_TARGET_NAME).bin
+	@$(OBJCOPY) -O ihex   $(BUILD)/$(MAKE_TARGET_NAME).elf $(BUILD)/$(MAKE_TARGET_NAME).hex
 	@echo ""
-	@echo "完整固件的链接要在有 SDK 的机器上做，照 SDK 示例工程的做法："
-	@echo "  1. 复制 $(SDK_ROOT)/projects/ble/ble_peripheral/ble_app_gus 一份；"
-	@echo "  2. 把上面这些 .c 和 include 路径加进它的 GCC/Makefile；"
-	@echo "  3. 在它的 COMMON_COMPILE_FLAGS 里加上 $(FP_FLAGS)；  ← 别漏"
-	@echo "  4. 链接脚本用 GCC/gcc_linker_$(CHIP).lds。"
-	@echo "详见 ../../README.md。"
+	@$(SIZE) $(BUILD)/$(MAKE_TARGET_NAME).elf
+	@echo ""
+	@echo "  GR5513BENDU: 512KB Flash / 128KB RAM（链接脚本留给应用 112KB）。"
+	@echo "  注意链接脚本的 FLASH 区写的是 8MB（内存映射窗口），**超出 512KB"
+	@echo "  链接不会报错**，所以要自己看上面 text 那个数。"
+
+all: firmware
 
 clean:
 	rm -rf $(BUILD)

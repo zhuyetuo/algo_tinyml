@@ -176,9 +176,10 @@ for (int i = 0; i < TM_GOLDEN_N; i++) {
 
 - **没有真实模型。** 测试跑的是随机权重——工具链是验过的，模型还没训。要
   `imu_train` 那边先定下端侧用哪几类、窗口多长。
-- **没有真正链出 .bin。** GR551x 的工程接入做了（`firmware/gr551x/`，已用
-  `arm-none-eabi-gcc` 交叉编译验过：我们这部分 5.6KB flash / 2.3KB RAM），但完整
-  链接要 SDK 的启动文件、`libble_sdk.a` 和板级配置，得在装了 SDK 的机器上做。
+- ~~没有真正链出 .bin~~ **链得出来，实测过**：用 `arm-none-eabi-gcc 13.2` 对着真
+  SDK 链出了 `tinyml_app.bin`。基线（BLE 协议栈+最小应用）104KB flash / 22KB RAM，
+  加上整条 tinyml 是 136KB / 25KB。细节和坑见
+  [firmware/gr551x/README.md](firmware/gr551x/README.md)。
 - **没有 QMI8658B 的驱动。** 寄存器配置（量程、ODR、FIFO 水位）要对着手册写，
   写错了表现成"特征量纲不对、模型全错"，没凭印象写。
 - **没做性能优化。** 算子是最朴素的三重循环，没用 CMSIS-NN、没用 M4F 的 DSP 指令。
