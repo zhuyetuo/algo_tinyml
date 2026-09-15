@@ -27,6 +27,26 @@ from tinyml.export_forest_c import export  # noqa: E402
 from tinyml.forest import flash_bytes, from_sklearn  # noqa: E402
 
 
+
+def resolve_model(path):
+    """把 --model 的路径解析清楚，不存在就给一条**能照着改**的报错。
+
+    这些脚本在 algo_tinyml 目录下跑，而模型在 imu_train 里——相对路径会解析到
+    algo_tinyml 下面去。直接交给 joblib 的话只会甩一个 FileNotFoundError 的
+    traceback，看不出是"路径写错了"还是"模型没训出来"。
+    """
+    p = os.path.expanduser(path)
+    if os.path.exists(p):
+        return p
+    hint = ""
+    if not os.path.isabs(p):
+        hint = (f"\n  注意这是相对路径，会解析成 {os.path.abspath(p)}。"
+                "\n  模型在 imu_train 里的话要写全：~/imu_train/results/...")
+    guess = os.path.expanduser("~/imu_train/results")
+    if os.path.isdir(guess):
+        hint += f"\n  ~/imu_train/results/ 下现有：{', '.join(sorted(os.listdir(guess))[:5]) or '（空）'}"
+    sys.exit(f"找不到模型文件：{p}{hint}")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -45,7 +65,7 @@ def main():
     except ImportError:
         sys.exit("没装 joblib/sklearn。这个脚本要在训练机上跑。")
 
-    bundle = joblib.load(args.model)
+    bundle = joblib.load(resolve_model(args.model))
     model = bundle.get("model", bundle) if isinstance(bundle, dict) else bundle
     names = [s for s in args.classes.split(",") if s] or None
     forest = from_sklearn(model, class_names=names)
