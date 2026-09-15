@@ -23,7 +23,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from tinyml.forest import flash_bytes, from_sklearn  # noqa: E402
+from tinyml.forest import (  # noqa: E402
+    compact_flash_bytes, flash_bytes, from_sklearn, quantize_leaves,
+)
 
 
 
@@ -117,6 +119,13 @@ def main():
                          "GBDT 不行，那边树是顺序的。")
     ap.add_argument("--depth-with-trees", type=int, default=0,
                     help="扫棵数时固定用这个 max_depth（配合 --trees）")
+    ap.add_argument("--grid", action="store_true",
+                    help="扫 棵数 × 深度 的联合网格，用紧凑编码 + uint8 叶子算体积。"
+                         "**两个轴是相乘的**，单轴曲线看不出可行点")
+    ap.add_argument("--grid-trees", default="5,10,20,40",
+                    help="网格的棵数轴")
+    ap.add_argument("--grid-depths", default="6,8,10,12",
+                    help="网格的深度轴")
     ap.add_argument("--min-samples-leaf", default="",
                     help="另外扫一遍 min_samples_leaf，逗号分隔（比如 1,5,10,20）")
     args = ap.parse_args()
@@ -175,6 +184,41 @@ def main():
         print(f"\n按棵数剪{tag_d}（RF 的树独立同分布，取前 n 棵是合法的）：")
         for n in trees:
             report(f"{n} 棵", from_sklearn(model, max_depth=d, n_trees=n))
+
+    if args.grid:
+        grid_trees = [int(v) for v in args.grid_trees.split(",") if v]
+        grid_depths = [int(v) for v in args.grid_depths.split(",") if v]
+        print(f"""
+════ 联合网格：棵数 × 深度，紧凑编码 + uint8 叶子 ════
+
+前面那两张表各自只动一个轴，而**两个轴是相乘的**——所以单看任何一条曲线都会
+得出"塞不下"的结论，哪怕网格里存在塞得下的点。这张表把两个轴一起扫。
+
+编码也换了：节点 6 B（跟 GBDT 那边同一套 AoS），叶子 uint8。
+叶子那一刀是大头——{n_cls} 分类下 float32 叶子是 {n_cls * 4} B，uint8 是 {n_cls} B。
+下面的 macro-F1 是**量化之后实测的**，不是原模型的数。""")
+        rows = []
+        for n in grid_trees:
+            for d in grid_depths:
+                f = quantize_leaves(from_sklearn(model, max_depth=d, n_trees=n))
+                b = sum(compact_flash_bytes(f, leaf_bits=8).values())
+                s = None
+                if X is not None:
+                    s = _macro_f1(y, np.array([f.predict(x) for x in X]), n_cls)
+                rows.append((n, d, b, s))
+                print(f"  {n:>3} 棵 × 深 {d:>2}   {b:>9,} B ({b / 1024:>7.1f} KB)"
+                      + ("  塞得下" if b <= args.budget else f"  超 {b / args.budget:.1f}×")
+                      + (f"   macro-F1 {s:.4f}" if s is not None else ""))
+        fits = [r for r in rows if r[2] <= args.budget and r[3] is not None]
+        print()
+        if fits:
+            best = max(fits, key=lambda r: r[3])
+            print(f"预算内最好的一格：{best[0]} 棵 × 深 {best[1]}，"
+                  f"{best[2] / 1024:.1f} KB，macro-F1 {best[3]:.4f}")
+            print("  这是**就地截断**的数。按这组参数重训一次通常还能再好一点，"
+                  "因为训练时限深会挑更适合浅树的分裂点。")
+        else:
+            print("网格里没有一格塞得下。要么把网格往更小推，要么这条路到此为止。")
 
     msl = [int(v) for v in args.min_samples_leaf.split(",") if v]
     if msl:
