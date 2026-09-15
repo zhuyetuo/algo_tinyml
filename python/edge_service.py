@@ -73,33 +73,68 @@ def add_imu_train(repo):
     if not os.path.exists(need):
         sys.exit(f"{repo} 看起来不是 imu_train 仓库（没有 {need}）。\n"
                  "  用 --imu-train 指对路径。")
-    for p in (os.path.join(repo, "src"), os.path.join(repo, "src", "data"),
-              os.path.join(repo, "label_service")):
+    # **label_service 绝对不能进 sys.path**，见 load_postprocess 的说明。
+    for p in (os.path.join(repo, "src"), os.path.join(repo, "src", "data")):
         if p not in sys.path:
             sys.path.insert(0, p)
+    _LS["repo"] = repo
     return repo
 
 
-def load_postprocess():
-    """拿 label_service 那份后处理，**不重写一份**。
+# imu_train 仓库路径（load_postprocess 要用）。模块级变量而不是参数，
+# 是因为 stabilize() 那条路上拿不到它，而多穿一层只为了传个常量不划算。
+_LS = {"repo": None, "mods": None}
 
-    stable / viterbi 是 algo_service（= imu_train/label_service）的后处理。
-    端侧模型要跟它"处理机制一样、只是模型不同"，唯一正确的做法是调同一份代码——
-    照着抄一份的话，两边的参数、滞回门槛、合并规则迟早分家，
-    而分家之后"模型对比"比的就不只是模型了，还混着后处理的差异，
+
+def load_postprocess():
+    """拿 label_service 那份后处理，**不重写一份，也不进 sys.path**。
+
+    为什么是同一份代码：stable / viterbi 是 algo_service（= imu_train/
+    label_service）的后处理。端侧模型要跟它"处理机制一样、只是模型不同"，
+    唯一正确的做法是调同一份代码——抄一份的话滞回门槛、合并规则、最短时长
+    迟早分家，而分家之后"模型对比"比的就不只是模型了，
     **而那个差异不会显示在任何地方**。
 
+    为什么按文件路径加载、而不是把 label_service 塞进 sys.path：
+    **那个目录里有个 queue.py，会把标准库的 queue 整个盖掉。**
+    表现是别处一句无辜的 `from queue import Empty` 变成
+
+        ImportError: cannot import name 'Empty' from 'queue'
+              (/home/toky/imu_train/label_service/queue.py)
+
+    而报错的地方跟"端侧后处理"看不出任何关系。第一版就是这么挂的，
+    80 个样本全军覆没。同目录里还有 pool.py / jobs.py / skin.py 这类
+    很容易撞名的模块，所以这里连"只加一次"都不做——一个都不加。
+
+    模块名带 `_ls_` 前缀塞进 sys.modules，也是为了不跟别的 config 撞。
     label_service 是线上服务，这里只读不改。
     """
-    try:
-        import config as ls_config          # label_service/config.py
-        import postprocess as ls_post       # label_service/postprocess.py
-    except ImportError as e:
-        raise SystemExit(
-            f"import 不到 label_service 的后处理（{e}）。\n"
-            "  stable/viterbi 要复用 imu_train/label_service/postprocess.py，"
-            "--imu-train 指对了吗？")
-    return ls_config, ls_post
+    if _LS["mods"]:
+        return _LS["mods"]
+    import importlib.util
+
+    repo = _LS["repo"]
+    if not repo:
+        raise SystemExit("还没调 add_imu_train()，不知道 label_service 在哪")
+    d = os.path.join(repo, "label_service")
+    mods = []
+    for name in ("config", "postprocess"):
+        src = os.path.join(d, f"{name}.py")
+        if not os.path.exists(src):
+            raise SystemExit(
+                f"找不到 {src}。\n"
+                "  stable/viterbi 要复用 imu_train/label_service 那份后处理，"
+                "--imu-train 指对了吗？")
+        spec = importlib.util.spec_from_file_location(f"_ls_{name}", src)
+        m = importlib.util.module_from_spec(spec)
+        # 先登记再执行：postprocess.py 里是 `from __future__ import annotations`
+        # 加标准库，不 import 兄弟模块，所以这里不需要互相可见。
+        # 但登记一下，重复加载时能命中缓存
+        sys.modules[f"_ls_{name}"] = m
+        spec.loader.exec_module(m)
+        mods.append(m)
+    _LS["mods"] = tuple(mods)
+    return _LS["mods"]
 
 
 class EdgeRunner:
@@ -218,26 +253,35 @@ class EdgeRunner:
 
 
 def _as_hz(v):
-    """采样率必须是**整数**。
+    """采样率转成整数。
 
     imu_train 的 downsample() 用 math.gcd(device_hz, model_hz) 算重采样比，
     而 gcd 只吃整数——传个 50.0 进去直接抛
     "TypeError: 'float' object cannot be interpreted as an integer"。
-    这就是端侧模型第一次跑批 303 个全失败的原因，**是我把它转成 float 的**。
+    整条链都是这个前提：infer_csv_scratch 的 --device_hz 就声明成 type=int。
 
-    整数值的 float（50.0）接受并转成 int；真正的小数（49.8）**报错而不是四舍五入**：
-    重采样比是按整数比算的，49.8 当成 50 会让整条时间轴慢慢漂，
-    而片段的起止时间看起来一直是正常的。宁可在这里停住。
+    **小数四舍五入，不报错。** 我上一版让它报错，理由是"49.8 当成 50 会让
+    时间轴慢慢漂"。那个理由本身没错，但结论是错的：平台存的 sample_hz 是
+    从时间戳实测出来的，本来就带抖动（49.8、49.4 都是同一个标称 50Hz 的设备），
+    而报错的结果是**这些样本一个都跑不了**。整条链又只接受整数，
+    所以"用实测的小数值"根本不是选项——只能取最接近的整数，
+    那也正是误差最小的那个整数（最多半个 Hz，约 1%）。
+
+    偏离超过 0.05 时打一行日志：取整这件事本身是合理的，
+    但"到底按多少 Hz 跑的"应该看得见，不然时间戳对不上的时候查不出原因。
+
+    注：`algo_service` 那条路把 device_hz 原样 float 传进 downsample，
+    所以这些样本在**线上模型上同样会失败**（同一个 TypeError）。
+    那边是线上服务不能动，这里只管端侧这条。
     """
     f = float(v)
     n = int(round(f))
-    if abs(f - n) > 1e-6:
-        raise ValueError(
-            f"采样率 {f} 不是整数。imu_train 的重采样按整数比算"
-            "（math.gcd），小数率会让时间轴逐渐漂移而片段时间看着正常。"
-            "先确认样本的 sample_hz 是不是记错了。")
+    if abs(f - n) > 0.05:
+        print(f"  [采样率] 实测 {f}Hz，按 {n}Hz 跑（整条重采样链只接受整数）")
     if n <= 0:
-        raise ValueError(f"采样率 {f} 不合法")
+        # 这个还是要拦：0 或负数不是抖动，是上游算错了，
+        # 取整救不回来，而 0 会让后面的除法炸在一个跟采样率无关的地方
+        raise ValueError(f"采样率 {f} 不合法（取整后是 {n}）")
     return n
 
 

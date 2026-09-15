@@ -845,17 +845,37 @@ def test_float_sample_rate_is_accepted_when_integral():
     assert isinstance(edge_service._as_hz(50.0), int)
 
 
-def test_fractional_sample_rate_is_refused_not_rounded():
-    """真正的小数率要**报错，不是四舍五入**。
+def test_fractional_sample_rate_is_rounded_not_refused():
+    """实测小数率**取整，不报错**。
 
-    重采样比是按整数比算的（gcd）。把 49.8 当成 50，整条时间轴会慢慢漂，
-    而每一段片段的起止时间看起来一直是正常的——最难发现的那种错。
+    上一版是报错的，理由是"49.8 当成 50 会让时间轴慢慢漂"。理由没错，
+    结论错了：平台存的 sample_hz 是从时间戳实测的，本来就带抖动
+    （49.8 / 49.4 都是同一个标称 50Hz 的设备），报错的结果是这些样本
+    **一个都跑不了**（80 个样本的那一批就是这么挂的）。
+    而整条重采样链只接受整数，所以"用实测的小数值"根本不是选项。
     """
     import edge_service
-    with pytest.raises(ValueError, match="不是整数"):
-        edge_service._as_hz(49.8)
+    assert edge_service._as_hz(49.8) == 50
+    assert edge_service._as_hz(49.4) == 49
+    assert edge_service._as_hz(16.0) == 16
+    # 0 / 负数不是抖动，是上游算错了，取整救不回来
     with pytest.raises(ValueError, match="不合法"):
         edge_service._as_hz(0)
+    with pytest.raises(ValueError, match="不合法"):
+        edge_service._as_hz(-50)
+
+
+def test_rounding_a_real_rate_is_visible_in_the_log(capsys):
+    """取整本身合理，但"到底按多少 Hz 跑的"要看得见——
+    不然片段时间戳对不上的时候查不出原因。"""
+    import edge_service
+    capsys.readouterr()
+    edge_service._as_hz(49.8)
+    assert "49.8" in capsys.readouterr().out
+    # 整数值的 float 不该刷屏：每个样本都打一行没有信息量
+    capsys.readouterr()
+    edge_service._as_hz(50.0)
+    assert capsys.readouterr().out == ""
 
 
 def test_gcd_really_rejects_floats():
@@ -893,7 +913,7 @@ def test_http_layer_handles_a_50hz_file(runner, tmp_path):
     assert r["model_path"] == "edge://edge_cnn_i8.edge"
 
 
-def test_http_layer_rejects_fractional_hz_with_a_clear_message(runner, tmp_path):
+def test_http_layer_runs_a_real_fractional_rate(runner, tmp_path):
     import edge_service
     h = edge_service.Handler.__new__(edge_service.Handler)
     h.runners = {"edge_cnn_i8": runner}
@@ -901,7 +921,8 @@ def test_http_layer_rejects_fractional_hz_with_a_clear_message(runner, tmp_path)
     h.nas_root = str(tmp_path)
     _write_csv_at(str(tmp_path / "x.csv"), n_rows=200, hz=50, seed=1)
     r = h._one({"path": "x.csv", "mode": "raw", "device_hz": 49.8})
-    assert "不是整数" in (r.get("error") or ""), r
+    assert "error" not in r, r
+    assert r["n_windows"] > 0, "49.8Hz 的样本要能跑出窗口来"
 
 
 # ── 后处理（stable / viterbi）跟线上同一份 ────────────────────────────────
@@ -1176,3 +1197,70 @@ def test_shipped_config_is_valid_json_and_names_both_models():
     for m in cfg["models"]:
         assert m["kind"] in ("cnn", "rf")
         assert m["gen"] and m["meta"]
+
+
+# ── label_service 不能污染 sys.path ───────────────────────────────────────
+
+
+def test_label_service_never_lands_on_syspath():
+    """**80 个样本全挂就是因为这个。**
+
+    imu_train/label_service 里有个 queue.py。把那个目录塞进 sys.path，
+    标准库的 queue 就被整个盖掉，于是别处一句无辜的
+
+        from queue import Empty
+
+    变成 ImportError: cannot import name 'Empty' from
+    '.../label_service/queue.py' —— 报错的地方跟"端侧后处理"看不出任何关系。
+    同目录里还有 pool.py / jobs.py / skin.py，都很容易撞名。
+    """
+    import edge_service
+    edge_service.add_imu_train(IMU_TRAIN)
+    ls = os.path.join(os.path.realpath(IMU_TRAIN), "label_service")
+    on_path = [p for p in sys.path if os.path.realpath(p) == ls]
+    assert not on_path, f"label_service 进 sys.path 了：{on_path}"
+
+
+def test_stdlib_queue_still_works_after_loading_postprocess():
+    """加载后处理之后，标准库还得是标准库。
+
+    上一条钉的是 sys.path，这一条钉的是**结果**——换个别的写法把那个目录
+    弄进搜索路径，上一条可能还是绿的。
+
+    这里用 find_spec 重新去搜索路径上找，**不是 `import queue`**：
+    queue 早被别的模块 import 过、在 sys.modules 里缓存着，
+    `import queue` 拿到的是缓存，盖没盖住根本验不出来。
+    （这条第一版就是那么写的，在"退回旧写法"的变异体下照样绿。）
+    """
+    import importlib.util
+    _need_postprocess()
+    spec = importlib.util.find_spec("queue")
+    assert spec and spec.origin, "标准库 queue 找不到了"
+    assert "label_service" not in os.path.realpath(spec.origin), \
+        f"标准库 queue 被盖成了 {spec.origin}"
+    for name in ("pool", "jobs", "skin"):
+        s = importlib.util.find_spec(name)
+        if s and s.origin:
+            assert "label_service" not in os.path.realpath(s.origin), \
+                f"`{name}` 被 label_service 那份占了：{s.origin}"
+
+
+def test_postprocess_modules_are_namespaced():
+    """挂在 sys.modules 上的名字要带前缀，不能占着 `config` / `postprocess`——
+    那两个名字太常见，占了之后别人 import 到的是 label_service 那份。"""
+    _need_postprocess()
+    for name in ("_ls_config", "_ls_postprocess"):
+        assert name in sys.modules, f"{name} 没登记，重复加载时命不中缓存"
+    for name in ("config", "postprocess"):
+        m = sys.modules.get(name)
+        if m is not None and getattr(m, "__file__", None):
+            assert "label_service" not in os.path.realpath(m.__file__), \
+                f"label_service 的模块占了 `{name}` 这个名字"
+
+
+def test_postprocess_is_loaded_once_not_every_call():
+    """后处理是每个窗口批次都要调的，每次重新 exec 一遍文件太浪费。"""
+    import edge_service
+    a = edge_service.load_postprocess()
+    b = edge_service.load_postprocess()
+    assert a[0] is b[0] and a[1] is b[1]
