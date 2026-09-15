@@ -4,3 +4,13 @@ __pycache__/
 firmware/generated/
 model.npz
 firmware/gr551x/tinyml_app/GCC/build/
+
+# 出包产物：每次 release.sh 都会生成新的一份，不进仓库。
+# 要长期留的版本走 Git LFS 或者另外归档——.bin/.hex 进 git 会让仓库迅速膨胀，
+# 而且它们是可以从「提交 + 模型指纹」完全复现的。
+release/
+
+# export_cnn.py / export_rf.py 的导出目录。这是产物，不是源码。
+# **更要紧的是别把一份假模型提交进来**：本机自测时会造随机权重的演示导出，
+# 名字跟真的一模一样，提交进去之后谁也分不出来，而它编得过、也能跑。
+firmware/generated*/

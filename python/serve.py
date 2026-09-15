@@ -84,8 +84,11 @@ class Engine:
         for name in ("th_ch_mean", "th_ch_std"):
             getattr(L, name).restype = ctypes.c_double
             getattr(L, name).argtypes = [ctypes.c_int]
-        L.th_in_scale.restype = ctypes.c_double
-        L.th_in_scale.argtypes = []
+        for name in ("th_in_scale", "th_out_scale"):
+            getattr(L, name).restype = ctypes.c_double
+            getattr(L, name).argtypes = []
+        L.th_out_zp.restype = ctypes.c_int
+        L.th_out_zp.argtypes = []
         L.th_infer_batch.restype = ctypes.c_int
         L.th_infer_batch.argtypes = [
             ctypes.POINTER(ctypes.c_float), ctypes.c_int,
@@ -100,6 +103,8 @@ class Engine:
         self.ch_std = [L.th_ch_std(i) for i in range(self.n_ch)]
         self.in_scale = L.th_in_scale()
         self.in_zp = L.th_in_zp()
+        self.out_scale = L.th_out_scale()
+        self.out_zp = L.th_out_zp()
         self.arena_bytes = L.th_arena_bytes()
         self.golden_n = L.th_golden_n()
         # C 里有静态缓冲，多线程同时进会互相踩。加锁比改 C 省事，
