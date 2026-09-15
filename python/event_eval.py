@@ -28,7 +28,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from tinyml.adapter import ModelAdapter  # noqa: E402
+from tinyml.adapter import ModelAdapter
+from tinyml.eventci import describe, event_ci  # noqa: E402
 
 
 def resolve_model(path):
@@ -208,6 +209,7 @@ def main():
         if args.quantize_leaves:
             bits.append("叶子量化成 uint8")
         print(f"（{('、'.join(bits))}——跟端上一致）\n")
+    last_ev = None
     for r in axis:
         t = ad.variant(r, n_trees=n_trees, quantize_leaves=args.quantize_leaves)
         pred = np.array([int(np.argmax(t.scores(x))) for x in X])
@@ -222,6 +224,13 @@ def main():
         ep, er, ef = prf(etp, efp, efn)
         print(f"{r:>8}{wp:>10.3f}{wr:>10.3f}{wf:>10.3f}{'  │':>4}"
               f"{len(pred_ev):>8}{ep:>10.3f}{er:>10.3f}{ef:>10.3f}")
+        last_ev = (len(true_ev), len(pred_ev), etp)
+
+    # **把不确定性打出来。** 事件只有十几次的时候，两个模型差几个点
+    # 差的其实是一两个事件——不写出来的话，人会拿那个差去做选型决定。
+    if last_ev is not None:
+        print()
+        print(describe(event_ci(*last_ev), len(true_ev)))
 
     print(f"""
 {ad.caveat()}

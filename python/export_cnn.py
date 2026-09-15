@@ -28,6 +28,7 @@ from tinyml.progress import bar, chunks  # noqa: E402
 from tinyml.export_c import _arena_bytes  # noqa: E402
 from tinyml.torch_import import load_cnn, normalize  # noqa: E402
 from event_eval import check_ordered, match_events, prf, to_events  # noqa: E402
+from tinyml.eventci import describe, event_ci  # noqa: E402
 
 
 def _need(path, flag):
@@ -40,14 +41,22 @@ def _need(path, flag):
 
 
 def macro_f1(y, p, n):
-    out = []
+    """返回 (macro, 逐类 F1, 逐类 (P, R, 支持数))。
+
+    P/R 分开报不是为了好看：F1 把两种完全不同的失败合成一个数——
+    "报得少但准"和"报得多但脏"可以给出同一个 F1，而它们在产品上
+    是相反的问题（漏报 vs 误报）。
+    """
+    f1s, pr = [], []
     for c in range(n):
         tp = int(np.sum((p == c) & (y == c)))
         fp = int(np.sum((p == c) & (y != c)))
         fn = int(np.sum((p != c) & (y == c)))
         d = 2 * tp + fp + fn
-        out.append(0.0 if d == 0 else 2 * tp / d)
-    return float(np.mean(out)), out
+        f1s.append(0.0 if d == 0 else 2 * tp / d)
+        pr.append((tp / (tp + fp) if tp + fp else 0.0,
+                   tp / (tp + fn) if tp + fn else 0.0, tp + fn))
+    return float(np.mean(f1s)), f1s, pr
 
 
 def main():
@@ -107,12 +116,15 @@ def main():
             q_pred[s:e] = np.argmax(forward_int_batch(qnet, xq), axis=1)
             pb.update()
     n_cls = len(classes)
-    f_macro, f_per = macro_f1(y, f_pred, n_cls)
-    q_macro, q_per = macro_f1(y, q_pred, n_cls)
+    f_macro, f_per, _ = macro_f1(y, f_pred, n_cls)
+    q_macro, q_per, q_pr = macro_f1(y, q_pred, n_cls)
 
-    print(f"\n{'类别':<10}{'float F1':>10}{'int8 F1':>10}{'差':>9}")
+    print(f"\n{'类别':<10}{'float F1':>10}{'int8 F1':>10}{'差':>9}"
+          f"{'int8 P':>9}{'int8 R':>9}{'窗口数':>8}")
     for c in range(n_cls):
-        print(f"{classes[c]:<10}{f_per[c]:>10.4f}{q_per[c]:>10.4f}{q_per[c] - f_per[c]:>+9.4f}")
+        pp, rr, sup = q_pr[c]
+        print(f"{classes[c]:<10}{f_per[c]:>10.4f}{q_per[c]:>10.4f}"
+              f"{q_per[c] - f_per[c]:>+9.4f}{pp:>9.3f}{rr:>9.3f}{sup:>8,}")
     print(f"{'macro':<10}{f_macro:>10.4f}{q_macro:>10.4f}{q_macro - f_macro:>+9.4f}")
     print(f"\nfloat 与 int8 判别一致率 {float(np.mean(f_pred == q_pred)):.4f}")
 
@@ -147,6 +159,11 @@ def main():
                 p, r, f1 = prf(tp, fp, fn)
                 print(f"{tag:<8}{len(ev):>5}{len(true_ev):>6}{tp:>5}{fp:>6}{fn:>5}"
                       f"{p:>8.3f}{r:>8.3f}{f1:>9.3f}")
+                if tag == "int8":
+                    last = (len(true_ev), len(ev), tp)
+            # 事件数少的时候这张表分辨不了小差距，必须说出来
+            print()
+            print(describe(event_ci(*last), len(true_ev)))
     else:
         print(f"\n事件级跳过：--focus「{args.focus}」不在类别里（{','.join(classes)}）")
 
