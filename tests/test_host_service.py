@@ -9,9 +9,12 @@
 一个都抓不到，而它恰恰是最容易犯的。
 """
 
+import errno
 import os
+import socket
 import subprocess
 import sys
+from http.server import BaseHTTPRequestHandler
 
 import numpy as np
 import pytest
@@ -161,3 +164,70 @@ def test_build_command_contains_required_flags(monkeypatch, tmp_path):
     # 固件的源文件必须是**原样**编进来的，不能是某个拷贝
     assert any(c.endswith("firmware/tinyml/tm_runtime.c") for c in cmd)
     assert any(c.endswith("firmware/tinyml/tm_prep.c") for c in cmd)
+
+
+# ── 端口 ──────────────────────────────────────────────────────────────────
+
+
+def _hold(port=0):
+    """占住一个端口，返回 (socket, 端口号)。"""
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", port))
+    s.listen(1)
+    return s, s.getsockname()[1]
+
+
+def test_busy_port_falls_through_to_the_next_one():
+    """端口占用太常见了（上一个实例没停、别的服务占着 8080）。
+    默认甩一个 OSError 的 traceback——那玩意儿看着像程序坏了，其实换个端口就行。"""
+    held, p = _hold()
+    try:
+        srv = serve.listen("127.0.0.1", p, BaseHTTPRequestHandler)
+        try:
+            assert srv.server_address[1] != p
+            assert srv.server_address[1] == p + 1
+        finally:
+            srv.server_close()
+    finally:
+        held.close()
+
+
+def test_strict_port_refuses_instead_of_moving():
+    """端口有时写死在别处的配置里，静默换掉比报错更糟——
+    web 那边还连着旧端口，而服务显示"开着了"。"""
+    held, p = _hold()
+    try:
+        with pytest.raises(SystemExit) as e:
+            serve.listen("127.0.0.1", p, BaseHTTPRequestHandler, tries=1)
+        assert "ss -ltnp" in str(e.value), "报错要说清楚怎么查是谁占的"
+    finally:
+        held.close()
+
+
+def test_port_zero_lets_the_kernel_pick():
+    srv = serve.listen("127.0.0.1", 0, BaseHTTPRequestHandler)
+    try:
+        assert srv.server_address[1] > 0
+    finally:
+        srv.server_close()
+
+
+def test_non_address_in_use_errors_are_not_swallowed():
+    """只有 EADDRINUSE 才该顺延。权限不够（绑 80）之类的错误顺延 20 次
+    只会刷 20 遍同样的失败，最后给出一条误导的"都被占着"。"""
+    with pytest.raises(OSError) as e:
+        serve.listen("203.0.113.1", 9999, BaseHTTPRequestHandler)   # 绑不上的地址
+    assert e.value.errno != errno.EADDRINUSE
+
+
+def test_urls_resolves_a_reachable_address_for_wildcard_bind():
+    """绑 0.0.0.0 时只打印 "<服务器 IP>" 是在给人出题。"""
+    got = serve.urls("0.0.0.0", 8080)
+    assert any("127.0.0.1:8080" in u for u in got)
+    assert len(got) >= 2, f"没给出对外地址：{got}"
+    assert all(":8080/" in u for u in got)
+
+
+def test_urls_for_explicit_host_is_just_that_host():
+    assert serve.urls("127.0.0.1", 9000) == ["http://127.0.0.1:9000/"]

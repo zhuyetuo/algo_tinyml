@@ -24,10 +24,12 @@
 
 import argparse
 import ctypes
+import errno
 import json
 import os
 import subprocess
 import sys
+import socket
 import tempfile
 import threading
 import time
@@ -350,6 +352,61 @@ class Handler(BaseHTTPRequestHandler):
         self._send({"index": int(after + 1 + hits[0]) if len(hits) else -1})
 
 
+def listen(host, port, handler, tries=20):
+    """绑端口，占用了就往后顺延。
+
+    端口占用太常见了（上一个实例没停、别的服务占着 8080），而默认行为是甩一个
+    OSError 的 traceback——那玩意儿看着像程序坏了，其实只要换个端口。
+
+    `port=0` 交给内核挑。`tries=1` 就是"只试这一个，占了就报错"（--strict-port），
+    因为有时候端口是写死在别处的配置里的，静默换掉反而更糟。
+
+    HTTPServer 已经设了 SO_REUSEADDR，所以这里的 EADDRINUSE **是真的有人在听**，
+    不是 TIME_WAIT 的残留——不用靠重试等它自己好。
+    """
+    last = None
+    for i in range(max(tries, 1)):
+        p = 0 if port == 0 else port + i
+        try:
+            return ThreadingHTTPServer((host, p), handler)
+        except OSError as e:
+            if e.errno != errno.EADDRINUSE:
+                raise
+            last = e
+    sys.exit(f"{host}:{port}..{port + tries - 1} 都被占着（{last}）。\n"
+             f"  看是谁占的：  ss -ltnp | grep :{port}\n"
+             "  或者直接指一个空的：--port 9000，或 --port 0 让内核挑。")
+
+
+def urls(host, port):
+    """把能点的地址列出来。
+
+    绑 0.0.0.0 时只打印 "<服务器 IP>" 是在给人出题——用户得自己去查 IP。
+    这里直接把本机的地址找出来。
+    """
+    if host not in ("0.0.0.0", "::"):
+        return [f"http://{host}:{port}/"]
+    out = [f"http://127.0.0.1:{port}/   （本机）"]
+    ips = set()
+    try:
+        # 不发包，只是让内核挑一条出口路由，从而拿到对外那张网卡的地址。
+        # socket.gethostbyname(gethostname()) 在很多机器上只会给 127.0.1.1
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ips.add(s.getsockname()[0])
+        finally:
+            s.close()
+    except OSError:
+        pass
+    for ip in sorted(ips):
+        if not ip.startswith("127."):
+            out.append(f"http://{ip}:{port}/   （局域网，web 那边用这个）")
+    if len(out) == 1:
+        out.append(f"http://<服务器 IP>:{port}/   （没探到对外地址，自己填）")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gen", required=True,
@@ -359,7 +416,10 @@ def main():
     ap.add_argument("--focus", default="抓挠")
     ap.add_argument("--host", default="127.0.0.1",
                     help="要让别的机器访问就写 0.0.0.0")
-    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--port", type=int, default=8080,
+                    help="被占了会自动往后顺延；0 = 让内核挑一个空的")
+    ap.add_argument("--strict-port", action="store_true",
+                    help="端口被占就报错，不要自动换（端口写死在别处配置里时用）")
     ap.add_argument("--cc", default="gcc")
     args = ap.parse_args()
 
@@ -388,13 +448,20 @@ def main():
 
     Handler.engine = eng
     Handler.focus = args.focus
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    where = args.host if args.host != "0.0.0.0" else "<服务器 IP>"
-    print(f"\n开着了：http://{where}:{args.port}/     Ctrl-C 停")
+    srv = listen(args.host, args.port, Handler,
+                 tries=1 if args.strict_port else 20)
+    port = srv.server_address[1]
+    if port != args.port:
+        print(f"\n{args.port} 被占了，换到 {port}")
+    print(f"\n开着了，Ctrl-C 停：")
+    for u in urls(args.host, port):
+        print(f"  {u}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n停了")
+    finally:
+        srv.server_close()
 
 
 if __name__ == "__main__":
