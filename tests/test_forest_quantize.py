@@ -93,8 +93,18 @@ def test_compact_flash_uint8_leaves_are_a_quarter_of_float32():
     b8 = compact_flash_bytes(f, leaf_bits=8)
     assert b32["leaves"] == 10 * 5 * 4
     assert b8["leaves"] == 10 * 5 * 1
-    # 节点那一侧不该受叶子位宽影响
-    assert b32["nodes"] == b8["nodes"] == 10 * 6
+    # 节点那一侧不该受叶子位宽影响。
+    #
+    # **这一条原来写死的是 10 * 6，而 6 是错的。** 它"验证"了一个照抄 GBDT、
+    # 在 RF 上根本不成立的字节数（GBDT 限深 6、右偏移塞得进 7 bit；
+    # RF 深度 10、一棵树几百个节点，偏移必须 uint16），于是那个错的记账
+    # 一路绿着被我拿去报了好几轮体积，而真实导出是另一个数。
+    #
+    # 现在从实现取，不写死——写死数字的测试只能保证"没人改过它"，
+    # 保证不了"它是对的"。真正的一致性由 test_forest_compact_c.py 里
+    # 跟导出器对账的那条钉着。
+    from tinyml.forest_compact import NODE_BYTES
+    assert b32["nodes"] == b8["nodes"] == 10 * NODE_BYTES
 
 
 def test_compact_flash_rejects_unsupported_leaf_width():

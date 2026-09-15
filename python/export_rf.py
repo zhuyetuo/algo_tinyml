@@ -24,6 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tinyml.export_features_c import export as export_feat_cfg  # noqa: E402
 from tinyml.export_forest_c import export  # noqa: E402
+from tinyml.export_forest_compact_c import export as export_compact  # noqa: E402
+from tinyml.forest_compact import CompactForest  # noqa: E402
 from tinyml.forest import flash_bytes, from_sklearn  # noqa: E402
 
 
@@ -61,6 +63,11 @@ def main():
     ap.add_argument("--channels", type=int, default=8, help="6=acc+gyr，8=再加 pitch/roll")
     ap.add_argument("--nperseg", type=int, default=32)
     ap.add_argument("--hz", type=float, default=16.0)
+    ap.add_argument("--compact", action="store_true",
+                    help="导紧凑编码（7 B/节点 + uint8 叶子）而不是原来的 SoA。"
+                         "**体积差两倍多**，128KB 预算下基本只能用这个。"
+                         "代价：叶子量化会改判决（相差不到 1/255 的两类会翻），"
+                         "用 prune_rf.py --grid 看量化之后的实测 macro-F1")
     args = ap.parse_args()
 
     try:
@@ -108,7 +115,20 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     # 特征配置表（Hann 窗 + FFT 旋转因子 + 位反序）跟模型一起导：它们必须成套，
     # 分开导迟早会出现"换了窗口长度但表没换"，而那只会表现成准确率莫名其妙地低
-    files = dict(export(forest, golden_x=golden))
+    if args.compact:
+        cf = CompactForest(forest)
+        files = dict(export_compact(cf, golden_x=golden))
+        sz = cf.flash_bytes()
+        total = sum(sz.values())
+        print(f"\n紧凑编码（7 B/节点 + uint8 叶子）：")
+        print(f"  节点 {sz['nodes']:,} B + 叶子 {sz['leaves']:,} B + 树表 "
+              f"{sz['tree_offset']:,} B = {total:,} B（{total / 1024:.1f} KB）")
+        print("  " + ("✓ 塞得进 128KB" if total <= 131072
+                      else f"✗ 还是超 {total / 131072:.2f} 倍"))
+        print("  注意叶子量化**会改判决**（相差不到 1/255 的两类会翻）——"
+              "量化之后的 macro-F1 用 prune_rf.py --grid 看，别拿原模型的数。")
+    else:
+        files = dict(export(forest, golden_x=golden))
     files.update(export_feat_cfg(args.window, args.channels, args.nperseg, args.hz))
     n_feat_expected = None
     try:

@@ -202,19 +202,35 @@ def quantize_leaves(forest: Forest, levels: int = 255) -> Forest:
     return replace(forest, leaf_proba=(q / levels).astype(np.float32))
 
 
-def compact_flash_bytes(forest: Forest, leaf_bits: int = 32) -> dict:
-    """紧凑布局下各部分占多少 flash。
+def compact_flash_bytes(forest: Forest, leaf_bits: int = 8) -> dict:
+    """紧凑布局下各部分占多少 flash。**跟 forest_compact 的实际编码对齐。**
 
-    节点 6 字节（AoS）：feature uint16 + threshold float32 的低位打包，
-    左孩子恒为 idx+1 所以不存，只存右孩子 —— 跟 GBDT 那边同一套编码。
-    叶子按 leaf_bits 决定单价：32 = float32 原样，8 = uint8 量化。
+    节点 **7** 字节（AoS）：
+        uint8  feature     内部节点=特征下标
+        float  threshold   内部=阈值；叶子=叶子表下标（4 字节复用）
+        uint16 right       右孩子相对偏移；0=叶子
+    左孩子恒为 idx+1，不存。
+
+    **这里原来写的是 6 字节，那是错的**，而且错得有后果：我拿这个数报了好几轮
+    "RF 98.2 KB"，跟 CNN 实测的 78.6 KB 并排比，而那个编码根本不存在——
+    真导出来是 277 KB（老的 SoA 编码）。
+
+    6 字节的来历是照抄了 GBDT 那边：那边限深 6，一棵树最多 127 个节点，
+    右偏移塞得进 7 bit。RF 深度 10、一棵树几百个节点，偏移必须 uint16。
+    **抄编码之前要先看两边的树有多深。**
+
+    记账函数和真实导出器对不上，就是在拿不存在的方案做决策。
+    forest_compact.CompactForest.flash_bytes() 才是权威的那一份，
+    这里保留只是为了 prune_rf.py 扫网格时不用真去打包每一个候选。
+    两者一致由 tests/test_forest_compact_c.py 钉着。
     """
     if leaf_bits not in (8, 32):
         raise ValueError(f"leaf_bits={leaf_bits} 只支持 8 或 32")
     n_nodes = len(forest.node_feature)
     n_leaves = len(forest.leaf_proba)
+    from .forest_compact import NODE_BYTES
     return {
-        "nodes": n_nodes * 6,
+        "nodes": n_nodes * NODE_BYTES,
         "leaves": n_leaves * forest.n_classes * (leaf_bits // 8),
         "tree_offset": (forest.n_trees + 1) * 4,
     }
