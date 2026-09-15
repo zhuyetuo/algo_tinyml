@@ -29,6 +29,9 @@
 #if defined(TM_HAS_RF_GOLDEN)
 #include "tm_forest_golden.h"
 #endif
+#if defined(TM_HAS_PIPELINE_GOLDEN)
+#include "tm_pipeline_golden.h"
+#endif
 #endif
 
 #if defined(TM_HAS_CNN)
@@ -90,6 +93,45 @@ static int selftest_rf(tm_selftest_report_t *r)
 }
 #endif
 
+#if defined(TM_HAS_RF) && defined(TM_HAS_PIPELINE_GOLDEN)
+/* 整条链：原始窗口 → 特征 → 森林。
+ *
+ * 这一段**不只是多验一层**。链接时 --gc-sections 会把没人调的代码整段丢掉——
+ * 自检不走完整条链的话，tm_features 压根不会被链进镜像，量出来的固件体积是假的
+ * （实测过：不走整条链时 tm_features/tm_invoke 在最终镜像里根本不存在）。
+ * 而且它验的是中间那道接缝：特征排列顺序跟模型训练时对不对得上。 */
+static int selftest_pipeline(tm_selftest_report_t *r)
+{
+    static float feat[TM_FEAT_DIM];
+    static float proba[TM_F_N_CLASSES];
+
+    for (int i = 0; i < TM_P_GOLDEN_N; i++) {
+        const float *x = tm_pipeline_in + (size_t)i * TM_P_N_CH * TM_P_N_T;
+        if (tm_features(&tm_feat_cfg, x, feat) != 0) {
+            r->fail_index = i;
+            r->fail_kind = TM_SELFTEST_INVOKE_FAILED;
+            return -1;
+        }
+        tm_forest_predict(&tm_forest, feat, proba);
+        const float *want = tm_pipeline_proba + (size_t)i * TM_F_N_CLASSES;
+        for (int c = 0; c < TM_F_N_CLASSES; c++) {
+            uint32_t a, b;
+            memcpy(&a, &proba[c], sizeof a);
+            memcpy(&b, &want[c], sizeof b);
+            if (a != b) {
+                r->fail_index = i;
+                r->fail_kind = TM_SELFTEST_MISMATCH;
+                r->got_bits = a;
+                r->want_bits = b;
+                return -1;
+            }
+        }
+        r->n_checked++;
+    }
+    return 0;
+}
+#endif
+
 int tm_selftest_run(tm_selftest_report_t *r)
 {
     memset(r, 0, sizeof(*r));
@@ -100,6 +142,9 @@ int tm_selftest_run(tm_selftest_report_t *r)
 #endif
 #if defined(TM_HAS_RF) && defined(TM_HAS_RF_GOLDEN)
     if (selftest_rf(r) != 0) return -1;
+#endif
+#if defined(TM_HAS_RF) && defined(TM_HAS_PIPELINE_GOLDEN)
+    if (selftest_pipeline(r) != 0) return -1;
 #endif
 
     if (r->n_checked == 0) {
