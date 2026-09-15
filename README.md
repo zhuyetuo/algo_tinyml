@@ -59,6 +59,8 @@ firmware/gr551x/         挂进 Goodix SDK 的工程（见它自己的 README）
   tinyml_app/Src/user/         上板自检（golden vector）、逐窗口判决 → 事件聚合
 tests/                   C ↔ Python 逐位对照（现场用 gcc 编）
 docs/chip_choice.md      芯片选型
+docs/rf_size.md          RF 体积怎么算、要不要量化剪枝
+docs/frameworks.md       Cortex-M4F 上有哪些推理框架、为什么我们都没用
 ```
 
 **训练框架跟板上那一侧是隔离的**：`train_torch.py` 最后只交出一个
