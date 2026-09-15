@@ -1,0 +1,62 @@
+"""--model 路径解析的报错。
+
+这几个脚本在 algo_tinyml 目录下跑，而模型在 imu_train 里——相对路径会解析到
+algo_tinyml 下面去（我自己就写错过一次）。直接交给 joblib 只会甩一个
+FileNotFoundError，看不出是"路径写错了"还是"模型没训出来"。
+
+这段是纯路径逻辑，不依赖 sklearn，所以能在这里测。
+"""
+
+import importlib.util
+import os
+import sys
+
+import pytest
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+SCRIPTS = ["export_gbdt", "export_rf", "prune_rf", "rf_footprint", "feature_usage"]
+
+
+def _load(name):
+    path = os.path.join(ROOT, "python", f"{name}.py")
+    spec = importlib.util.spec_from_file_location(f"_t_{name}", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("name", SCRIPTS)
+def test_每个脚本都有路径检查(name):
+    mod = _load(name)
+    assert hasattr(mod, "resolve_model"), f"{name}.py 少了 resolve_model"
+
+
+@pytest.mark.parametrize("name", SCRIPTS)
+def test_存在的路径原样返回(name, tmp_path):
+    mod = _load(name)
+    p = tmp_path / "m.pkl"
+    p.write_bytes(b"x")
+    assert mod.resolve_model(str(p)) == str(p)
+
+
+@pytest.mark.parametrize("name", SCRIPTS)
+def test_不存在时报错里带绝对路径(name):
+    """报错必须把相对路径解析成什么说出来——只说"找不到 results/xxx"的话，
+    人还是不知道它到底找到哪儿去了。"""
+    mod = _load(name)
+    with pytest.raises(SystemExit) as e:
+        mod.resolve_model("results/nope/x.pkl")
+    msg = str(e.value)
+    assert "results/nope/x.pkl" in msg
+    assert os.path.abspath("results/nope/x.pkl") in msg, "报错里没说清解析成了哪个绝对路径"
+    assert "imu_train" in msg, "报错里没提示模型应该在 imu_train 下"
+
+
+@pytest.mark.parametrize("name", SCRIPTS)
+def test_波浪号会展开(name, tmp_path, monkeypatch):
+    mod = _load(name)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "m.pkl").write_bytes(b"x")
+    assert mod.resolve_model("~/m.pkl") == str(tmp_path / "m.pkl")
