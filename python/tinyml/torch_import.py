@@ -51,10 +51,36 @@ def load_meta(json_path):
 
 
 def normalize(x, meta):
-    """逐通道 z-score，跟训练时一致。x: [..., C, T]。"""
+    """逐通道 z-score，跟训练时一致。x: [..., C, T]。
+
+    走 float32：这一份是给**训练侧的 float 前向**用的，对应 PyTorch 里的
+    同一个运算。端上那一份是 prep_quantize_ref（float64），跟 C 逐位一致——
+    两者故意不是同一个函数，因为它们要对齐的对象不同。
+    """
     mean = np.asarray(meta["ch_mean"], np.float32).reshape(-1, 1)
     std = np.asarray(meta["ch_std"], np.float32).reshape(-1, 1)
     return ((np.asarray(x, np.float32) - mean) / std).astype(np.float32)
+
+
+def prep_quantize_ref(x, meta, in_scale, in_zp):
+    """归一化 + 量化，一步到位，跟固件 tm_prep() **逐位一致**。
+
+    x: float [C, T]，**原始量纲**（不是归一化过的）→ int8 [C, T]。
+
+    两步走（先减均值除标准差，再除 in_scale），不合成 (x*a + b)：
+    合成会改变舍入，两边就差几个 LSB——而那种差异看起来完全像"正常的数值误差"，
+    是最不容易被怀疑到的一类不一致。
+
+    全程 float64，因为 C 那边也是 double。M4F 没有双精度 FPU，这段走软件浮点，
+    但只有 n_ch × n_t = 128 次，跟后面几十万次乘加的卷积比可以忽略。
+    """
+    mean = np.asarray(meta["ch_mean"], np.float64).reshape(-1, 1)
+    std = np.asarray(meta["ch_std"], np.float64).reshape(-1, 1)
+    v = (np.asarray(x, np.float64) - mean) * (1.0 / std)
+    q = v / np.float64(in_scale)
+    # 四舍五入远离零。np.round 是银行家舍入（.5 取偶），跟 C 的 round() 走反
+    r = np.sign(q) * np.floor(np.abs(q) + 0.5) + in_zp
+    return np.clip(r, -128, 127).astype(np.int8)
 
 
 def load_cnn(pt_path, json_path=None, eps=1e-5):

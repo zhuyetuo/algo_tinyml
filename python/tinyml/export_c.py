@@ -36,10 +36,13 @@ def _arena_bytes(qnet: QNet) -> int:
     return biggest
 
 
-def export(qnet: QNet, golden_x_i8=None, model_name="tm_model") -> dict:
+def export(qnet: QNet, golden_x_i8=None, model_name="tm_model", prep=None) -> dict:
     """返回 {文件名: 内容}。分成 .h / .c 两个文件是给固件工程用的：
     权重只在一个编译单元里，别的地方 include 头文件就行。"""
-    lines = ['#include "tm_runtime.h"\n', "\n"]
+    lines = ['#include "tm_runtime.h"\n']
+    if prep is not None:
+        lines.append('#include "tm_prep.h"\n')
+    lines.append("\n")
     layer_entries = []
 
     for i, lyr in enumerate(qnet.layers):
@@ -80,12 +83,28 @@ def export(qnet: QNet, golden_x_i8=None, model_name="tm_model") -> dict:
         f"}};\n"
     )
 
+    # 归一化参数。**不导的话这份 C 就不是完整的管线**——端上少做一次 z-score，
+    # 输入分布跟训练时对不上，效果掉一截而且不报错。
+    # 用 double：Python 那侧是 float64（.json 里是十进制文本），存成 float
+    # 会先丢一次精度，两边就不可能逐位一致（这一点有专门的测试钉着）。
+    if prep is not None:
+        lines.append("\n/* 逐通道 z-score 的参数，来自训练时的 .json */\n")
+        for nm, vals in (("mean", prep["ch_mean"]), ("std", prep["ch_std"])):
+            body = ", ".join(f"{float(v):.17e}" for v in vals)
+            lines.append(f"static const double {model_name}_ch_{nm}[] = {{{body}}};\n")
+        lines.append(
+            f"const tm_prep_t {model_name}_prep = {{\n"
+            f"    {model_name}_ch_mean, {model_name}_ch_std,\n"
+            f"    {qnet.in_scale!r}, {qnet.in_zp}, {qnet.n_ch}, {qnet.n_t}\n"
+            f"}};\n")
+
     arena = _arena_bytes(qnet)
     names = qnet.class_names or [f"class{i}" for i in range(qnet.n_classes)]
     header = [
         "/* 自动生成，别手改 —— 改了下次导出就没了。 */\n",
         "#ifndef TM_MODEL_H\n#define TM_MODEL_H\n\n",
-        '#include "tm_runtime.h"\n\n',
+        '#include "tm_runtime.h"\n',
+        '#include "tm_prep.h"\n\n' if prep is not None else "\n",
         f"#define TM_ARENA_BYTES {2 * arena}\n",
         f"#define TM_N_CH {qnet.n_ch}\n",
         f"#define TM_N_T {qnet.n_t}\n",
@@ -93,7 +112,9 @@ def export(qnet: QNet, golden_x_i8=None, model_name="tm_model") -> dict:
         "/* 类别顺序就是模型输出的下标顺序，跟训练时的 label 编码一致 */\n",
         "static const char *const TM_CLASS_NAMES[] = {"
         + ", ".join(f'"{n}"' for n in names) + "};\n\n",
-        f"extern const tm_model_t {model_name};\n\n",
+        f"extern const tm_model_t {model_name};\n",
+        (f"extern const tm_prep_t {model_name}_prep;\n" if prep is not None else ""),
+        "\n",
         "#endif\n",
     ]
 
