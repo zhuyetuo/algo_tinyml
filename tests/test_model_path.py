@@ -103,3 +103,13 @@ def test_dump_holdout_不在_imu_train_目录时明确报错(tmp_path, monkeypat
     with pytest.raises(SystemExit) as e:
         mod.main()
     assert "imu_train" in str(e.value)
+
+
+@pytest.mark.parametrize("name", SCRIPTS + ["prune_gbdt", "event_eval"])
+def test_路径里的省略号占位符会被点出来(name):
+    """我在说明里习惯用 `.../` 当占位符，照抄过来就是个找不到的路径。
+    只说"找不到"的话，人会以为是自己目录搞错了——实际是占位符没替换。"""
+    mod = _load(name)
+    with pytest.raises(SystemExit) as e:
+        mod.resolve_model("~/imu_train/results/.../xgb/ml_xgb.pkl")
+    assert "占位符" in str(e.value)

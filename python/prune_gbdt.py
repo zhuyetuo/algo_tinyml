@@ -53,6 +53,9 @@ def resolve_model(path):
     if os.path.exists(p):
         return p
     hint = ""
+    if "..." in path:
+        # 我在说明里用 `.../` 当占位符，照抄过来就是这个样子。直接点出来
+        hint = "\n  路径里有 `...`——那是占位符，要换成真实目录名。"
     if not os.path.isabs(p):
         hint = (f"\n  注意这是相对路径，会解析成 {os.path.abspath(p)}。"
                 "\n  模型在 imu_train 里的话要写全：~/imu_train/results/...")

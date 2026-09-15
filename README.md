@@ -67,6 +67,7 @@ docs/market.md           市面上的项圈（FitBark/Fi/Tractive/Maven/Whistle�
 docs/model_choice.md     端侧选哪个模型（1D-CNN / GBDT / LR / RF 的体积对照）
 docs/features_cost.md    193 维特征贵在哪、能不能不用 float32、怎么砍
 docs/xgb_result.md       **xgb 200 轮实测 + 怎么塞进 128KB**（轮数曲线/编码/二分类）
+docs/ram_and_cache.md    运行内存实测（模型不占 RAM）+ 8KB cache 那笔账
 tools/host_sim.c         在 PC 上跑板上那份 C，喂真实数据
 ```
 
