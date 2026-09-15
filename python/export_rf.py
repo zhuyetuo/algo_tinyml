@@ -22,6 +22,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from tinyml.export_features_c import export as export_feat_cfg  # noqa: E402
 from tinyml.export_forest_c import export  # noqa: E402
 from tinyml.forest import flash_bytes, from_sklearn  # noqa: E402
 
@@ -33,6 +34,10 @@ def main():
     ap.add_argument("--out", default="firmware/generated")
     ap.add_argument("--golden", type=int, default=32)
     ap.add_argument("--classes", default="")
+    ap.add_argument("--window", type=int, default=32, help="窗口点数（16Hz×2s=32）")
+    ap.add_argument("--channels", type=int, default=8, help="6=acc+gyr，8=再加 pitch/roll")
+    ap.add_argument("--nperseg", type=int, default=32)
+    ap.add_argument("--hz", type=float, default=16.0)
     args = ap.parse_args()
 
     try:
@@ -78,7 +83,21 @@ def main():
               "**强烈建议给**：没有它，板上跑出来对不对只能靠肉眼看准确率。")
 
     os.makedirs(args.out, exist_ok=True)
-    for name, content in export(forest, golden_x=golden).items():
+    # 特征配置表（Hann 窗 + FFT 旋转因子 + 位反序）跟模型一起导：它们必须成套，
+    # 分开导迟早会出现"换了窗口长度但表没换"，而那只会表现成准确率莫名其妙地低
+    files = dict(export(forest, golden_x=golden))
+    files.update(export_feat_cfg(args.window, args.channels, args.nperseg, args.hz))
+    n_feat_expected = None
+    try:
+        from tinyml.features import n_features
+        n_feat_expected = n_features(args.channels)
+    except Exception:
+        pass
+    if n_feat_expected is not None and n_feat_expected != forest.n_features:
+        sys.exit(f"模型要 {forest.n_features} 维特征，但 {args.channels} 通道只算得出 "
+                 f"{n_feat_expected} 维。--channels 给错了，或者这个模型不是这套特征训的。"
+                 "不拦住的话，特征会整体错位而模型照样给得出结果。")
+    for name, content in files.items():
         p = os.path.join(args.out, name)
         with open(p, "w", encoding="utf-8") as f:
             f.write(content)
