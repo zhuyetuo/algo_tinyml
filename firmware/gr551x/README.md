@@ -41,8 +41,7 @@ make SDK_ROOT=/path/to/GR551x_SDK GEN_DIR=/path/to/generated objs
 `TM_FEAT_MAX_T` / `TM_FEAT_MAX_NPERSEG` 默认 32（16Hz × 2 秒）。**按实际窗口调小
 能省一半 RAM**：上限 64 时 bss 是 4624 B，32 时是 2320 B。
 
-
-
+---
 ## 完整固件：链得出来，实测过
 
 **不是"应该能链"——这里真的用 `arm-none-eabi-gcc 13.2` 链出了 .bin。**
