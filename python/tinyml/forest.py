@@ -14,7 +14,7 @@
     否则                →  x[node_feature[i]] <= node_threshold[i] 走左，否则走右
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -175,6 +175,49 @@ def from_sklearn(model, class_names=None, max_depth=None, min_samples_leaf=None,
         # 别处（list）能跑，恰恰是最容易漏掉的那种。
         class_names=_pick_names(class_names, model),
     )
+
+
+def quantize_leaves(forest: Forest, levels: int = 255) -> Forest:
+    """把叶子概率量化成 uint8（再还原回 float 用于评估），**4 倍地省叶子表**。
+
+    为什么这件事对 RF 特别关键：RF 的叶子表比节点表还大。5 分类、叶子占节点数
+    一半的话，节点侧是 6 B/节点，叶子侧是 20 B/叶子 = 10 B/节点——**叶子才是大头**。
+    砍深度、砍棵数都是在砍节点和叶子的**数量**，而这里砍的是**单价**，两者相乘。
+
+    量化方式：概率天然落在 [0, 1]，所以不需要 per-tensor scale，固定 1/255 即可。
+    取整用四舍五入远离零，跟 quantize_input_ref 一致（np.round 是 banker's
+    rounding，会在 .5 上跟 C 走不同方向）。
+
+    还有一个白捡的好处：叶子变成整数之后，端上累加 n 棵树可以全程走 int32——
+    浮点加法不满足结合律那套"板上跟 PC 差一点点"的麻烦直接没有了，
+    而且 argmax 在整数上是精确的。除以棵数那步不用做，argmax 对正的常数缩放不变。
+
+    返回的是**新的 Forest**，原来的不动——调用方要能拿两个跑同一批样本对比。
+    """
+    if levels < 1 or levels > 255:
+        raise ValueError(f"levels={levels} 要在 1..255（uint8 存得下才有意义）")
+    p = np.asarray(forest.leaf_proba, np.float64)
+    q = np.floor(p * levels + 0.5)          # 四舍五入远离零；p >= 0 所以 floor(+0.5) 即可
+    q = np.clip(q, 0, levels)
+    return replace(forest, leaf_proba=(q / levels).astype(np.float32))
+
+
+def compact_flash_bytes(forest: Forest, leaf_bits: int = 32) -> dict:
+    """紧凑布局下各部分占多少 flash。
+
+    节点 6 字节（AoS）：feature uint16 + threshold float32 的低位打包，
+    左孩子恒为 idx+1 所以不存，只存右孩子 —— 跟 GBDT 那边同一套编码。
+    叶子按 leaf_bits 决定单价：32 = float32 原样，8 = uint8 量化。
+    """
+    if leaf_bits not in (8, 32):
+        raise ValueError(f"leaf_bits={leaf_bits} 只支持 8 或 32")
+    n_nodes = len(forest.node_feature)
+    n_leaves = len(forest.leaf_proba)
+    return {
+        "nodes": n_nodes * 6,
+        "leaves": n_leaves * forest.n_classes * (leaf_bits // 8),
+        "tree_offset": (forest.n_trees + 1) * 4,
+    }
 
 
 def flash_bytes(forest: Forest) -> dict:
