@@ -27,6 +27,22 @@ from tinyml.forest import flash_bytes, from_sklearn  # noqa: E402
 
 
 
+def _need(path, flag):
+    """--features / --labels 的路径检查。跟 --model 一样，不存在就说清楚怎么来——
+    这两个文件不是训练的产物，得先用 dump_holdout.py 导一次，而那件事
+    不说的话没人知道。"""
+    p = os.path.expanduser(path)
+    if os.path.exists(p):
+        return p
+    sys.exit(
+        f"{flag} 找不到：{p}\n"
+        f"  （相对路径会解析成 {os.path.abspath(p)}）\n"
+        "  这个文件要先导一次——在 imu_train 目录下跑：\n"
+        "    python ~/algo_tinyml/python/dump_holdout.py \\\n"
+        "        --processed-dir data/processed_<DATE>_missing_drop_window \\\n"
+        "        --hz 16 --remap configs/remap_custom_3class.yaml")
+
+
 def resolve_model(path):
     """把 --model 的路径解析清楚，不存在就给一条**能照着改**的报错。
 
@@ -109,8 +125,11 @@ def main():
 
     X = y = None
     if args.features and args.labels:
-        X = np.load(args.features).astype(np.float32)
-        y = np.load(args.labels).astype(np.int64)
+        X = np.load(_need(args.features, "--features")).astype(np.float32)
+        y = np.load(_need(args.labels, "--labels")).astype(np.int64)
+        if len(X) != len(y):
+            sys.exit(f"特征 {len(X)} 行、标签 {len(y)} 行，对不上。错位的话每一个"
+                     "指标都是错的，而且看起来完全正常——用 dump_holdout.py 一起导。")
         print(f"留出集 {len(X)} 条")
     else:
         print("没给 --features/--labels，只报体积不报准确率。"

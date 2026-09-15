@@ -82,3 +82,24 @@ def test_prf_和_macro_f1_算得对():
     # 类别 2 一个都没预测对 → F1=0，不该是 nan
     assert mod.prf(y, p, 2)[2] == 0.0
     assert not np.isnan(mod.macro_f1(y, p, 3))
+
+
+@pytest.mark.parametrize("name", ["prune_gbdt", "prune_rf"])
+def test_features_路径错时告诉人怎么生成(name):
+    """--features 不是训练的产物，得先用 dump_holdout.py 导一次。
+    只说"找不到"的话，人不知道这文件从哪来——我第一次就是这么让人卡住的。"""
+    mod = _load(name)
+    with pytest.raises(SystemExit) as e:
+        mod._need("holdout_feats.npy", "--features")
+    msg = str(e.value)
+    assert "dump_holdout" in msg, "报错里没说怎么生成这个文件"
+    assert os.path.abspath("holdout_feats.npy") in msg
+
+
+def test_dump_holdout_不在_imu_train_目录时明确报错(tmp_path, monkeypatch):
+    mod = _load("dump_holdout")
+    monkeypatch.setattr(sys, "argv", ["x", "--processed-dir", "d",
+                                      "--imu-train", str(tmp_path)])
+    with pytest.raises(SystemExit) as e:
+        mod.main()
+    assert "imu_train" in str(e.value)
