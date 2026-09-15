@@ -46,13 +46,15 @@ python/
   tinyml/forest.py       随机森林：从 sklearn 抽成扁平数组 + 参考前向
   tinyml/features.py     193 维手工特征的参考实现（纯 numpy float32）
   tinyml/export_forest_c.py / export_features_c.py   导出森林和特征常量表
-  export_rf.py           把平台在用的 .pkl + 特征表一起导成板上的 C（要 sklearn）
+  export_rf.py           sklearn 随机森林 → 板上的 C（要 sklearn）
+  export_gbdt.py         **XGBoost → 板上的 C**（要 xgboost）
   rf_footprint.py        量 RF 搬过去占多少 flash（要 sklearn）
   verify_against_scipy.py  量端侧特征 vs scipy 版差多少、**判别翻了多少**（要 scipy）
 firmware/tinyml/         跟芯片无关的纯 C，PC 上也能编（tests/ 就是这么测的）
   tm_runtime.c/h         int8 推理（conv1d / maxpool / dense），无 malloc、无 float
   tm_window.c/h          环形缓冲 → 窗口 → 量化
   tm_forest.c/h          随机森林推理（照抄 sklearn 的概率平均，不是多数投票）
+  tm_gbdt.c/h            XGBoost 推理（判决是 < 不是 <=；叶子相加；端上不做 softmax）
   tm_features.c/h        193 维手工特征（含基-2 FFT、Welch、时域统计）
 firmware/gr551x/         挂进 Goodix SDK 的工程（见它自己的 README）
   tinyml_app/GCC/Makefile      交叉编译 + 报体积，SDK 用 SDK_ROOT 指过去不复制
