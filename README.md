@@ -66,6 +66,7 @@ docs/frameworks.md       Cortex-M4F 上有哪些推理框架、为什么我们�
 docs/market.md           市面上的项圈（FitBark/Fi/Tractive/Maven/Whistle）是不是端侧推理
 docs/model_choice.md     端侧选哪个模型（1D-CNN / GBDT / LR / RF 的体积对照）
 docs/features_cost.md    193 维特征贵在哪、能不能不用 float32、怎么砍
+docs/xgb_result.md       **xgb 200 轮实测 + 怎么塞进 128KB**（轮数曲线/编码/二分类）
 tools/host_sim.c         在 PC 上跑板上那份 C，喂真实数据
 ```
 
