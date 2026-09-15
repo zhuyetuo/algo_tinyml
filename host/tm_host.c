@@ -100,4 +100,13 @@ double th_ch_mean(int c) { return (c >= 0 && c < TM_N_CH) ? tm_model_prep.ch_mea
 double th_ch_std(int c)  { return (c >= 0 && c < TM_N_CH) ? tm_model_prep.ch_std[c] : 0.0; }
 double th_in_scale(void) { return tm_model_prep.in_scale; }
 int    th_in_zp(void)    { return tm_model_prep.in_zp; }
+
+/* 输出侧的量化参数。端上用不到——argmax 对仿射变换保序，所以板子直接对
+ * int8 分数取 argmax 就行，不用还原成实数，更不用算 softmax。
+ *
+ * 但服务端要给标注平台一个**置信度**，那就得还原：
+ *   logit = (score - out_zp) * out_scale，再 softmax。
+ * 这一步只影响"显示成多少分"，不影响判决——判决在板上已经定了。 */
+double th_out_scale(void) { return tm_model.out_scale; }
+int    th_out_zp(void)    { return tm_model.out_zp; }
 int    th_arena_bytes(void) { return TM_ARENA_BYTES; }
