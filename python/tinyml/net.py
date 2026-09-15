@@ -30,9 +30,14 @@ class Conv1D:
     w: np.ndarray  # float32 [out_ch, in_ch, k]
     b: np.ndarray  # float32 [out_ch]
     relu: bool = True
+    pad: int = 0   # 两端各补多少。pad=k//2 就是 PyTorch 的 padding='same'（k 为奇数时）
 
-    def forward(self, x):  # x: [in_ch, T] -> [out_ch, T-k+1]
+    def forward(self, x):  # x: [in_ch, T] -> [out_ch, T + 2*pad - k + 1]
         oc, ic, k = self.w.shape
+        if self.pad:
+            # **补的是 0**，不是边缘复制。量化那一侧对应的是补 zero_point，
+            # 因为 int8 里的"实数 0"就是 zp——这一点靠 _affine 保证 0 可精确表示。
+            x = np.pad(x, ((0, 0), (self.pad, self.pad)))
         t_out = x.shape[1] - k + 1
         assert t_out > 0, "窗口比卷积核还短"
         y = np.empty((oc, t_out), dtype=np.float32)
@@ -43,6 +48,38 @@ class Conv1D:
                     acc += self.w[o, c, j] * x[c, j:j + t_out]
             y[o] = acc
         return np.maximum(y, 0.0) if self.relu else y
+
+
+def fold_batchnorm(conv: Conv1D, gamma, beta, mean, var, eps=1e-5) -> Conv1D:
+    """把 BatchNorm1d **折进**卷积的权重和偏置，端上就不需要 BN 这个算子了。
+
+    推理期的 BN 是一个逐通道的仿射变换（训练期不是——那时用的是 batch 统计量，
+    而且 running_mean/var 还在更新）。所以：
+
+        y = gamma * (conv(x) - mean) / sqrt(var + eps) + beta
+          = conv_folded(x)，其中
+            w' = w * s[:, None, None]        s = gamma / sqrt(var + eps)
+            b' = (b - mean) * s + beta
+
+    这在浮点上是**恒等变换**（不是近似），所以折完之后 float 前向的结果不变。
+    对量化反而是好事：BN 单独存在的话要么多一层重量化（多一次精度损失），
+    要么在端上引入 float —— 折进去之后两样都没有。
+
+    注意 eps 要跟训练时一致。PyTorch 的 BatchNorm1d 默认 1e-5；填错的话
+    误差很小但确实存在，属于"板上跟训练差一点点"里最难查的那一类。
+    """
+    s = np.asarray(gamma, np.float64) / np.sqrt(np.asarray(var, np.float64) + eps)
+    n_out = conv.w.shape[0]
+    for name, v in (("gamma", gamma), ("beta", beta), ("mean", mean), ("var", var)):
+        if len(np.asarray(v).reshape(-1)) != n_out:
+            raise ValueError(
+                f"BN 的 {name} 长度 {len(np.asarray(v).reshape(-1))} "
+                f"对不上卷积的输出通道数 {n_out}")
+    w = conv.w.astype(np.float64) * s[:, None, None]
+    b = (conv.b.astype(np.float64) - np.asarray(mean, np.float64)) * s \
+        + np.asarray(beta, np.float64)
+    return Conv1D(w.astype(np.float32), b.astype(np.float32),
+                  relu=conv.relu, pad=conv.pad)
 
 
 @dataclass
@@ -133,6 +170,7 @@ class QConv:
     in_zp: int
     out_zp: int
     relu: bool
+    pad: int = 0
 
 
 @dataclass
@@ -237,6 +275,7 @@ def quantize(net: FloatNet, calib_x, class_names=None):
             w=qw, bias=qb,
             mult=np.array(mult, np.int32), shift=np.array(shift, np.int32),
             in_zp=cur_zp, out_zp=out_zp, relu=lyr.relu,
+            pad=getattr(lyr, "pad", 0),
         ))
         cur_scale, cur_zp = out_scale, out_zp
 
@@ -289,6 +328,12 @@ def forward_int(qnet: QNet, x_i8):
             acc = lyr.w.astype(np.int64) @ xi.reshape(-1) + lyr.bias.astype(np.int64)
         else:
             oc, ic, k = lyr.w.shape
+            if lyr.pad:
+                # **在减掉 zero_point 之后补 0**，等价于在 int8 域补 in_zp。
+                # 顺序反过来（先补 0 再减 zp）会让 padding 位置贡献 -zp，
+                # 那是个凭空的常数偏置，而且只在边界上——表现成"边缘几个点不对"，
+                # 中间全对，最像"实现没问题只是数值误差"的那种错。
+                xi = np.pad(xi, ((0, 0), (lyr.pad, lyr.pad)))
             t_out = xi.shape[1] - k + 1
             acc = np.empty((oc, t_out), dtype=np.int64)
             for o in range(oc):
