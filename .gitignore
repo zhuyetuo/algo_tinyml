@@ -14,3 +14,7 @@ release/
 # **更要紧的是别把一份假模型提交进来**：本机自测时会造随机权重的演示导出，
 # 名字跟真的一模一样，提交进去之后谁也分不出来，而它编得过、也能跑。
 firmware/generated*/
+
+# serve_edge.sh 的运行时文件
+.edge_service.pid
+logs/
