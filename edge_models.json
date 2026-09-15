@@ -1,0 +1,36 @@
+{
+  "_说明": [
+    "端侧服务要挂哪些模型。**加模型改这个文件就行**，不用动代码或启动脚本。",
+    "",
+    "后处理（稳定版 v2 那一套）是跟模型无关的模板：窗口长度、步长、类别、",
+    "label_mode 全部从模型自己的 meta json 里读，滞回/合并/最短时长那套参数",
+    "从 imu_train/label_service/config.py 读（跟线上同一份）。所以新模型挂上去",
+    "就自动拥有跟线上完全一致的后处理，只有模型本身不同——这正是模型对比要的。",
+    "",
+    "字段：",
+    "  tag   平台上看到的名字，也是版本串 edge:<tag>。不能重复。",
+    "  gen   导出目录（export_cnn.py / export_rf.py --compact 的产物）",
+    "  meta  imu_train 的元数据 json。CNN 用 dl_*.json，RF 用 ml_*.json",
+    "  kind  cnn / rf。不写就按 tag 里含不含 rf 猜（老规矩）",
+    "",
+    "gen 和 meta 支持 glob，但必须**唯一匹配**——匹配到多个会当场报错并列出",
+    "候选，不会替你挑一个。挑错了不报错，只会让平台上的结果对应到另一份模型。",
+    "相对路径相对于本文件所在目录。",
+    "",
+    "列表里第一个是默认模型（平台不指定 model 时用它）。"
+  ],
+  "models": [
+    {
+      "tag": "edge_cnn_i8",
+      "kind": "cnn",
+      "gen": "firmware/generated_cnn_a",
+      "meta": "~/imu_train/results_edge_a/*/16hz_remap_custom_3class/dl_cnn_best.json"
+    },
+    {
+      "tag": "edge_rf_d10",
+      "kind": "rf",
+      "gen": "firmware/generated_rf",
+      "meta": "~/imu_train/results_edge_rf/*/16hz_remap_custom_3class/rf/ml_rf.json"
+    }
+  ]
+}

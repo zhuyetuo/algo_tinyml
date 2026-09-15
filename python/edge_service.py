@@ -24,11 +24,20 @@
     而分家之后"模型对比"里混进了后处理的差异，那个差异不显示在任何地方。
     要比的只是模型，所以后处理必须是同一份代码。
 
+**后处理是个跟模型无关的模板**：窗口几何、类别、label_mode 从模型自己的 meta
+读，滞回/合并/最短时长那套从 label_service 读。所以再挂一个模型上去，它自动
+拥有跟线上一模一样的后处理，差别只有模型本身。加模型 = 往 edge_models.json
+里加四行，不用改这里的代码。
+
 用法：
-    python python/edge_service.py \\
-        --gen firmware/generated_cnn_a \\
-        --meta ~/imu_train/results_edge_a/.../dl_cnn_best.json \\
+    python python/edge_service.py --models edge_models.json \\
         --imu-train ~/imu_train --host 0.0.0.0 --port 8900
+
+老写法照样能用（一个模型一对 --gen/--meta）：
+    python python/edge_service.py \\
+        --gen edge_cnn_i8=firmware/generated_cnn_a \\
+        --meta edge_cnn_i8=~/imu_train/results_edge_a/.../dl_cnn_best.json \\
+        --imu-train ~/imu_train
 """
 
 import argparse
@@ -91,26 +100,6 @@ def load_postprocess():
             "  stable/viterbi 要复用 imu_train/label_service/postprocess.py，"
             "--imu-train 指对了吗？")
     return ls_config, ls_post
-
-
-def _as_hz(v):
-    """采样率必须是**整数**。
-
-    重采样那条路走的是 `math.gcd(device_hz, model_hz)`，而 gcd 只吃 int：
-    传 50.0 进去直接 `TypeError: 'float' object cannot be interpreted as an
-    integer`。平台的 sample_hz 过一趟 JSON 就是 50.0，于是 303 个样本全挂，
-    错误信息还完全看不出跟采样率有关。所以在入口处就转干净。
-
-    真的不是整数（49.8）时**报错，不四舍五入**——那说明上游的采样率算错了，
-    悄悄取整只会把问题挪到时间轴上。
-    """
-    f = float(v)
-    n = int(round(f))
-    if abs(f - n) > 1e-6:
-        raise ValueError(f"采样率 {f} 不是整数，重采样要求整数采样率")
-    if n <= 0:
-        raise ValueError(f"采样率 {f} 不合法")
-    return n
 
 
 class EdgeRunner:
@@ -362,13 +351,93 @@ class Handler(BaseHTTPRequestHandler):
             return {"error": f"{type(e).__name__}: {e}"}
 
 
+def _pick_one(pattern, what):
+    """glob 出**恰好一个**路径。
+
+    训练产出的目录名带日期批次，写死的话换一批数据就得改配置。
+    但找到多个时**不挑**：挑错了不会报错，只会让平台上的结果对应到
+    另一份模型——而那件事没有任何迹象。
+    """
+    p = os.path.expanduser(str(pattern))
+    hits = sorted(glob.glob(p)) if any(c in p for c in "*?[") else (
+        [p] if os.path.exists(p) else [])
+    if not hits:
+        sys.exit(f"{what} 找不到：{p}")
+    if len(hits) > 1:
+        sys.exit(f"{what} 匹配到 {len(hits)} 个，不猜。写具体一点：\n  "
+                 + "\n  ".join(hits))
+    return hits[0]
+
+
+def load_models_config(path):
+    """从配置文件读要挂哪些模型。
+
+    **为什么要有这个文件**：后处理这套（稳定版 v2）是跟模型无关的模板——
+    窗口几何、类别、label_mode 全部从模型自己的 meta 里来，滞回/合并那套
+    参数从 label_service 来。所以"再加一个模型"本该只是加几行数据，
+    而不是改脚本。改脚本的版本里，加模型要动 serve_edge.sh 的三处写死路径，
+    漏掉一处的表现是**服务照常起来，只是少了一个模型**。
+
+    格式（models 是个列表，顺序即默认模型的优先级）：
+
+        {"models": [
+          {"tag": "edge_cnn_i8",
+           "gen":  "firmware/generated_cnn_a",
+           "meta": "~/imu_train/results_edge_a/*/*/dl_cnn_best.json",
+           "kind": "cnn"}
+        ]}
+
+    gen / meta 支持 glob，但必须**唯一匹配**。相对路径相对于配置文件所在目录。
+    kind 不写就按老规矩从 tag 里猜（含 rf 就是 RF），旧配置照样能用。
+    """
+    path = os.path.abspath(os.path.expanduser(path))
+    with open(path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    items = cfg.get("models") if isinstance(cfg, dict) else cfg
+    if not isinstance(items, list) or not items:
+        sys.exit(f"{path} 里没有 models 列表")
+    base = os.path.dirname(path)
+
+    def resolve(v, what):
+        v = os.path.expanduser(str(v))
+        if not os.path.isabs(v):
+            v = os.path.join(base, v)
+        return _pick_one(v, what)
+
+    out = []
+    seen = set()
+    for i, m in enumerate(items):
+        tag = str(m.get("tag") or "").strip()
+        if not tag:
+            sys.exit(f"{path} 里第 {i + 1} 个模型没写 tag")
+        # 标签重复**必须报错**：后一个会悄悄盖掉前一个，而平台上两份结果
+        # 都标着同一个 tag，事后分不清哪份是哪份
+        if tag in seen:
+            sys.exit(f"{path} 里模型标签重复：{tag}")
+        seen.add(tag)
+        for k in ("gen", "meta"):
+            if not m.get(k):
+                sys.exit(f"{path} 里模型 {tag} 缺 {k}")
+        kind = str(m.get("kind") or ("rf" if "rf" in tag.lower() else "cnn"))
+        if kind not in ("cnn", "rf"):
+            sys.exit(f"{path} 里模型 {tag} 的 kind={kind!r} 不认识，只有 cnn / rf")
+        out.append({"tag": tag, "kind": kind,
+                    "gen": resolve(m["gen"], f"模型 {tag} 的导出目录"),
+                    "meta": resolve(m["meta"], f"模型 {tag} 的 meta json")})
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gen", action="append", required=True, metavar="TAG=DIR",
+    ap.add_argument("--models", metavar="JSON",
+                    help="模型清单（见 load_models_config 的说明）。"
+                         "加模型时改这个文件，不用改代码或启动脚本。"
+                         "给了它就不用 --gen/--meta")
+    ap.add_argument("--gen", action="append", metavar="TAG=DIR",
                     help="端侧模型：标签=导出目录。可以给多次。"
                          "标签里含 rf 的走 RF 路线（tm_features+tm_forest），"
                          "否则走 CNN（tm_prep+tm_invoke）")
-    ap.add_argument("--meta", action="append", required=True, metavar="TAG=JSON",
+    ap.add_argument("--meta", action="append", metavar="TAG=JSON",
                     help="端侧模型：标签=imu_train 的元数据 json。可以给多次。"
                          "CNN 用 dl_*.json（带 ch_mean/ch_std），"
                          "RF 用 ml_*.json（不需要归一化，没那两项）")
@@ -393,19 +462,32 @@ def main():
             out[k] = v
         return out
 
-    gens, metas = kv(args.gen, "gen"), kv(args.meta, "meta")
-    if set(gens) != set(metas):
-        sys.exit(f"--gen 和 --meta 的标签对不上：{sorted(gens)} vs {sorted(metas)}")
+    # 两种来源。**旧的 --gen/--meta 保留**：已经写好的命令行不该因为
+    # 加了配置文件就失效
+    if args.models:
+        if args.gen or args.meta:
+            sys.exit("--models 和 --gen/--meta 只能给一种，同时给了不知道听谁的")
+        specs = load_models_config(args.models)
+    else:
+        if not args.gen or not args.meta:
+            sys.exit("要么给 --models，要么给成对的 --gen/--meta")
+        gens, metas = kv(args.gen, "gen"), kv(args.meta, "meta")
+        if set(gens) != set(metas):
+            sys.exit(f"--gen 和 --meta 的标签对不上：{sorted(gens)} vs {sorted(metas)}")
+        specs = [{"tag": t, "gen": gens[t], "meta": os.path.expanduser(metas[t]),
+                  # 按标签选路线。写死"含 rf 就是 RF"看着土，但比自动探测
+                  # 导出目录里有什么文件可靠——两条都导过的目录会让自动探测
+                  # 选错，而选错不报错
+                  "kind": "rf" if "rf" in t.lower() else "cnn"}
+                 for t in sorted(gens)]
 
-    for tag in sorted(gens):
-        # 按标签选路线。写死"含 rf 就是 RF"看着土，但比自动探测导出目录里
-        # 有什么文件可靠——两条都导过的目录会让自动探测选错，而选错不报错
-        kind = "rf" if "rf" in tag.lower() else "cnn"
+    for spec in specs:
+        tag, kind = spec["tag"], spec["kind"]
         # 两条路线的元数据字段不同：CNN 要 ch_mean/ch_std（tm_prep 用），
         # RF 不做归一化所以没有那两项。按路线读，别用同一套必填项
-        meta = load_meta(os.path.expanduser(metas[tag]), kind=kind)
+        meta = load_meta(spec["meta"], kind=kind)
         if kind == "rf":
-            eng = serve.RfEngine(serve.build_rf(gens[tag]))
+            eng = serve.RfEngine(serve.build_rf(spec["gen"]))
             print(f"  {tag:<16} [RF] {eng.n_ch}×{eng.n_t}，{eng.n_classes} 类，"
                   f"{eng.n_features} 维特征（在 C 里算）")
             fatal = False
@@ -430,7 +512,7 @@ def main():
                     "  ②导出的 tm_forest_model.c 跟验过的不是同一份；\n"
                     "  ③导出时的窗口长度/通道数跟训练时不一致。")
         else:
-            eng = serve.Engine(serve.build(gens[tag]))
+            eng = serve.Engine(serve.build(spec["gen"]))
             bad = eng.selftest()
             flag = "✓ 逐位一致" if bad == 0 else f"✗ {bad} 字节对不上"
             print(f"  {tag:<16} [CNN] {eng.n_ch}×{eng.n_t}，{eng.n_classes} 类，"
@@ -441,7 +523,9 @@ def main():
         Handler.runners[tag] = EdgeRunner(tag, eng, meta, args.imu_train,
                                           args.resample, kind=kind)
 
-    Handler.default_tag = sorted(gens)[0]
+    # 默认模型 = 清单里的第一个。配置文件里顺序是人写的，尊重它；
+    # --gen 那条路是排序后的第一个（保持老行为不变）
+    Handler.default_tag = specs[0]["tag"]
     Handler.nas_root = os.path.abspath(os.path.expanduser(args.nas_root))
 
     srv = serve.listen(args.host, args.port, Handler,

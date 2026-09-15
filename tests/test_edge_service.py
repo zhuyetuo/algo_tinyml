@@ -1070,3 +1070,109 @@ def test_chatter_is_replayed_when_it_blows_up(runner, tmp_path, capsys,
     with pytest.raises(RuntimeError, match="炸了"):
         runner.infer(str(p), HZ, min_windows=1, max_gap=2, targets=CLASSES)
     assert "崩之前打的这行" in capsys.readouterr().out
+
+
+# ── 模型清单：加模型是改数据，不是改代码 ──────────────────────────────────
+
+
+def _cfg(tmp_path, models):
+    p = tmp_path / "edge_models.json"
+    p.write_text(json.dumps({"models": models}, ensure_ascii=False),
+                 encoding="utf-8")
+    return str(p)
+
+
+def test_config_resolves_globs_and_relative_paths(tmp_path):
+    """路径相对配置文件、glob 唯一匹配时直接解开。
+
+    训练产出目录名带日期批次，写死的话换一批数据就得改配置。
+    """
+    import edge_service
+    (tmp_path / "gen_a").mkdir()
+    (tmp_path / "r_20260901").mkdir()
+    (tmp_path / "r_20260901" / "dl.json").write_text("{}", encoding="utf-8")
+    got = edge_service.load_models_config(_cfg(tmp_path, [
+        {"tag": "m1", "kind": "cnn", "gen": "gen_a", "meta": "r_*/dl.json"}]))
+    assert got == [{"tag": "m1", "kind": "cnn",
+                    "gen": str(tmp_path / "gen_a"),
+                    "meta": str(tmp_path / "r_20260901" / "dl.json")}]
+
+
+def test_ambiguous_glob_refuses_instead_of_picking(tmp_path):
+    """匹配到多个**不挑**。挑错了不报错，只会让平台上的结果对应到另一份模型
+    ——而那件事没有任何迹象。"""
+    import edge_service
+    (tmp_path / "gen_a").mkdir()
+    for d in ("r_20260901", "r_20260902"):
+        (tmp_path / d).mkdir()
+        (tmp_path / d / "dl.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(SystemExit, match="不猜"):
+        edge_service.load_models_config(_cfg(tmp_path, [
+            {"tag": "m1", "gen": "gen_a", "meta": "r_*/dl.json"}]))
+
+
+def test_missing_path_is_named(tmp_path):
+    import edge_service
+    (tmp_path / "gen_a").mkdir()
+    with pytest.raises(SystemExit, match="找不到"):
+        edge_service.load_models_config(_cfg(tmp_path, [
+            {"tag": "m1", "gen": "gen_a", "meta": "没有这个/dl.json"}]))
+
+
+def test_duplicate_tag_is_refused(tmp_path):
+    """重复标签后一个会悄悄盖掉前一个，而平台上两份结果都标着同一个 tag，
+    事后分不清哪份是哪份。"""
+    import edge_service
+    (tmp_path / "g").mkdir()
+    (tmp_path / "m.json").write_text("{}", encoding="utf-8")
+    one = {"tag": "m1", "gen": "g", "meta": "m.json"}
+    with pytest.raises(SystemExit, match="重复"):
+        edge_service.load_models_config(_cfg(tmp_path, [one, dict(one)]))
+
+
+def test_kind_defaults_to_the_old_tag_rule(tmp_path):
+    """不写 kind 就按老规矩从 tag 猜（含 rf 就是 RF）——旧配置照样能用。"""
+    import edge_service
+    (tmp_path / "g").mkdir()
+    (tmp_path / "m.json").write_text("{}", encoding="utf-8")
+    got = edge_service.load_models_config(_cfg(tmp_path, [
+        {"tag": "edge_rf_d10", "gen": "g", "meta": "m.json"},
+        {"tag": "edge_cnn_i8", "gen": "g", "meta": "m.json"}]))
+    assert [m["kind"] for m in got] == ["rf", "cnn"]
+
+
+def test_unknown_kind_is_refused(tmp_path):
+    """kind 打错了不能当成 cnn 跑——那会拿 CNN 的路线去跑一棵森林。"""
+    import edge_service
+    (tmp_path / "g").mkdir()
+    (tmp_path / "m.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(SystemExit, match="不认识"):
+        edge_service.load_models_config(_cfg(tmp_path, [
+            {"tag": "m1", "kind": "gbdt", "gen": "g", "meta": "m.json"}]))
+
+
+def test_config_order_decides_the_default_model(tmp_path):
+    """列表顺序是人写的，第一个是默认模型。排序会让默认模型随改名而变。"""
+    import edge_service
+    (tmp_path / "g").mkdir()
+    (tmp_path / "m.json").write_text("{}", encoding="utf-8")
+    got = edge_service.load_models_config(_cfg(tmp_path, [
+        {"tag": "z_model", "kind": "cnn", "gen": "g", "meta": "m.json"},
+        {"tag": "a_model", "kind": "cnn", "gen": "g", "meta": "m.json"}]))
+    assert [m["tag"] for m in got] == ["z_model", "a_model"], \
+        "顺序被排序打乱了，默认模型会变成名字最小的那个"
+
+
+def test_shipped_config_is_valid_json_and_names_both_models():
+    """仓库里那份 edge_models.json 本身要是合法的。
+
+    它是部署时直接用的那份；写坏了的表现是服务起不来，而那时候
+    人正在等着服务起来。
+    """
+    p = os.path.join(os.path.dirname(__file__), "..", "edge_models.json")
+    cfg = json.load(open(p, encoding="utf-8"))
+    tags = [m["tag"] for m in cfg["models"]]
+    assert tags == ["edge_cnn_i8", "edge_rf_d10"], tags
+    for m in cfg["models"]:
+        assert m["kind"] in ("cnn", "rf")
+        assert m["gen"] and m["meta"]
