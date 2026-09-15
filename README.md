@@ -43,9 +43,14 @@ python/
   tinyml/export_c.py     导出 tm_model.c/h + tm_golden.h
   train_torch.py         训练（**唯一依赖 torch 的文件**），输出纯 numpy 的 model.npz
   quantize_and_export.py 量化 + 导出，只要 numpy
+  tinyml/forest.py       随机森林：从 sklearn 抽成扁平数组 + 参考前向
+  tinyml/export_forest_c.py  导出 tm_forest_model.c/h + tm_forest_golden.h
+  export_rf.py           把平台在用的 .pkl 导成板上的 C（要 sklearn）
+  rf_footprint.py        量 RF 搬过去占多少 flash（要 sklearn）
 firmware/tinyml/
   tm_runtime.c/h         int8 推理（conv1d / maxpool / dense），无 malloc、无 float
   tm_window.c/h          环形缓冲 → 窗口 → 量化
+  tm_forest.c/h          随机森林推理（照抄 sklearn 的概率平均，不是多数投票）
 tests/                   C ↔ Python 逐位对照（现场用 gcc 编）
 docs/chip_choice.md      芯片选型
 ```
@@ -163,19 +168,66 @@ for (int i = 0; i < TM_GOLDEN_N; i++) {
 是同一次推理结果的后处理解码模式（`raw` 逐窗口原始输出 / `stable` 滞回+合并 /
 `viterbi` 动态规划），见 imu_train 的 `label_service/postprocess.py`。
 
-RF 要搬到 GR5513 上，三个障碍，难度递增：
+**RF 端侧能跑。** 算力根本不是问题，这一点容易想当然地搞反：
 
-1. **体积**——sklearn 默认 `max_depth=None`，节点数完全由数据决定，只能量：
+- 窗口是 16Hz × 2 秒 = **32 个点**，`features.py` 里 `welch(nperseg=min(len(x), 32))`
+  就是个 32 点 FFT。整条特征链（十来次 32 元素排序 + 8 路 32 点 FFT + 一堆统计量）
+  撑死几万次浮点运算，一两秒才跑一次，占空比不到 0.5%。
+- RF 推理本身**比 CNN 还便宜**——只有比较，没有乘法。200 棵树 × 十几二十层
+  ≈ 几千次比较。
+
+真正的约束只有一条，剩下的是工作量：
+
+1. **flash 体积（唯一可能真卡住的）**——`configs/ml.yaml` 是
+   `n_estimators: 200, max_depth: null`，不限深意味着节点数完全由训练数据量决定，
+   可能几十 KB，也可能上 MB。**可测**：
    ```bash
    python python/rf_footprint.py --model ~/imu_train/results/.../rf/xxx.pkl
    ```
-   它会打印节点数和三种编码下的 flash 占用，以及预算内能放几棵。
-2. **特征**——193 维手工特征里有 Welch PSD，端上要做 FFT。算得动（M4F 有 DSP 指令
-   + CMSIS-DSP），但那是 float 的，两边**做不到逐位一致**，只能定容差。这比 int8 CNN
-   的一致性问题难一个量级。
-3. **后处理搬不过来**——`viterbi` 要看完整条时间轴才解码，端侧是流式的、看不到未来。
-   必须改成有限延迟的在线版，而改完**结果跟平台上不一样**。这一点要先想清楚：
-   否则同一段数据，项圈说是抓挠、平台说不是，而两边都"没错"。
+   超了多半也可解：**限深往往比砍树掉点少**——不限深的树尾部都是只覆盖几个样本的
+   过拟合分支，那部分是噪声不是信息。
+2. **193 维特征要在 C 里重写一遍（工作量，不是可行性）**——`np.percentile` 的插值
+   方式、`find_peaks` 的判定、Welch 的分段和窗函数，每一个都是一处可能跟 scipy
+   写岔的地方。活儿不难但很碎，而且同样要拿 golden vector 钉住。
 
-所以这个仓库的默认路线是 int8 CNN，不是把 RF 搬过去——端侧要的是流式 + 定点可验证。
-平台那边继续用 RF 不受影响，两者本来就是不同约束下的不同选择。
+关于**浮点能不能两边一致**：算术核心能——全程锁 float32、关掉 FMA 合并
+（`-ffp-contract=off`），IEEE-754 的加减乘除和 sqrt 都是精确定义的。对不齐的是 libm
+的超越函数（频谱熵的 `logf`、偏度峰度的 `powf`、窗函数的正弦表）在不同实现上
+末位可能不同。这是要处理的细节，不是墙；而且对 RF 的影响比对 CNN 还小——只有
+正好卡在阈值边上的样本会翻分支，200 棵树投票会摊掉。
+
+**流式解码那件事跟 RF 无关**，别记到它头上：`viterbi` 要看完整条时间轴才解码，
+端侧看不到未来，必须改成有限延迟的在线版，改完结果会跟平台不一样。这一条
+**跑什么模型都一样**，CNN 也躲不掉。
+
+## 两条路线都做了
+
+| | int8 CNN | 随机森林 |
+|---|---|---|
+| 模型体积 | ~1KB | 要量（`rf_footprint.py` / `export_rf.py` 都会打印） |
+| 前处理 | 只要窗口 + 量化，已实现 | **193 维手工特征要在 C 里重写，这部分还没做** |
+| 算术 | 定点，板上跟 PC **逐位相同** | float32，逐位相同要靠 `-ffp-contract=off`，已验证 |
+| 跟平台一致 | 两个模型、两套表现 | **同一个模型、同一套结论** |
+| 代码 | `tm_runtime.c` + `tm_window.c` | `tm_forest.c` |
+| 导出 | `quantize_and_export.py` | `export_rf.py` |
+
+RF 路线的 golden vector 比的是概率的**位模式**（`%08x`），不是 argmax——只比 argmax
+的话，一个已经算错、只是恰好还没把类别翻过去的实现能一路混到量产。
+
+**RF 还差最后一块：特征提取。** 模型本身（树的遍历、概率平均、并列取下标小的、
+`<=` 走左）已经导出并逐位验过了，但端上还得先有那 193 维特征才能喂给它。
+`np.percentile` 的插值方式、`find_peaks` 的判定、Welch 的分段和窗函数——每一个
+都要在 C 里重写并跟 scipy 对齐。活儿不难但很碎，是这条路线上剩下的主要工作量。
+
+怎么选，等体积数出来：
+
+```bash
+python python/rf_footprint.py --model ~/imu_train/results/.../rf/xxx.pkl
+```
+
+限深之后能压进预算的话，**RF 是更稳的选择**——理由是表里最后一行：端上跑的就是
+平台在跑的那个模型，项圈和平台给同一套结论。换 CNN 就是两个模型，以后每次对不上
+都要先查是模型差异还是实现差异。
+
+（`viterbi` 那种整条时间轴的解码两条路线都搬不过来，端侧看不到未来，必须改成
+有限延迟的在线版——这跟选哪个模型无关。）
