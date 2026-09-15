@@ -45,7 +45,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import serve  # noqa: E402
-from tinyml.edge_model import EdgeCNN  # noqa: E402
+from tinyml.edge_model import EdgeCNN, EdgeRF  # noqa: E402
 from tinyml.torch_import import load_meta  # noqa: E402
 
 
@@ -69,11 +69,15 @@ def add_imu_train(repo):
 class EdgeRunner:
     """一个端侧模型 + 一套推理参数。"""
 
-    def __init__(self, tag, engine, meta, imu_train, resample="poly"):
+    def __init__(self, tag, engine, meta, imu_train, resample="poly", kind="cnn"):
         self.tag = tag
         self.engine = engine
         self.meta = meta
-        self.model = EdgeCNN(engine, meta["classes"])
+        self.kind = kind
+        # 两条路线的包装不同，但对 infer_file 来说都是一个有 predict_proba
+        # 的对象——这正是复用整条预处理链的前提
+        self.model = EdgeCNN(engine, meta["classes"]) if kind == "cnn" \
+            else EdgeRF(engine, meta["classes"])
         self.classes = list(meta["classes"])
         self.window_size = int(meta["window_size"])
         self.model_hz = int(meta["hz"])
@@ -244,7 +248,9 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gen", action="append", required=True, metavar="TAG=DIR",
-                    help="端侧模型：标签=导出目录。可以给多次")
+                    help="端侧模型：标签=导出目录。可以给多次。"
+                         "标签里含 rf 的走 RF 路线（tm_features+tm_forest），"
+                         "否则走 CNN（tm_prep+tm_invoke）")
     ap.add_argument("--meta", action="append", required=True, metavar="TAG=JSON",
                     help="端侧模型：标签=imu_train 的 dl_*.json。可以给多次")
     ap.add_argument("--imu-train", default=os.path.expanduser("~/imu_train"))
@@ -272,16 +278,26 @@ def main():
     if set(gens) != set(metas):
         sys.exit(f"--gen 和 --meta 的标签对不上：{sorted(gens)} vs {sorted(metas)}")
 
-    for tag in gens:
+    for tag in sorted(gens):
         meta = load_meta(os.path.expanduser(metas[tag]))
-        eng = serve.Engine(serve.build(gens[tag]))
-        Handler.runners[tag] = EdgeRunner(tag, eng, meta, args.imu_train, args.resample)
-        bad = eng.selftest()
-        flag = "✓ 逐位一致" if bad == 0 else f"✗ {bad} 字节对不上"
-        print(f"  {tag:<16} {eng.n_ch}×{eng.n_t}，{eng.n_classes} 类，"
-              f"golden {eng.golden_n} 条 {flag}")
-        if bad:
-            sys.exit("golden vector 自检没过，导出和运行时不配套，不要用这个服务的结果。")
+        # 按标签选路线。写死"含 rf 就是 RF"看着土，但比自动探测导出目录里
+        # 有什么文件可靠——两条都导过的目录会让自动探测选错，而选错不报错
+        kind = "rf" if "rf" in tag.lower() else "cnn"
+        if kind == "rf":
+            eng = serve.RfEngine(serve.build_rf(gens[tag]))
+            print(f"  {tag:<16} [RF] {eng.n_ch}×{eng.n_t}，{eng.n_classes} 类，"
+                  f"{eng.n_features} 维特征（在 C 里算）")
+        else:
+            eng = serve.Engine(serve.build(gens[tag]))
+            bad = eng.selftest()
+            flag = "✓ 逐位一致" if bad == 0 else f"✗ {bad} 字节对不上"
+            print(f"  {tag:<16} [CNN] {eng.n_ch}×{eng.n_t}，{eng.n_classes} 类，"
+                  f"golden {eng.golden_n} 条 {flag}")
+            if bad:
+                sys.exit("golden vector 自检没过，导出和运行时不配套，"
+                         "不要用这个服务的结果。")
+        Handler.runners[tag] = EdgeRunner(tag, eng, meta, args.imu_train,
+                                          args.resample, kind=kind)
 
     Handler.default_tag = sorted(gens)[0]
     Handler.nas_root = os.path.abspath(os.path.expanduser(args.nas_root))

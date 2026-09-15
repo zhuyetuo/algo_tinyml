@@ -68,6 +68,105 @@ def build(gen_dir, out_so=None, cc="gcc"):
     return out_so
 
 
+def build_rf(gen_dir, out_so=None, cc="gcc"):
+    """编 RF 那条路线的 .so（tm_features + tm_forest）。
+
+    跟 build() 分开，因为两条路线的导出文件名不同——合成一个带开关的函数，
+    "只导了其中一条"时会报一堆莫名其妙的 include 错误，而不是一句话说清缺什么。
+    """
+    gen_dir = os.path.abspath(os.path.expanduser(gen_dir))
+    need = ["tm_forest_model.c", "tm_forest_model.h", "tm_feat_cfg.c", "tm_feat_cfg.h"]
+    missing = [f for f in need if not os.path.exists(os.path.join(gen_dir, f))]
+    if missing:
+        sys.exit(f"{gen_dir} 里缺 {missing}。\n"
+                 "  先跑 export_rf.py 生成，--out 指到这个目录。")
+    out_so = out_so or os.path.join(tempfile.mkdtemp(), "tm_host_rf.so")
+    cmd = [cc, "-O2", "-std=c99", "-Wall", "-Wextra", "-Werror",
+           "-ffp-contract=off", "-fno-math-errno", "-fPIC", "-shared",
+           f"-I{FW}", f"-I{gen_dir}",
+           os.path.join(FW, "tm_features.c"), os.path.join(FW, "tm_forest.c"),
+           os.path.join(gen_dir, "tm_forest_model.c"),
+           os.path.join(gen_dir, "tm_feat_cfg.c"),
+           os.path.join(ROOT, "host", "tm_host_rf.c"),
+           "-lm", "-o", out_so]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"编译失败：\n{r.stderr}")
+    return out_so
+
+
+class RfEngine:
+    """RF 那条的 ctypes 包装。特征在 C 里算——这是重点，见 host/tm_host_rf.c。"""
+
+    def __init__(self, so_path):
+        self.lib = ctypes.CDLL(so_path)
+        L = self.lib
+        for name in ("thr_n_ch", "thr_n_t", "thr_n_classes",
+                     "thr_n_features", "thr_feat_dim"):
+            getattr(L, name).restype = ctypes.c_int
+            getattr(L, name).argtypes = []
+        L.thr_class_name.restype = ctypes.c_char_p
+        L.thr_class_name.argtypes = [ctypes.c_int]
+        L.thr_infer_batch.restype = ctypes.c_int
+        L.thr_infer_batch.argtypes = [
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int8)]
+        L.thr_features.restype = ctypes.c_int
+        L.thr_features.argtypes = [ctypes.POINTER(ctypes.c_float),
+                                   ctypes.POINTER(ctypes.c_float)]
+
+        self.n_ch = L.thr_n_ch()
+        self.n_t = L.thr_n_t()
+        self.n_classes = L.thr_n_classes()
+        self.n_features = L.thr_n_features()
+        self.feat_dim = L.thr_feat_dim()
+        self.classes = [L.thr_class_name(i).decode("utf-8")
+                        for i in range(self.n_classes)]
+        if self.feat_dim != self.n_features:
+            # 这个不能等到推理时才发现：森林会按下标读越界的特征，
+            # **不会崩**，只是给出一个看起来正常的概率
+            raise ValueError(
+                f"特征维度对不上：tm_features 产出 {self.feat_dim} 维，"
+                f"森林按 {self.n_features} 维训的。导出时的窗口/通道数配错了。")
+        self.lock = threading.Lock()
+
+    def features(self, win):
+        """算一个窗口的特征。单独暴露是为了能跟 Python 参考分开对账——
+        混在一起的话，对不上时分不清是特征错了还是森林错了。"""
+        w = np.ascontiguousarray(np.asarray(win, np.float32))
+        if w.shape != (self.n_ch, self.n_t):
+            raise ValueError(f"窗口形状要 ({self.n_ch}, {self.n_t})，给的是 {w.shape}")
+        out = np.empty(self.feat_dim, np.float32)
+        with self.lock:
+            rc = self.lib.thr_features(
+                w.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+        if rc != 0:
+            raise RuntimeError(f"tm_features 返回 {rc}（窗口超出编译期上限？）")
+        return out
+
+    def infer(self, wins):
+        """wins: float32 [N, n_ch, n_t] → (类别 [N], 概率 [N, n_classes])。"""
+        w = np.ascontiguousarray(np.asarray(wins, np.float32))
+        if w.ndim == 2:
+            w = w[None]
+        if w.shape[1:] != (self.n_ch, self.n_t):
+            raise ValueError(f"窗口形状要 [N, {self.n_ch}, {self.n_t}]，给的是 {w.shape}")
+        n = w.shape[0]
+        proba = np.empty((n, self.n_classes), np.float32)
+        cls = np.empty(n, np.int8)
+        with self.lock:
+            rc = self.lib.thr_infer_batch(
+                w.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), n,
+                proba.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                cls.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
+        if rc == -2:
+            raise RuntimeError("特征维度跟森林对不上")
+        if rc != 0:
+            raise RuntimeError(f"thr_infer_batch 返回 {rc}")
+        return cls.astype(np.int64), proba
+
+
 class Engine:
     """ctypes 包一层。形状全从 C 里问，不在 Python 这边写死——
     写死的话换个模型就会静默错位，而错位的表现是"效果突然变差"。"""

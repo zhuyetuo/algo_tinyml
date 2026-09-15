@@ -71,3 +71,51 @@ class EdgeCNN:
 
     def predict(self, X_aligned):
         return np.argmax(self.predict_proba(X_aligned), axis=1)
+
+
+class EdgeRF:
+    """RF 那条：重力对齐后的原始窗口进 C，**特征也在 C 里算**。
+
+    为什么不用 imu_train 的 extract_features 算好再喂给森林：那样得到的是
+    "服务器上的 RF"。板子算特征用的是 tm_features（float32、自己的 FFT），
+    imu_train 用的是 scipy（float64、不同的 FFT 实现），两者**做不到逐位一致**
+    （tm_features.h 顶部写明了这一点）。差多少要单独量，不能假装没有。
+
+    平台上看到的必须是板子会算出来的结果，所以这里走 C 那一份。
+
+    is_dl=True 是给 infer_file 看的：它靠这个字段决定要不要在 Python 里
+    算手工特征。这里要拿到的是**原始窗口**（X_aligned），特征自己在 C 里算，
+    所以必须是 True。写成 False 的话 infer_file 会先算一遍 scipy 特征
+    再喂进来——形状还正好是 193，不会报错，但算的是另一套。
+    """
+
+    def __init__(self, engine, classes=None):
+        self.engine = engine
+        self.classes = list(classes or engine.classes)
+        if len(self.classes) != engine.n_classes:
+            raise ValueError(
+                f"类别数对不上：传进来 {len(self.classes)} 个，"
+                f"模型是 {engine.n_classes} 个。")
+        self.is_dl = True
+
+    def predict_proba(self, X_aligned):
+        """X_aligned: float [N, T, C] → float64 [N, n_classes]。
+
+        森林直接给概率（各棵树叶子概率的平均），不需要 softmax——
+        它已经是概率了，再过一次 softmax 会把分布压平，置信度全错。
+        """
+        X = np.asarray(X_aligned, np.float32)
+        if X.ndim != 3:
+            raise ValueError(f"要 [N, T, C]，给的是 {X.shape}")
+        n, t, c = X.shape
+        if (c, t) != (self.engine.n_ch, self.engine.n_t):
+            raise ValueError(
+                f"窗口是 {t} 点 × {c} 通道，模型要 {self.engine.n_t} 点 × "
+                f"{self.engine.n_ch} 通道。")
+        if n == 0:
+            return np.empty((0, len(self.classes)), np.float64)
+        _, proba = self.engine.infer(np.ascontiguousarray(X.transpose(0, 2, 1)))
+        return proba.astype(np.float64)
+
+    def predict(self, X_aligned):
+        return np.argmax(self.predict_proba(X_aligned), axis=1)
