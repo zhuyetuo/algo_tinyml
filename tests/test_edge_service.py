@@ -99,6 +99,12 @@ def hot_label(runner, tmp_path_factory):
 
 def _write_csv(path, n_rows, seed=0, null_from=None):
     """造一段带时间戳的 IMU CSV，列名用 load_csv 认得的那套。"""
+    return _write_csv_at(path, n_rows, HZ, seed, null_from)
+
+
+def _write_csv_at(path, n_rows, hz, seed=0, null_from=None):
+    """指定采样率。**重采样那条路只有 hz != 16 时才走得到**，
+    而真实数据是 50Hz 的 _raw.csv——线上每个样本都走那条。"""
     rng = np.random.default_rng(seed)
     t0 = np.datetime64("2026-08-11T09:00:00")
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -110,7 +116,7 @@ def _write_csv(path, n_rows, seed=0, null_from=None):
         w.writerow(["timestamp", "acc_x", "acc_y", "acc_z",
                     "gyro_x", "gyro_y", "gyro_z"])
         for i in range(n_rows):
-            ts = (t0 + np.timedelta64(int(i * 1000 / HZ), "ms")).astype(str)
+            ts = (t0 + np.timedelta64(int(i * 1000 / hz), "ms")).astype(str)
             if null_from is not None and i >= null_from:
                 w.writerow([ts, "", "", "", "", "", ""])
                 continue
@@ -801,3 +807,98 @@ def test_pipeline_selftest_actually_compares(tmp_path):
     eng = serve.RfEngine(serve.build_rf(str(d), out_so=str(d / "tp.so")))
     pipe = [r for r in eng.selftest() if "整条链" in r[0]][0]
     assert pipe[2] > 0, "改了 golden 自检却没红——那它根本没在比"
+
+
+# ── 采样率：重采样那条路 ──────────────────────────────────────────────────
+
+
+def test_resampling_path_works_when_device_hz_differs(runner, tmp_path):
+    """device_hz != model_hz 时要走重采样，而**我之前的端到端测试全传的
+    device_hz == 16**，正好绕开了这条路。
+
+    真实数据是 50Hz 的 `_raw.csv`，所以线上每一个样本都走这里。
+    第一次跑批 303 个全失败就是这一段炸的。
+    """
+    p = tmp_path / "hz50.csv"
+    _write_csv_at(str(p), n_rows=50 * 60, hz=50, seed=31)
+    out = runner.infer(str(p), device_hz=50, min_windows=1, max_gap=2,
+                       targets=["抓挠"])
+    # 50Hz 一分钟 → 16Hz 约 960 点 → (960-16)/8+1 = 119 窗口左右
+    assert out["n_windows"] > 100, f"只出了 {out['n_windows']} 个窗口，重采样没生效？"
+
+
+def test_float_sample_rate_is_accepted_when_integral():
+    """**这是那个真实 bug 的回归测试。**
+
+    平台传过来的 sample_hz 经过 JSON 会变成 50（int）或 50.0（float），
+    而我在服务里写了 `float(...)`——imu_train 的 downsample 用
+    math.gcd(device_hz, model_hz)，gcd 只吃整数，50.0 直接抛
+    "TypeError: 'float' object cannot be interpreted as an integer"。
+
+    303 个样本全失败，而且每个只用 0.4 秒——快得根本来不及读完一个
+    18 万行的 CSV。那个"快"本该早点提醒我是前置步骤炸了。
+    """
+    import edge_service
+    assert edge_service._as_hz(50.0) == 50
+    assert edge_service._as_hz(50) == 50
+    assert edge_service._as_hz("16") == 16
+    assert isinstance(edge_service._as_hz(50.0), int)
+
+
+def test_fractional_sample_rate_is_refused_not_rounded():
+    """真正的小数率要**报错，不是四舍五入**。
+
+    重采样比是按整数比算的（gcd）。把 49.8 当成 50，整条时间轴会慢慢漂，
+    而每一段片段的起止时间看起来一直是正常的——最难发现的那种错。
+    """
+    import edge_service
+    with pytest.raises(ValueError, match="不是整数"):
+        edge_service._as_hz(49.8)
+    with pytest.raises(ValueError, match="不合法"):
+        edge_service._as_hz(0)
+
+
+def test_gcd_really_rejects_floats():
+    """钉住这个前提本身：math.gcd 不吃 float。
+
+    哪天 Python 放宽了这个限制，上面那条防护就成了多余的——
+    但在那之前，它是必须的。
+    """
+    from math import gcd
+    with pytest.raises(TypeError):
+        gcd(50.0, 16)
+
+
+def test_http_layer_handles_a_50hz_file(runner, tmp_path):
+    """**走 Handler._one，不是直接调 runner.infer。**
+
+    这一条是补一个真实的漏：上面那些端到端测试全是直接调 runner.infer()，
+    而 `device_hz` 的类型转换在 `_one()` 里——HTTP 那一层从来没被测到。
+    于是我在 `_one()` 里写的 `float(...)` 一路绿着上了线，
+    线上 303 个样本全失败。
+
+    变异测试也证实了：把 `_as_hz` 换回 `float`，上面那些测试**全是绿的**。
+    """
+    import edge_service
+    h = edge_service.Handler.__new__(edge_service.Handler)
+    h.runners = {"edge_cnn_i8": runner}
+    h.default_tag = "edge_cnn_i8"
+    h.nas_root = str(tmp_path)
+
+    _write_csv_at(str(tmp_path / "raw50.csv"), n_rows=50 * 60, hz=50, seed=41)
+    # device_hz 按 JSON 过来的样子给：**float**，跟平台实际发的一致
+    r = h._one({"path": "raw50.csv", "mode": "raw", "device_hz": 50.0})
+    assert "error" not in r, f"HTTP 层失败了：{r.get('error')}"
+    assert r["n_windows"] > 100
+    assert r["model_path"] == "edge://edge_cnn_i8.edge"
+
+
+def test_http_layer_rejects_fractional_hz_with_a_clear_message(runner, tmp_path):
+    import edge_service
+    h = edge_service.Handler.__new__(edge_service.Handler)
+    h.runners = {"edge_cnn_i8": runner}
+    h.default_tag = "edge_cnn_i8"
+    h.nas_root = str(tmp_path)
+    _write_csv_at(str(tmp_path / "x.csv"), n_rows=200, hz=50, seed=1)
+    r = h._one({"path": "x.csv", "mode": "raw", "device_hz": 49.8})
+    assert "不是整数" in (r.get("error") or ""), r
