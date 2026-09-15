@@ -10,3 +10,5 @@ from .net import (  # noqa: F401
     forward_int, make_net, quantize,
 )
 from .export_c import export  # noqa: F401
+from .forest import Forest, from_sklearn  # noqa: F401
+from .export_forest_c import export as export_forest  # noqa: F401
