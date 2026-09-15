@@ -6,11 +6,13 @@
 #   ./serve_edge.sh stop       停掉
 #   ./serve_edge.sh status     看在不在跑
 #
-# 模型目录和 .json 路径**自动找**，不用每次粘贴一长串。
-# 找不到或者找到多个时明确报错并列出候选，不猜。
+# 挂哪些模型看 edge_models.json。**加模型改那个文件，不用改这个脚本。**
+# 里面的路径支持 glob（训练产出目录带日期批次），但必须唯一匹配——
+# 匹配到多个会当场报错并列出候选，不替你挑。挑错了不报错，
+# 只会让平台上的结果对应到另一份模型。
 #
 # 覆盖默认值（一般用不到）：
-#   PORT=8901 NAS_ROOT=/mnt/nas ./serve_edge.sh
+#   PORT=8901 NAS_ROOT=/mnt/nas MODELS=别的.json ./serve_edge.sh
 
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -67,37 +69,12 @@ esac
 BG=no
 [ "${1:-}" = "-d" ] && BG=yes
 
-# ── 找模型 ────────────────────────────────────────────────────────────────
-# 训练产出的目录名带日期批次，写死的话换一批数据就得改脚本。
-# 自动找；找到多个就列出来让人选，**不挑一个**——挑错了不会报错，
-# 只会让平台上的结果对应到另一份模型。
-pick_one() {
-    local what=$1 pattern=$2 n
-    local -a hits
-    mapfile -t hits < <(compgen -G "$pattern" 2>/dev/null || true)
-    n=${#hits[@]}
-    if [ "$n" -eq 0 ]; then
-        echo "找不到 $what（找的是 $pattern）" >&2
-        return 1
-    fi
-    if [ "$n" -gt 1 ]; then
-        echo "$what 找到多个，不猜。用环境变量指定其中一个：" >&2
-        printf '  %s\n' "${hits[@]}" >&2
-        return 1
-    fi
-    echo "${hits[0]}"
-}
-
-CNN_META=${CNN_META:-$(pick_one "CNN 的 .json" \
-    "$IMU_TRAIN/results_edge_a/*/16hz_remap_custom_3class/dl_cnn_best.json")} || exit 1
-RF_META=${RF_META:-$(pick_one "RF 的 .json" \
-    "$IMU_TRAIN/results_edge_rf/*/16hz_remap_custom_3class/rf/ml_rf.json")} || exit 1
-CNN_GEN=${CNN_GEN:-$ROOT/firmware/generated_cnn_a}
-RF_GEN=${RF_GEN:-$ROOT/firmware/generated_rf}
-
-for d in "$CNN_GEN" "$RF_GEN"; do
-    [ -d "$d" ] || { echo "导出目录不存在：$d"; echo "  先跑 export_cnn.py / export_rf.py --compact"; exit 1; }
-done
+# ── 模型清单 ──────────────────────────────────────────────────────────────
+# **加模型改 edge_models.json，不改这个脚本。**
+# 以前这里给每个模型写死一串 glob，加一个模型要动三处；漏掉一处的表现是
+# 服务照常起来，只是少了一个模型——不报错，只是那个模型在平台上不存在。
+MODELS=${MODELS:-$ROOT/edge_models.json}
+[ -f "$MODELS" ] || { echo "模型清单不存在：$MODELS（用 MODELS= 指定）"; exit 1; }
 [ -d "$NAS_ROOT" ] || { echo "NAS 根不存在：$NAS_ROOT（用 NAS_ROOT= 覆盖）"; exit 1; }
 
 # ── 拉代码 ────────────────────────────────────────────────────────────────
@@ -109,19 +86,19 @@ fi
 stop_it
 
 ARGS=(
-    python "$ROOT/python/edge_service.py"
-    --gen  "edge_cnn_i8=$CNN_GEN"  --meta "edge_cnn_i8=$CNN_META"
-    --gen  "edge_rf_d10=$RF_GEN"   --meta "edge_rf_d10=$RF_META"
+    # **-u（不缓冲）**：不加的话 Python 发现 stdout 不是终端就会开缓冲，
+    # 后台起的时候日志文件**一直是空的**，直到缓冲满或进程退出。
+    # 服务是常驻的，那意味着实际上永远看不到日志。
+    python -u "$ROOT/python/edge_service.py"
+    --models "$MODELS"
     --imu-train "$IMU_TRAIN"
     --nas-root "$NAS_ROOT"
     --host "$HOST" --port "$PORT"
 )
 
-echo "▶ CNN  $CNN_GEN"
-echo "       $CNN_META"
-echo "▶ RF   $RF_GEN"
-echo "       $RF_META"
-echo "▶ NAS  $NAS_ROOT"
+echo "▶ 模型清单  $MODELS"
+sed -n 's/.*"tag" *: *"\([^"]*\)".*/    · \1/p' "$MODELS"
+echo "▶ NAS       $NAS_ROOT"
 echo ""
 
 if [ "$BG" = yes ]; then
