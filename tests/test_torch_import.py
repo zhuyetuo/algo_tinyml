@@ -46,7 +46,9 @@ def _fake_state_dict(seed=0, filters=FILTERS, k=3):
 
 def _meta(**over):
     m = {
-        "model": "cnn", "window_size": N_T, "n_channels": N_CH,
+        # hz 也是必填：两条路线都要用它算特征/重采样。
+        # imu_train 的 dl_*.json 和 ml_*.json 里都有
+        "model": "cnn", "window_size": N_T, "n_channels": N_CH, "hz": 16,
         "classes": ["活动", "睡觉", "抓挠", "未佩戴", "甩身体"],
         "ch_mean": [0.1] * N_CH, "ch_std": [2.0] * N_CH,
     }
@@ -148,7 +150,7 @@ def test_rejects_class_count_mismatch(patched):
         ti.load_cnn(pt, js)
 
 
-@pytest.mark.parametrize("missing", ["classes", "ch_mean", "ch_std", "window_size"])
+@pytest.mark.parametrize("missing", ["classes", "ch_mean", "ch_std", "window_size", "hz"])
 def test_meta_requires_every_field_inference_needs(tmp_path, missing):
     m = _meta()
     del m[missing]
@@ -177,3 +179,46 @@ def test_normalize_is_per_channel_not_global(tmp_path):
     got = normalize(x, meta)
     for c in range(N_CH):
         assert np.allclose(got[c], (10.0 - c) / (c + 1), atol=1e-5)
+
+
+# ── 两条路线要的字段不一样 ────────────────────────────────────────────────
+
+
+def test_rf_meta_does_not_require_normalisation_params(tmp_path):
+    """**RF 不需要 ch_mean/ch_std。**
+
+    森林吃的是 193 维手工特征，特征从原始量纲的窗口算，阈值就是按那些
+    原始特征值训的——不做任何归一化。给它 ch_mean 反而是错的。
+
+    这一条是补一个真实的错：我一开始用同一个 load_meta 去读 RF 的
+    ml_rf.json，报"缺 ch_mean"。那不是 json 的问题，是我把 CNN 的加载器
+    套到了 RF 上。
+    """
+    m = {"classes": ["活动", "抓挠"], "window_size": 16, "hz": 16,
+         "stride": 8, "gravity_aligned": True, "label_mode": "majority"}
+    p = tmp_path / "ml_rf.json"
+    p.write_text(json.dumps(m, ensure_ascii=False), encoding="utf-8")
+    got = load_meta(str(p), kind="rf")          # 不该抛
+    assert got["classes"] == ["活动", "抓挠"]
+
+    # 同一份 json 按 cnn 读必须报错——两者不能混着用
+    with pytest.raises(ValueError, match="ch_mean"):
+        load_meta(str(p), kind="cnn")
+
+
+def test_rf_meta_still_requires_the_shared_fields(tmp_path):
+    """类别/窗口/采样率这三样两条路线都要，缺了照样报错。"""
+    for missing in ("classes", "window_size", "hz"):
+        m = {"classes": ["a"], "window_size": 16, "hz": 16}
+        del m[missing]
+        p = tmp_path / f"no_{missing}.json"
+        p.write_text(json.dumps(m), encoding="utf-8")
+        with pytest.raises(ValueError, match=missing):
+            load_meta(str(p), kind="rf")
+
+
+def test_unknown_kind_is_refused(tmp_path):
+    p = tmp_path / "x.json"
+    p.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="只支持"):
+        load_meta(str(p), kind="gbdt")
