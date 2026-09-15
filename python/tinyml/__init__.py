@@ -7,7 +7,7 @@
 
 from .net import (  # noqa: F401
     Conv1D, Dense, FloatNet, MaxPool1D, QNet,
-    forward_int, make_net, quantize,
+    forward_int, forward_int_batch, make_net, quantize,
 )
 from .export_c import export  # noqa: F401
 from .forest import Forest, from_sklearn  # noqa: F401

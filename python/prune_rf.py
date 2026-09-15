@@ -23,6 +23,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from tinyml.progress import track  # noqa: E402
 from tinyml.forest import (  # noqa: E402
     compact_flash_bytes, flash_bytes, from_sklearn, quantize_leaves,
 )
@@ -164,7 +165,7 @@ def main():
         line = f"  {tag:<18} {n:>8} 节点  {b:>9,} B ({b / 1024:>7.1f} KB)"
         line += "  塞得下" if b <= args.budget else f"  超 {b / args.budget:.1f}×"
         if X is not None:
-            pred = np.array([f.predict(x) for x in X])
+            pred = np.array([f.predict(x) for x in track(X, desc=f'  {tag}')])
             line += f"   macro-F1 {_macro_f1(y, pred, n_cls):.4f}"
         print(line)
 
@@ -204,7 +205,9 @@ def main():
                 b = sum(compact_flash_bytes(f, leaf_bits=8).values())
                 s = None
                 if X is not None:
-                    s = _macro_f1(y, np.array([f.predict(x) for x in X]), n_cls)
+                    pred = np.array([f.predict(x) for x in
+                                     track(X, desc=f'  {n} 棵 × 深 {d}')])
+                    s = _macro_f1(y, pred, n_cls)
                 rows.append((n, d, b, s))
                 print(f"  {n:>3} 棵 × 深 {d:>2}   {b:>9,} B ({b / 1024:>7.1f} KB)"
                       + ("  塞得下" if b <= args.budget else f"  超 {b / args.budget:.1f}×")

@@ -25,6 +25,30 @@ from .fixedpoint import (
 # 而且量化器可以用随机权重测试——不用先有一个训好的模型才能验证工具链。
 
 
+def im2col(x, k, pad):
+    """把卷积的滑窗摊平成矩阵，让卷积变成一次矩阵乘：[in_ch, T] → [in_ch*k, t_out]。
+
+    **这不是可有可无的优化。** 原来是 for o / for c / for j 三重循环，
+    在测试用的 [8,16,32] 上够快，换到 imu_train 真实的 [64,128,256] 上
+    第三层要跑 256×128×3 = 98304 次切片，乘以两万多条留出集样本——
+    几十小时，表现成"命令跑着不动"。这个差距我没量过就把命令发出去了。
+
+    摊平的顺序必须跟 w.reshape(oc, ic*k) 对上：w[o,c,j] 对应 cols[c*k+j, t]，
+    所以中间那一维是 k，外面那一维是 ic。反了的话结果是错的但形状是对的。
+
+    padding 补 0：跟量化那侧补 zero_point 是同一件事（int8 里实数 0 就是 zp）。
+    """
+    ic, T = x.shape
+    if pad:
+        x = np.pad(x, ((0, 0), (pad, pad)))
+    t_out = x.shape[1] - k + 1
+    if t_out <= 0:
+        raise ValueError(f"窗口 {T} 点（补完 {x.shape[1]}）比卷积核 {k} 还短")
+    # k 次切片，每次 [ic, t_out]。k 一般是 3，比 as_strided 好懂且不会踩到
+    # 视图重叠的坑（后面还要做矩阵乘，strided 视图会被复制一份，没省到内存）
+    return np.stack([x[:, j:j + t_out] for j in range(k)], axis=1).reshape(ic * k, t_out)
+
+
 @dataclass
 class Conv1D:
     w: np.ndarray  # float32 [out_ch, in_ch, k]
@@ -34,19 +58,8 @@ class Conv1D:
 
     def forward(self, x):  # x: [in_ch, T] -> [out_ch, T + 2*pad - k + 1]
         oc, ic, k = self.w.shape
-        if self.pad:
-            # **补的是 0**，不是边缘复制。量化那一侧对应的是补 zero_point，
-            # 因为 int8 里的"实数 0"就是 zp——这一点靠 _affine 保证 0 可精确表示。
-            x = np.pad(x, ((0, 0), (self.pad, self.pad)))
-        t_out = x.shape[1] - k + 1
-        assert t_out > 0, "窗口比卷积核还短"
-        y = np.empty((oc, t_out), dtype=np.float32)
-        for o in range(oc):
-            acc = np.full(t_out, self.b[o], dtype=np.float32)
-            for c in range(ic):
-                for j in range(k):
-                    acc += self.w[o, c, j] * x[c, j:j + t_out]
-            y[o] = acc
+        cols = im2col(x, k, self.pad)                    # [ic*k, t_out]
+        y = (self.w.reshape(oc, ic * k) @ cols + self.b[:, None]).astype(np.float32)
         return np.maximum(y, 0.0) if self.relu else y
 
 
@@ -328,20 +341,15 @@ def forward_int(qnet: QNet, x_i8):
             acc = lyr.w.astype(np.int64) @ xi.reshape(-1) + lyr.bias.astype(np.int64)
         else:
             oc, ic, k = lyr.w.shape
-            if lyr.pad:
-                # **在减掉 zero_point 之后补 0**，等价于在 int8 域补 in_zp。
-                # 顺序反过来（先补 0 再减 zp）会让 padding 位置贡献 -zp，
-                # 那是个凭空的常数偏置，而且只在边界上——表现成"边缘几个点不对"，
-                # 中间全对，最像"实现没问题只是数值误差"的那种错。
-                xi = np.pad(xi, ((0, 0), (lyr.pad, lyr.pad)))
-            t_out = xi.shape[1] - k + 1
-            acc = np.empty((oc, t_out), dtype=np.int64)
-            for o in range(oc):
-                a = np.full(t_out, int(lyr.bias[o]), dtype=np.int64)
-                for c in range(ic):
-                    for j in range(k):
-                        a += int(lyr.w[o, c, j]) * xi[c, j:j + t_out]
-                acc[o] = a
+            # im2col 里的 padding 补的是 0，而 xi **已经减掉 zero_point** 了，
+            # 所以这等价于在 int8 域补 in_zp。顺序反过来（先补 0 再减 zp）会让
+            # padding 位置贡献 -zp，那是个凭空的常数偏置，而且只在边界上——
+            # 表现成"边缘几个点不对、中间全对"，最像"数值误差"的那种错。
+            cols = im2col(xi, k, lyr.pad)               # [ic*k, t_out]，int64
+            # **整数矩阵乘，所以逐位一致不受影响**：整数加法满足结合律，
+            # 换累加顺序结果完全相同。浮点那边不是这样，这个区别不能混。
+            acc = (lyr.w.astype(np.int64).reshape(oc, ic * k) @ cols
+                   + lyr.bias.astype(np.int64)[:, None])
         # C 那边累加器是 int32。这里用 int64 算，所以**必须显式检查**没有溢出——
         # 不查的话溢出只会表现成"板上和 PC 对不上"，而两边代码看起来都对。
         if np.abs(acc).max() > (1 << 31) - 1:
@@ -351,3 +359,50 @@ def forward_int(qnet: QNet, x_i8):
         if isinstance(lyr, QDense):
             x = x.reshape(-1)
     return x, last_acc
+
+
+def forward_int_batch(qnet: QNet, X_i8):
+    """一次算 N 条：int8 [N, C, T] → int8 [N, n_classes]。
+
+    **跟 forward_int 逐位相同**，不是近似。整数加法满足结合律，所以把 N 条摊进
+    同一个矩阵乘不改变任何一个结果；省下的是 Python 层的开销——原来 _requant
+    要按输出通道循环，256 个通道 × 两万多条样本就是六百万次 Python 迭代，
+    批量之后只剩 256 次。实测 23712 条从 4 分钟降到几秒。
+
+    只返回输出，不返回累加器：调试要看某一层的 acc 时用 forward_int 单条跑，
+    批量版返回所有中间量的话内存会很难看。
+    """
+    X = np.asarray(X_i8, np.int8)
+    if X.ndim != 3:
+        raise ValueError(f"要 [N, C, T]，给的是 {X.shape}")
+    n = X.shape[0]
+    x = X
+    for lyr in qnet.layers:
+        if isinstance(lyr, QPool):
+            _, ch, t = x.shape
+            t_out = t // lyr.pool
+            x = x[:, :, :t_out * lyr.pool].reshape(n, ch, t_out, lyr.pool) \
+                 .max(axis=3).astype(np.int8)
+            continue
+        xi = x.astype(np.int64) - lyr.in_zp
+        if isinstance(lyr, QDense):
+            acc = xi.reshape(n, -1) @ lyr.w.astype(np.int64).T \
+                + lyr.bias.astype(np.int64)      # [n, out]
+            acc = acc.T                          # → [out, n]，跟 _requant 的约定一致
+            t_out = 1
+        else:
+            oc, ic, k = lyr.w.shape
+            # 把 N 条拼到时间轴后面：im2col 出来是 [ic*k, N*t_out]，
+            # 一次矩阵乘同时算完所有样本所有时间步
+            cols = np.concatenate([im2col(xi[i], k, lyr.pad) for i in range(n)], axis=1)
+            t_out = cols.shape[1] // n
+            acc = lyr.w.astype(np.int64).reshape(oc, ic * k) @ cols \
+                + lyr.bias.astype(np.int64)[:, None]
+        if np.abs(acc).max() > (1 << 31) - 1:
+            raise OverflowError("累加器超出 int32，C 侧会回绕；把通道数或窗口调小")
+        q = _requant(acc, lyr)                   # [out, n*t_out]
+        if isinstance(lyr, QDense):
+            x = q.T                              # [n, out]
+        else:
+            x = q.reshape(lyr.w.shape[0], n, t_out).transpose(1, 0, 2)
+    return np.asarray(x, np.int8)
