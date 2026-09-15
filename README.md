@@ -68,6 +68,7 @@ docs/model_choice.md     端侧选哪个模型（1D-CNN / GBDT / LR / RF 的体�
 docs/features_cost.md    193 维特征贵在哪、能不能不用 float32、怎么砍
 docs/xgb_result.md       **xgb 200 轮实测 + 怎么塞进 128KB**（轮数曲线/编码/二分类）
 docs/ram_and_cache.md    运行内存实测（模型不占 RAM）+ 8KB cache 那笔账
+docs/dl_edge.md          **1D-CNN 上端侧**：体积/访存对比 + 还差 padding 和 BN 折叠
   python/tune_operating_point.py  扫 min_windows × 类别偏置（两个零 flash 成本的旋钮）
 tools/host_sim.c         在 PC 上跑板上那份 C，喂真实数据
 ```

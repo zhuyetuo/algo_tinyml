@@ -32,7 +32,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from tinyml.gbdt import from_xgboost  # noqa: E402
+from tinyml.adapter import ModelAdapter  # noqa: E402
 
 _ev = None
 
@@ -91,9 +91,10 @@ def main():
 
     bundle = joblib.load(ev.resolve_model(args.model))
     model = bundle.get("model", bundle) if isinstance(bundle, dict) else bundle
-    b = from_xgboost(model, class_names=names)
+    ad = ModelAdapter(model, class_names=names)
+    print(f"模型类型：{ad.kind}，变小的轴是 **{ad.axis_name}**（最大 {ad.total}）")
 
-    rounds = [int(v) for v in args.rounds.split(",") if v]
+    rounds = [int(v) for v in args.rounds.split(",") if v] or ad.default_axis()[-3:]
     mws = [int(v) for v in args.min_windows.split(",") if v]
     biases = [float(v) for v in args.bias.split(",") if v]
 
@@ -104,9 +105,12 @@ def main():
     # margin 只跟轮数有关，先算好，别在三重循环里重复算
     margins = {}
     for r in rounds:
-        t = b.truncate(r)
-        margins[r] = np.stack([t.margins(x) for x in X])
-        print(f"  {r} 轮的 margin 算完")
+        t = ad.variant(r)
+        # GBDT 是 margin、RF 是概率。两者都保序，所以 argmax 和"加偏置挪工作点"
+        # 在两边含义一致——但**数量级差很远**（margin 是几，概率是 0~1），
+        # 所以 --bias 的合适范围两边不一样，下面会提示
+        margins[r] = np.stack([t.scores(x) for x in X])
+        print(f"  {ad.axis_name}={r} 的分数算完")
 
     results = []
     for r in rounds:
@@ -124,19 +128,23 @@ def main():
                                 tp, fp, fn, p, rc))
 
     n_true_ref = results[0][5] if results else 0
+    if ad.kind == "rf":
+        print("\n注意：RF 的分数是**概率**（0~1），不是 margin。"
+              "--bias 的合适范围比 GBDT 小一到两个数量级——"
+              "默认那组 -1.5~0.5 对概率来说太大了，试 -0.3,-0.2,-0.1,0,0.1。")
     print(f"\n⚠ 真值只有 **{n_true_ref} 次事件**（min_windows 变了真值也会变，"
           "表里每行的真值数单列）。\n"
           "  一次事件的变动就能让 P 动几个点——**只看大势，别做精细比较**。\n")
 
     results.sort(reverse=True)
-    hdr = (f"{'事件F1':>8}{'轮数':>6}{'偏置':>7}{'minW':>6}"
+    hdr = (f"{'事件F1':>8}{ad.axis_name:>8}{'偏置':>7}{'minW':>6}"
            f"{'报':>5}{'真值':>6}{'对':>4}{'误报':>6}{'漏':>4}{'事件P':>8}{'事件R':>8}")
     print(f"按事件 F1 排前 {args.top}：")
     print(hdr)
     print("-" * len(hdr))
     for row in results[:args.top]:
         f1, r, bias, mw, npred, ntrue, tp, fp, fn, p, rc = row
-        print(f"{f1:>8.3f}{r:>6}{bias:>7.1f}{mw:>6}{npred:>5}{ntrue:>6}"
+        print(f"{f1:>8.3f}{r:>8}{bias:>7.2f}{mw:>6}{npred:>5}{ntrue:>6}"
               f"{tp:>4}{fp:>6}{fn:>4}{p:>8.3f}{rc:>8.3f}")
 
     # 基线：默认设置下每个轮数各是多少，用来看旋钮到底买到了什么
@@ -146,13 +154,15 @@ def main():
     for row in sorted([x for x in results if x[2] == 0.0 and x[3] == 3],
                       key=lambda z: z[1]):
         f1, r, bias, mw, npred, ntrue, tp, fp, fn, p, rc = row
-        print(f"{f1:>8.3f}{r:>6}{bias:>7.1f}{mw:>6}{npred:>5}{ntrue:>6}"
+        print(f"{f1:>8.3f}{r:>8}{bias:>7.2f}{mw:>6}{npred:>5}{ntrue:>6}"
               f"{tp:>4}{fp:>6}{fn:>4}{p:>8.3f}{rc:>8.3f}")
 
     print("""
 怎么用这张表：
 
-  **找"少轮数 + 调过旋钮"能不能追上"多轮数 + 默认旋钮"。** 追得上的话，
+  """ + ad.caveat() + """
+
+  **找"小模型 + 调过旋钮"能不能追上"大模型 + 默认旋钮"。** 追得上的话，
   省下来的 flash 是白赚的——这两个旋钮在板上都是零成本
   （min_windows 是聚合参数，偏置是一次加法或者直接折进 base_score）。
 

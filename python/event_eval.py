@@ -28,7 +28,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from tinyml.gbdt import from_xgboost  # noqa: E402
+from tinyml.adapter import ModelAdapter  # noqa: E402
 
 
 def resolve_model(path):
@@ -140,7 +140,8 @@ def main():
     ap.add_argument("--labels", required=True)
     ap.add_argument("--classes", default="")
     ap.add_argument("--focus", required=True)
-    ap.add_argument("--rounds", default="15,30,50,100,200")
+    ap.add_argument("--rounds", default="",
+                    help="要扫的点。GBDT 是轮数，RF 是 max_depth。留空=自动")
     ap.add_argument("--min-windows", type=int, default=3)
     ap.add_argument("--max-gap", type=int, default=2)
     ap.add_argument("--force", action="store_true",
@@ -177,19 +178,21 @@ def main():
 
     bundle = joblib.load(resolve_model(args.model))
     model = bundle.get("model", bundle) if isinstance(bundle, dict) else bundle
-    b = from_xgboost(model, class_names=names)
+    ad = ModelAdapter(model, class_names=names)
+    print(f"模型类型：{ad.kind}，变小的轴是 **{ad.axis_name}**（最大 {ad.total}）")
 
     true_ev = to_events(y == fi, args.min_windows, args.max_gap)
     print(f"真值里「{args.focus}」聚合出 {len(true_ev)} 次事件"
           f"（min_windows={args.min_windows}, max_gap={args.max_gap}）\n")
 
-    hdr = (f"{'轮数':>6}{'窗口 P':>10}{'窗口 R':>10}{'窗口 F1':>10}"
+    hdr = (f"{ad.axis_name:>8}{'窗口 P':>10}{'窗口 R':>10}{'窗口 F1':>10}"
            f"{'  │':>4}{'事件数':>8}{'事件 P':>10}{'事件 R':>10}{'事件 F1':>10}")
     print(hdr)
     print("-" * len(hdr))
-    for r in [int(v) for v in args.rounds.split(",") if v]:
-        t = b.truncate(r)
-        pred = np.array([t.predict(x) for x in X])
+    axis = [int(v) for v in args.rounds.split(",") if v] or ad.default_axis()
+    for r in axis:
+        t = ad.variant(r)
+        pred = np.array([int(np.argmax(t.scores(x))) for x in X])
         hits = pred == fi
         tp = int(np.sum(hits & (y == fi)))
         fp = int(np.sum(hits & (y != fi)))
@@ -199,11 +202,13 @@ def main():
         pred_ev = to_events(hits, args.min_windows, args.max_gap)
         etp, efp, efn = match_events(pred_ev, true_ev)
         ep, er, ef = prf(etp, efp, efn)
-        print(f"{r:>6}{wp:>10.3f}{wr:>10.3f}{wf:>10.3f}{'  │':>4}"
+        print(f"{r:>8}{wp:>10.3f}{wr:>10.3f}{wf:>10.3f}{'  │':>4}"
               f"{len(pred_ev):>8}{ep:>10.3f}{er:>10.3f}{ef:>10.3f}")
 
     print(f"""
-窗口级和事件级差多少，决定了"能减到多少轮"。
+{ad.caveat()}
+
+窗口级和事件级差多少，决定了"能减到多少"。
 
   - 事件级明显好于窗口级 → 误报大多是**孤立的单窗口**，聚合能吃掉。
     那就可以放心往下减轮数，省下来的 flash 比那点窗口级 precision 值钱。
