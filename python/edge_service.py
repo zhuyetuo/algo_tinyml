@@ -228,6 +228,30 @@ class EdgeRunner:
             self.label_mode, params, algo=algo)
 
 
+def _as_hz(v):
+    """采样率必须是**整数**。
+
+    imu_train 的 downsample() 用 math.gcd(device_hz, model_hz) 算重采样比，
+    而 gcd 只吃整数——传个 50.0 进去直接抛
+    "TypeError: 'float' object cannot be interpreted as an integer"。
+    这就是端侧模型第一次跑批 303 个全失败的原因，**是我把它转成 float 的**。
+
+    整数值的 float（50.0）接受并转成 int；真正的小数（49.8）**报错而不是四舍五入**：
+    重采样比是按整数比算的，49.8 当成 50 会让整条时间轴慢慢漂，
+    而片段的起止时间看起来一直是正常的。宁可在这里停住。
+    """
+    f = float(v)
+    n = int(round(f))
+    if abs(f - n) > 1e-6:
+        raise ValueError(
+            f"采样率 {f} 不是整数。imu_train 的重采样按整数比算"
+            "（math.gcd），小数率会让时间轴逐渐漂移而片段时间看着正常。"
+            "先确认样本的 sample_hz 是不是记错了。")
+    if n <= 0:
+        raise ValueError(f"采样率 {f} 不合法")
+    return n
+
+
 class Handler(BaseHTTPRequestHandler):
     runners = {}
     default_tag = ""
