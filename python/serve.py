@@ -518,15 +518,20 @@ def listen(host, port, handler, tries=20):
              "  或者直接指一个空的：--port 9000，或 --port 0 让内核挑。")
 
 
-def urls(host, port):
-    """把能点的地址列出来。
+def urls(host, port, path=""):
+    """把能点的地址列出来。path 拼在端口后面，**不是拼在注释后面**。
+
+    原来调用方自己在 f"{u}xxx" 后面接路径，而 u 末尾带着"（本机）"这种注释，
+    拼出来是 "http://127.0.0.1:8900/   （本机）api/v1/label/infer" —— 点不开。
+    路径由这个函数拼，注释永远在最后。
 
     绑 0.0.0.0 时只打印 "<服务器 IP>" 是在给人出题——用户得自己去查 IP。
     这里直接把本机的地址找出来。
     """
+    p = path.lstrip("/")
     if host not in ("0.0.0.0", "::"):
-        return [f"http://{host}:{port}/"]
-    out = [f"http://127.0.0.1:{port}/   （本机）"]
+        return [f"http://{host}:{port}/{p}"]
+    out = [f"http://127.0.0.1:{port}/{p}   （本机）"]
     ips = set()
     try:
         # 不发包，只是让内核挑一条出口路由，从而拿到对外那张网卡的地址。
@@ -541,9 +546,9 @@ def urls(host, port):
         pass
     for ip in sorted(ips):
         if not ip.startswith("127."):
-            out.append(f"http://{ip}:{port}/   （局域网，web 那边用这个）")
+            out.append(f"http://{ip}:{port}/{p}   （局域网，web 那边用这个）")
     if len(out) == 1:
-        out.append(f"http://<服务器 IP>:{port}/   （没探到对外地址，自己填）")
+        out.append(f"http://<服务器 IP>:{port}/{p}   （没探到对外地址，自己填）")
     return out
 
 

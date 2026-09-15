@@ -88,3 +88,47 @@ def _golden(cf: CompactForest, xs):
         f"static const int32_t tm_forest_c_golden_out[] = {{{body}}};\n"
         "\n#endif\n"
     )
+
+
+def pipeline_golden(cf: CompactForest, windows, hz, nperseg, name="tm_forest_c"):
+    """整条链的 golden：原始窗口 → 193 维特征 → 森林 → **整数票数**。
+
+    比只验森林（从特征进）多覆盖一样东西：**特征的排列顺序**。
+    那一维错位不会崩、不会报错，只会让每个阈值都对到别的特征上，
+    而模型照样给得出结果——这是 RF 这条路上唯一没被别的测试覆盖的接缝。
+
+    整数票数意味着没有"数值误差"这个借口：特征那一段是 float，
+    但只要特征算对了，票数就必然逐位相同。所以一旦对不上，
+    **一定是特征错了**（顺序、窗口长度、通道数），而不是森林。
+    """
+    from .features import extract_one
+
+    ws = np.asarray(windows, np.float32)
+    if ws.ndim != 3:
+        raise ValueError(f"windows 要 [N, T, C]，给的是 {ws.shape}")
+    feats = np.stack([extract_one(w, hz, nperseg) for w in ws])
+    if feats.shape[1] != cf.n_features:
+        raise ValueError(
+            f"算出来 {feats.shape[1]} 维特征，森林要 {cf.n_features} 维。"
+            "通道数或窗口长度跟训练时不一致——先解决这个，"
+            "不然板上每一维都会错位而且不报错。")
+    votes = np.stack([cf.votes(f) for f in feats]).astype(np.int32)
+
+    # 板上是 [n_ch][n_t]（通道在前），跟 tm_window 的输出一致。
+    # **这里转置一次**——windows 进来是 [T, C]，写反了整条链都错位
+    flat_in = np.stack([w.T.reshape(-1) for w in ws]).reshape(-1)
+    n, t_len, n_ch = ws.shape
+    return (
+        "/* 自动生成。整条链：原始窗口 → 特征 → 紧凑森林 → **整数票数**。\n"
+        " * 对不上一定是特征那一段错了（顺序/窗口长度/通道数），不是森林——\n"
+        " * 森林那一段的整数累加跟指令集无关，不可能有数值误差。 */\n"
+        "#ifndef TM_FC_PIPELINE_GOLDEN_H\n#define TM_FC_PIPELINE_GOLDEN_H\n\n"
+        "#include <stdint.h>\n\n"
+        f"#define TM_FCP_GOLDEN_N {n}\n"
+        f"#define TM_FCP_N_CH {n_ch}\n"
+        f"#define TM_FCP_N_T {t_len}\n\n"
+        f"static const float {name}_pipeline_in[] = {{"
+        + ", ".join(_f32(v) for v in flat_in) + "};\n"
+        f"static const int32_t {name}_pipeline_votes[] = {{"
+        + ", ".join(str(int(v)) for v in votes.reshape(-1)) + "};\n\n#endif\n"
+    )
