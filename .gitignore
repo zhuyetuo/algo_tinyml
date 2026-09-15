@@ -3,3 +3,4 @@ __pycache__/
 .pytest_cache/
 firmware/generated/
 model.npz
+firmware/gr551x/tinyml_app/GCC/build/

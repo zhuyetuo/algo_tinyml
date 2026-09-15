@@ -49,11 +49,14 @@ python/
   export_rf.py           把平台在用的 .pkl + 特征表一起导成板上的 C（要 sklearn）
   rf_footprint.py        量 RF 搬过去占多少 flash（要 sklearn）
   verify_against_scipy.py  量端侧特征 vs scipy 版差多少、**判别翻了多少**（要 scipy）
-firmware/tinyml/
+firmware/tinyml/         跟芯片无关的纯 C，PC 上也能编（tests/ 就是这么测的）
   tm_runtime.c/h         int8 推理（conv1d / maxpool / dense），无 malloc、无 float
   tm_window.c/h          环形缓冲 → 窗口 → 量化
   tm_forest.c/h          随机森林推理（照抄 sklearn 的概率平均，不是多数投票）
   tm_features.c/h        193 维手工特征（含基-2 FFT、Welch、时域统计）
+firmware/gr551x/         挂进 Goodix SDK 的工程（见它自己的 README）
+  tinyml_app/GCC/Makefile      交叉编译 + 报体积，SDK 用 SDK_ROOT 指过去不复制
+  tinyml_app/Src/user/         上板自检（golden vector）、逐窗口判决 → 事件聚合
 tests/                   C ↔ Python 逐位对照（现场用 gcc 编）
 docs/chip_choice.md      芯片选型
 ```
@@ -173,8 +176,11 @@ for (int i = 0; i < TM_GOLDEN_N; i++) {
 
 - **没有真实模型。** 测试跑的是随机权重——工具链是验过的，模型还没训。要
   `imu_train` 那边先定下端侧用哪几类、窗口多长。
-- **没有 GR551x 的工程文件。** `firmware/tinyml/` 是不依赖芯片头文件的纯 C，
-  怎么挂进 GR551x SDK 的工程还没做。
+- **没有真正链出 .bin。** GR551x 的工程接入做了（`firmware/gr551x/`，已用
+  `arm-none-eabi-gcc` 交叉编译验过：我们这部分 5.6KB flash / 2.3KB RAM），但完整
+  链接要 SDK 的启动文件、`libble_sdk.a` 和板级配置，得在装了 SDK 的机器上做。
+- **没有 QMI8658B 的驱动。** 寄存器配置（量程、ODR、FIFO 水位）要对着手册写，
+  写错了表现成"特征量纲不对、模型全错"，没凭印象写。
 - **没做性能优化。** 算子是最朴素的三重循环，没用 CMSIS-NN、没用 M4F 的 DSP 指令。
   这是有意的：第一版要的是"板上跟 PC 一模一样"。换 CMSIS-NN 之后，这套 golden
   vector 正好用来证明结果没变——**先有对照，再谈优化**。
