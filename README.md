@@ -62,12 +62,38 @@ docs/chip_choice.md      芯片选型
 docs/rf_size.md          RF 体积怎么算、要不要量化剪枝
 docs/frameworks.md       Cortex-M4F 上有哪些推理框架、为什么我们都没用
 docs/market.md           市面上的项圈（FitBark/Fi/Tractive/Maven/Whistle）是不是端侧推理
+docs/model_choice.md     端侧选哪个模型（1D-CNN / GBDT / LR / RF 的体积对照）
+tools/host_sim.c         在 PC 上跑板上那份 C，喂真实数据
 ```
 
 **训练框架跟板上那一侧是隔离的**：`train_torch.py` 最后只交出一个
 `{名字: numpy 数组}` 的 npz，量化、导出、对照那一整条链只依赖 numpy。所以换框架、
 换训练机器都不波及固件，而且工具链能用随机权重自测——不用先有一个训好的模型
 才能验证它。
+
+---
+
+## 在 Ubuntu 服务器上先看效果（不需要板子、不需要交叉编译器）
+
+跑的是 `firmware/tinyml/` 下**板上那份一模一样的 C**，编译选项也跟固件一致
+（`-ffp-contract=off`），所以**判决结果跟板上逐位相同**：
+
+```bash
+python python/run_host_sim.py --gen firmware/generated \
+    --data ~/imu_train/data/processed_custom/test.npz
+```
+
+会打印每个窗口的类别和概率、各类占比、以及耗时。**耗时那一栏是 x86 的数，
+跟 Cortex-M4F 没有可比性**，只能用来横向比 RF 和 CNN 哪个贵。
+
+资源报告（模型多大、固件多大、运行内存、能存几天）：
+
+```bash
+python python/resource_report.py --gen firmware/generated \
+    --elf firmware/gr551x/tinyml_app/GCC/build/tinyml_app.elf
+```
+
+每一行都标了是实测还是估算——体积和内存可以照着用，耗时只能当数量级。
 
 ---
 
