@@ -31,6 +31,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tinyml.gbdt import from_xgboost  # noqa: E402
 
 
+def resolve_model(path):
+    """跟别的脚本一样的 --model 路径守卫。漏了这个的话（我就漏了），
+    路径写错只会甩一个 joblib 的 traceback。"""
+    p = os.path.expanduser(path)
+    if os.path.exists(p):
+        return p
+    hint = ""
+    if "..." in path:
+        hint = "\n  路径里有 `...`——那是占位符，要换成真实目录名。"
+    if not os.path.isabs(p):
+        hint += f"\n  相对路径会解析成 {os.path.abspath(p)}。"
+    guess = os.path.expanduser("~/imu_train/results")
+    if os.path.isdir(guess):
+        hint += f"\n  ~/imu_train/results/ 下现有：{', '.join(sorted(os.listdir(guess))[:5]) or '（空）'}"
+    sys.exit(f"找不到模型文件：{p}{hint}")
+
+
 def _need(path, flag):
     p = os.path.expanduser(path)
     if os.path.exists(p):
@@ -158,7 +175,7 @@ def main():
             "或者拿一段原始连续数据来评。\n"
             "  真要看的话加 --force，但**别拿那个数做决定**。")
 
-    bundle = joblib.load(os.path.expanduser(args.model))
+    bundle = joblib.load(resolve_model(args.model))
     model = bundle.get("model", bundle) if isinstance(bundle, dict) else bundle
     b = from_xgboost(model, class_names=names)
 
