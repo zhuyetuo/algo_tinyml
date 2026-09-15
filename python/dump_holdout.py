@@ -34,6 +34,9 @@ def main():
                     help="导哪个分割。默认 val——imu_train 常见配置下 test 是空的")
     ap.add_argument("--imu-train", default="", help="imu_train 仓库路径，默认当前目录")
     ap.add_argument("--out-prefix", default="holdout")
+    ap.add_argument("--raw", action="store_true",
+                    help="导**原始窗口**（[N, 通道, 点数]）而不是 193 维手工特征。"
+                         "CNN 那条路要这个；RF/GBDT 要的是默认的特征")
     args = ap.parse_args()
 
     repo = os.path.abspath(os.path.expanduser(args.imu_train or "."))
@@ -76,6 +79,39 @@ def main():
     else:
         for k in ys:
             keeps[k] = np.ones(len(ys[k]), bool)
+
+    if args.raw:
+        # CNN 吃的是**原始窗口**，不是 193 维手工特征。窗口就在 load_all_splits
+        # 的返回值里，不用再算一遍——而"再算一遍"正是两边分家的起点。
+        rawX = {"train": Xtr, "val": Xva, "test": Xte}[args.split]
+        y = ys[args.split]
+        keep = keeps[args.split]
+        # remap 会丢掉一部分窗口（映射到"忽略"的那些类）。标签已经被 apply_remap
+        # 筛过了，窗口**没有**——不跟着筛就是错位，而错位的表现是所有指标都错、
+        # 但一切看起来正常。这一步是整个脚本里最容易漏的地方。
+        if len(rawX) == len(keep):
+            rawX = rawX[keep]
+        if len(rawX) != len(y):
+            sys.exit(f"窗口 {len(rawX)} 条、标签 {len(y)} 条，对不上。"
+                     "别手动对齐——先查 remap 和数据批次是不是配套的。")
+        rawX = np.asarray(rawX, np.float32)
+        # 统一成 [N, C, T]（channel-first）。判据用通道数：窗口点数（16）和
+        # 通道数（8）不相等，所以这个判断是确定的；相等的话会报错而不是猜
+        n_ch = int(meta.get("n_channels", 0) or 0) or rawX.shape[2]
+        if rawX.shape[1] == rawX.shape[2]:
+            sys.exit(f"窗口形状 {rawX.shape} 的两个维度相等，没法判断是 [N,T,C] "
+                     "还是 [N,C,T]。手工指定一下再跑。")
+        if rawX.shape[2] == n_ch:
+            rawX = rawX.transpose(0, 2, 1)      # [N,T,C] → [N,C,T]
+        fx = f"{args.out_prefix}_raw.npy"
+        fy = f"{args.out_prefix}_y.npy"
+        np.save(fx, rawX)
+        np.save(fy, y.astype(np.int64))
+        with open(f"{args.out_prefix}_classes.txt", "w", encoding="utf-8") as f:
+            f.write(",".join(classes) + "\n")
+        print(f"\n导出 {args.split} 原始窗口：{rawX.shape}（[N, 通道, 点数]）")
+        print(f"写出 {fx} / {fy} / {args.out_prefix}_classes.txt")
+        return
 
     cache = os.path.join(pdir, f"{args.hz}hz", "ml_features.npz")
     if not os.path.exists(cache):

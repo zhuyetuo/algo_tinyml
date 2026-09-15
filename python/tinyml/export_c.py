@@ -31,7 +31,7 @@ def _arena_bytes(qnet: QNet) -> int:
             ch, t = lyr.w.shape[0], 1
         else:
             oc, ic, k = lyr.w.shape
-            ch, t = oc, t - k + 1
+            ch, t = oc, t + 2 * getattr(lyr, "pad", 0) - k + 1
         biggest = max(biggest, ch * t)
     return biggest
 
@@ -44,8 +44,12 @@ def export(qnet: QNet, golden_x_i8=None, model_name="tm_model") -> dict:
 
     for i, lyr in enumerate(qnet.layers):
         if isinstance(lyr, QPool):
+            # **指定初始化器，不是位置初始化器。** 原来是一串 0 按位置对齐到
+            # tm_layer_t 的字段上——往结构体中间加一个字段（比如 pad），
+            # 后面每个值都会悄悄挪到相邻字段去，编译器一声不吭，
+            # 表现成"某些层的 relu 或 zero_point 莫名其妙"。
             layer_entries.append(
-                f"    {{ TM_MAXPOOL1D, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {lyr.pool} }}"
+                f"    {{ .op = TM_MAXPOOL1D, .pool = {lyr.pool} }}"
             )
             continue
         p = f"L{i}"
@@ -58,8 +62,11 @@ def export(qnet: QNet, golden_x_i8=None, model_name="tm_model") -> dict:
         else:
             op, (out_ch, in_ch, k) = "TM_CONV1D", lyr.w.shape
         layer_entries.append(
-            f"    {{ {op}, {p}_w, {p}_b, {p}_m, {p}_s, {out_ch}, {in_ch}, {k}, "
-            f"{lyr.in_zp}, {lyr.out_zp}, {1 if lyr.relu else 0}, 0 }}"
+            f"    {{ .op = {op}, .w = {p}_w, .bias = {p}_b, .mult = {p}_m, "
+            f".shift = {p}_s, .out_ch = {out_ch}, .in_ch = {in_ch}, .k = {k}, "
+            f".pad = {getattr(lyr, 'pad', 0)}, "
+            f".in_zp = {lyr.in_zp}, .out_zp = {lyr.out_zp}, "
+            f".relu = {1 if lyr.relu else 0} }}"
         )
 
     lines.append(f"\nstatic const tm_layer_t {model_name}_layers[] = {{\n")

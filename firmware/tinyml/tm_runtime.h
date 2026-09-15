@@ -33,6 +33,8 @@ typedef struct {
     int16_t out_ch;
     int16_t in_ch;
     int16_t k;            /* 卷积核长度；dense 忽略 */
+    int16_t pad;          /* 两端各补多少个 0（在减 zero_point 之后的域里）；
+                           * pad = k/2 即 PyTorch 的 padding='same'（k 为奇数） */
     int8_t in_zp;
     int8_t out_zp;
     uint8_t relu;

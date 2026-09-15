@@ -61,16 +61,26 @@ static int8_t requant(int32_t acc, int32_t mult, int32_t shift, int8_t out_zp, i
 static void conv1d(const tm_layer_t *L, const int8_t *in, int t_in, int8_t *out, int *t_out)
 {
     const int k = L->k;
-    const int to = t_in - k + 1;
+    const int pad = L->pad;
+    const int to = t_in + 2 * pad - k + 1;
     for (int o = 0; o < L->out_ch; o++) {
         const int8_t *wo = L->w + (size_t)o * L->in_ch * k;
         for (int t = 0; t < to; t++) {
             int32_t acc = L->bias[o];
             for (int c = 0; c < L->in_ch; c++) {
                 const int8_t *wc = wo + (size_t)c * k;
-                const int8_t *xc = in + (size_t)c * t_in + t;
+                const int8_t *xc = in + (size_t)c * t_in;
                 for (int j = 0; j < k; j++) {
-                    acc += (int32_t)wc[j] * ((int32_t)xc[j] - L->in_zp);
+                    /* padding 位置的贡献是 0。**不是补 in_zp 再减 in_zp** ——
+                     * 那样写结果一样但多一次读越界内存；直接跳过既对又安全。
+                     * 越界的判断放在最内层看着浪费，但 pad 通常是 1，
+                     * 分支预测几乎全中，而把边界拆成三段循环的写法
+                     * 是这套代码里最容易写岔、又最不容易被测出来的地方。 */
+                    const int ti = t - pad + j;
+                    if (ti < 0 || ti >= t_in) {
+                        continue;
+                    }
+                    acc += (int32_t)wc[j] * ((int32_t)xc[ti] - L->in_zp);
                 }
             }
             out[(size_t)o * to + t] = requant(acc, L->mult[o], L->shift[o], L->out_zp, L->relu);
@@ -135,7 +145,7 @@ int tm_invoke(const tm_model_t *m, const int8_t *input, int8_t *out,
         int t_next = t, ch_next = ch;
         switch (L->op) {
         case TM_CONV1D:
-            if ((size_t)L->out_ch * (t - L->k + 1) > (size_t)half) return -1;
+            if ((size_t)L->out_ch * (t + 2 * L->pad - L->k + 1) > (size_t)half) return -1;
             conv1d(L, src, t, dst, &t_next);
             ch_next = L->out_ch;
             break;
