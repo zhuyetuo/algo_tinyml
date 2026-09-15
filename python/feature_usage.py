@@ -34,6 +34,7 @@ from tinyml.features import feature_groups, n_features  # noqa: E402
 COST = {"time": 1.0, "freq": 1.3, "derive+time": 1.2, "cheap": 0.15}
 
 
+<<<<<<< HEAD
 
 def resolve_model(path):
     """把 --model 的路径解析清楚，不存在就给一条**能照着改**的报错。
@@ -54,6 +55,8 @@ def resolve_model(path):
         hint += f"\n  ~/imu_train/results/ 下现有：{', '.join(sorted(os.listdir(guess))[:5]) or '（空）'}"
     sys.exit(f"找不到模型文件：{p}{hint}")
 
+=======
+>>>>>>> origin/main
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -65,7 +68,11 @@ def main():
     except ImportError:
         sys.exit("没装 joblib/sklearn。这个脚本要在训练机上跑。")
 
+<<<<<<< HEAD
     bundle = joblib.load(resolve_model(args.model))
+=======
+    bundle = joblib.load(args.model)
+>>>>>>> origin/main
     model = bundle.get("model", bundle) if isinstance(bundle, dict) else bundle
     ests = getattr(model, "estimators_", None)
     if ests is None:
