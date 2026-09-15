@@ -109,7 +109,10 @@ fi
 stop_it
 
 ARGS=(
-    python "$ROOT/python/edge_service.py"
+    # **-u（不缓冲）**：不加的话 Python 发现 stdout 不是终端就会开缓冲，
+    # 后台起的时候日志文件**一直是空的**，直到缓冲满或进程退出。
+    # 服务是常驻的，那意味着实际上永远看不到日志。
+    python -u "$ROOT/python/edge_service.py"
     --gen  "edge_cnn_i8=$CNN_GEN"  --meta "edge_cnn_i8=$CNN_META"
     --gen  "edge_rf_d10=$RF_GEN"   --meta "edge_rf_d10=$RF_META"
     --imu-train "$IMU_TRAIN"

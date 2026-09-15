@@ -17,10 +17,12 @@
 整个消失。不报错，只是效果差一截。自己抄一遍，迟早在这种地方跟训练侧分家，
 而分家的表现是"平台上看着对、板上不对"。
 
-**这个服务只做端上真会做的事**：
-  · mode 只支持 raw。algo_service 的 stable/viterbi 端上没有，
-    假装支持会让对比表里两列看着可比、实际不是一回事。
-  · 片段聚合用的 min_windows / max_gap 就是固件 tinyml_task 里那两个参数。
+**模型是端侧的，后处理跟线上同一份**：
+  · raw 是板子上真会出的东西（片段聚合就是固件 tinyml_task 里那两个参数）。
+  · stable / viterbi 直接调 label_service 那份 `postprocess.stabilize()`，
+    **不是抄一份**。抄的话滞回门槛、合并规则、最短时长迟早跟线上分家，
+    而分家之后"模型对比"里混进了后处理的差异，那个差异不显示在任何地方。
+    要比的只是模型，所以后处理必须是同一份代码。
 
 用法：
     python python/edge_service.py \\
@@ -30,7 +32,9 @@
 """
 
 import argparse
+import contextlib
 import glob
+import io
 import json
 import os
 import sys
@@ -60,10 +64,53 @@ def add_imu_train(repo):
     if not os.path.exists(need):
         sys.exit(f"{repo} 看起来不是 imu_train 仓库（没有 {need}）。\n"
                  "  用 --imu-train 指对路径。")
-    for p in (os.path.join(repo, "src"), os.path.join(repo, "src", "data")):
+    for p in (os.path.join(repo, "src"), os.path.join(repo, "src", "data"),
+              os.path.join(repo, "label_service")):
         if p not in sys.path:
             sys.path.insert(0, p)
     return repo
+
+
+def load_postprocess():
+    """拿 label_service 那份后处理，**不重写一份**。
+
+    stable / viterbi 是 algo_service（= imu_train/label_service）的后处理。
+    端侧模型要跟它"处理机制一样、只是模型不同"，唯一正确的做法是调同一份代码——
+    照着抄一份的话，两边的参数、滞回门槛、合并规则迟早分家，
+    而分家之后"模型对比"比的就不只是模型了，还混着后处理的差异，
+    **而那个差异不会显示在任何地方**。
+
+    label_service 是线上服务，这里只读不改。
+    """
+    try:
+        import config as ls_config          # label_service/config.py
+        import postprocess as ls_post       # label_service/postprocess.py
+    except ImportError as e:
+        raise SystemExit(
+            f"import 不到 label_service 的后处理（{e}）。\n"
+            "  stable/viterbi 要复用 imu_train/label_service/postprocess.py，"
+            "--imu-train 指对了吗？")
+    return ls_config, ls_post
+
+
+def _as_hz(v):
+    """采样率必须是**整数**。
+
+    重采样那条路走的是 `math.gcd(device_hz, model_hz)`，而 gcd 只吃 int：
+    传 50.0 进去直接 `TypeError: 'float' object cannot be interpreted as an
+    integer`。平台的 sample_hz 过一趟 JSON 就是 50.0，于是 303 个样本全挂，
+    错误信息还完全看不出跟采样率有关。所以在入口处就转干净。
+
+    真的不是整数（49.8）时**报错，不四舍五入**——那说明上游的采样率算错了，
+    悄悄取整只会把问题挪到时间轴上。
+    """
+    f = float(v)
+    n = int(round(f))
+    if abs(f - n) > 1e-6:
+        raise ValueError(f"采样率 {f} 不是整数，重采样要求整数采样率")
+    if n <= 0:
+        raise ValueError(f"采样率 {f} 不合法")
+    return n
 
 
 class EdgeRunner:
@@ -89,7 +136,8 @@ class EdgeRunner:
         # 并发进来会互相踩。端上本来就是单线程，这里串行没有损失
         self.lock = threading.Lock()
 
-    def infer(self, csv_path, device_hz, min_windows, max_gap, targets):
+    def infer(self, csv_path, device_hz, min_windows, max_gap, targets,
+              mode="raw"):
         from infer_csv_scratch import infer_file, load_csv
 
         # missing_seconds 要自己算：infer_file 不返回它，但平台要这个字段
@@ -99,24 +147,35 @@ class EdgeRunner:
         missing_seconds = float(len(acc)) / max(device_hz, 1) * float(null_ratio)
 
         with self.lock, tempfile.TemporaryDirectory() as out_dir:
-            res = infer_file(
-                csv_path, self.model, self.classes,
-                window_size=self.window_size, stride=self.stride,
-                device_hz=device_hz, model_hz=self.model_hz,
-                gravity_aligned=self.gravity_aligned,
-                quiet=True, scratch_only=True,
-                output_dir=out_dir, min_windows=min_windows,
-                keep_isolated=(min_windows <= 1),
-                label_mode=self.label_mode, resample_method=self.resample,
-                target_labels=targets, is_dl=True,
-            )
+            # infer_file 即使 quiet=True 也会往 stdout 打【汇总】/【片段】，
+            # 而且是**每个目标类别打一遍**。现在默认 5 个类别全上，一个样本
+            # 就是几十行；批量跑一天下来日志里全是这个，真正的报错被冲掉。
+            # imu_train 那边不能改（"原来是怎样的不要碰它"），所以在这里接住。
+            # 出错时**把接住的内容原样吐回去**——那时候这些行是唯一的线索。
+            noise = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(noise):
+                    res = infer_file(
+                        csv_path, self.model, self.classes,
+                        window_size=self.window_size, stride=self.stride,
+                        device_hz=device_hz, model_hz=self.model_hz,
+                        gravity_aligned=self.gravity_aligned,
+                        quiet=True, scratch_only=True,
+                        output_dir=out_dir, min_windows=min_windows,
+                        keep_isolated=(min_windows <= 1),
+                        label_mode=self.label_mode, resample_method=self.resample,
+                        target_labels=targets, is_dl=True,
+                    )
+            except Exception:
+                sys.stdout.write(noise.getvalue())
+                raise
             if res is None:
                 # 一个窗口都没有（整段缺失、或者文件比窗口还短）。
                 # 返回空结果而不是报错——平台那边"这个样本没片段"是正常情况
                 return {"n_windows": 0, "segments": {t: [] for t in targets},
-                        "missing_seconds": missing_seconds}
+                        "missing_seconds": missing_seconds, "windows": []}
 
-            segments, n_windows = {}, 0
+            segments, n_windows, windows = {}, 0, []
             for label in targets:
                 hits = glob.glob(os.path.join(out_dir, label, "_infer", "*_infer.json"))
                 if not hits:
@@ -128,33 +187,45 @@ class EdgeRunner:
                 # 那边注释里写明了不改名是为了不牵动一串下游脚本
                 segments[label] = d.get("scratch_segments") or []
                 n_windows = int(d.get("n_windows") or 0)
+                # 逐窗口结果每个类别的文件里都是同一份（infer_file 那边写明了），
+                # 取一次就够
+                windows = windows or (d.get("windows") or [])
 
-        return {"n_windows": n_windows, "segments": segments,
-                "missing_seconds": missing_seconds}
+        out = {"n_windows": n_windows, "segments": segments,
+               "missing_seconds": missing_seconds, "windows": windows}
+        if mode in ("stable", "viterbi"):
+            out["segments"] = self.stabilize(windows, targets, mode)
+        return out
 
+    def stabilize(self, windows, targets, algo):
+        """走 label_service 那份后处理，**跟线上模型完全同一份代码**。
 
-def _as_hz(v):
-    """采样率必须是**整数**。
-
-    imu_train 的 downsample() 用 math.gcd(device_hz, model_hz) 算重采样比，
-    而 gcd 只吃整数——传个 50.0 进去直接抛
-    "TypeError: 'float' object cannot be interpreted as an integer"。
-    这就是端侧模型第一次跑批 303 个全失败的原因，**是我把它转成 float 的**。
-
-    整数值的 float（50.0）接受并转成 int；真正的小数（49.8）**报错而不是四舍五入**：
-    重采样比是按整数比算的，49.8 当成 50 会让整条时间轴慢慢漂，
-    而片段的起止时间看起来一直是正常的。宁可在这里停住。
-    """
-    f = float(v)
-    n = int(round(f))
-    if abs(f - n) > 1e-6:
-        raise ValueError(
-            f"采样率 {f} 不是整数。imu_train 的重采样按整数比算"
-            "（math.gcd），小数率会让时间轴逐渐漂移而片段时间看着正常。"
-            "先确认样本的 sample_hz 是不是记错了。")
-    if n <= 0:
-        raise ValueError(f"采样率 {f} 不合法")
-    return n
+        这样"模型对比"比的才只是模型。自己抄一份的话，两边的滞回门槛、
+        合并规则、最短时长迟早分家，而分家之后对比表里混进了后处理的差异，
+        **那个差异不会显示在任何地方**。
+        """
+        ls_config, ls_post = load_postprocess()
+        params = ls_post.StableParams(
+            event_labels=tuple(ls_config.STABLE_EVENT_LABELS),
+            smooth_windows=ls_config.STABLE_SMOOTH_WINDOWS,
+            min_state_s=ls_config.STABLE_MIN_STATE_S,
+            event_enter=ls_config.STABLE_EVENT_ENTER,
+            event_stay=ls_config.STABLE_EVENT_STAY,
+            event_gap_s=ls_config.STABLE_EVENT_GAP_S,
+            shake_absorb_s=ls_config.STABLE_SHAKE_ABSORB_S,
+            event_min_windows=ls_config.STABLE_EVENT_MIN_WINDOWS,
+            event_min_mean=ls_config.STABLE_EVENT_MIN_MEAN,
+            event_single_conf=ls_config.STABLE_EVENT_SINGLE_CONF,
+            spectral_min=ls_config.STABLE_SPECTRAL_MIN,
+            viterbi_switch=ls_config.STABLE_VITERBI_SWITCH,
+        )
+        # window_s / stride_s 按模型自己的采样率算，不读 label_service 的配置——
+        # 那边是线上模型的几何，端侧模型的窗口可能不一样
+        window_s = self.window_size / float(self.model_hz)
+        stride_s = self.stride / float(self.model_hz)
+        return ls_post.stabilize(
+            windows, self.classes, targets, window_s, stride_s,
+            self.label_mode, params, algo=algo)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -238,22 +309,20 @@ class Handler(BaseHTTPRequestHandler):
     def _one(self, body, raise_on_error=False):
         try:
             mode = str(body.get("mode") or "raw")
-            if mode != "raw":
-                # **不假装支持**。stable/viterbi 是 algo_service 的后处理，
-                # 端上没有。返回一个"支持了"的结果，会让对比表里两列看着可比、
-                # 实际不是一回事——那比报错糟得多
-                raise ValueError(
-                    f"端侧模型只有 raw，没有 {mode}。"
-                    "stable/viterbi 是 algo_service 的后处理，板子上不存在——"
-                    "在这里假装支持会让模型对比变成拿两个不同的东西相比。")
+            if mode not in ("raw", "stable", "viterbi"):
+                raise ValueError(f"mode 只支持 raw / stable / viterbi，给的是 {mode}")
             r = self._runner(body.get("model"))
             path = self._resolve(str(body["path"]))
             device_hz = _as_hz(body.get("device_hz") or r.model_hz)
-            targets = body.get("labels") or ["抓挠"]
+            # **默认所有类别**。原来写死 ["抓挠"]，于是平台上只出抓挠的片段，
+            # 活动/睡觉/未佩戴/甩身体一个都没有——而那几类占了绝大多数窗口。
+            targets = body.get("labels") or list(r.classes)
             res = r.infer(path, device_hz,
                           int(body.get("min_windows") or 1),
                           int(body.get("max_gap") or 2),
-                          list(targets))
+                          list(targets), mode=mode)
+            # windows 是给后处理用的中间量，几千条，没必要回给平台
+            res.pop("windows", None)
             res.update({
                 # model_path 平台用来算 model_tag（取文件名去后缀），
                 # 所以这里给一个能一眼看出是端侧、且带模型标识的假路径

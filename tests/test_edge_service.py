@@ -258,18 +258,18 @@ def test_nas_path_cannot_escape_the_root(tmp_path):
 
 
 def test_unsupported_mode_is_refused_not_faked(runner):
-    """stable/viterbi 是 algo_service 的后处理，端上没有。
+    """raw / stable / viterbi 之外的 mode 要明确报错。
 
-    **假装支持比报错糟得多**：对比表里两列看着可比，实际是拿两个不同的
-    东西在比，而且没有任何迹象。
+    **悄悄当成 raw 比报错糟得多**：对比表里两列看着可比，实际是拿两个
+    不同的东西在比，而且没有任何迹象。
     """
     import edge_service
     h = edge_service.Handler.__new__(edge_service.Handler)
     h.runners = {"edge_cnn_i8": runner}
     h.default_tag = "edge_cnn_i8"
     h.nas_root = "/"
-    r = h._one({"path": "/x", "mode": "viterbi"})
-    assert "error" in r and "viterbi" in r["error"]
+    r = h._one({"path": "/x", "mode": "smooth"})
+    assert "error" in r and "smooth" in r["error"]
 
 
 def test_unknown_model_tag_lists_what_exists(runner):
@@ -902,3 +902,171 @@ def test_http_layer_rejects_fractional_hz_with_a_clear_message(runner, tmp_path)
     _write_csv_at(str(tmp_path / "x.csv"), n_rows=200, hz=50, seed=1)
     r = h._one({"path": "x.csv", "mode": "raw", "device_hz": 49.8})
     assert "不是整数" in (r.get("error") or ""), r
+
+
+# ── 后处理（stable / viterbi）跟线上同一份 ────────────────────────────────
+
+
+def _need_postprocess():
+    import edge_service
+    try:
+        return edge_service.load_postprocess()
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"拿不到 label_service 的后处理：{e}")
+
+
+def test_postprocess_is_label_services_own_file_not_a_copy():
+    """**这条是整个 stable 路线的地基**。
+
+    抄一份后处理过来，测试照样全绿——直到线上改了滞回门槛或者最短时长，
+    两边分家。分家之后"模型对比"里混进了后处理的差异，而那个差异
+    不会显示在任何地方。所以这里直接钉住文件路径。
+    """
+    ls_config, ls_post = _need_postprocess()
+    for m in (ls_config, ls_post):
+        real = os.path.realpath(m.__file__)
+        assert os.path.realpath(IMU_TRAIN) in real, (
+            f"{m.__name__} 来自 {real}，不是 imu_train/label_service 那一份")
+        assert os.path.basename(os.path.dirname(real)) == "label_service", real
+
+
+def test_stable_mode_actually_post_processes(runner, tmp_path):
+    """stable 的结果必须跟 raw **不一样**。
+
+    只断言"能跑出结果"是验不到东西的：把 stabilize() 换成
+    `return raw_segments` 那种直通实现，也照样绿。
+    """
+    _need_postprocess()
+    p = tmp_path / "pp.csv"
+    _write_csv(str(p), n_rows=HZ * 300, seed=11)
+    kw = dict(device_hz=HZ, min_windows=1, max_gap=2, targets=CLASSES)
+    raw = runner.infer(str(p), mode="raw", **kw)
+    stable = runner.infer(str(p), mode="stable", **kw)
+    vit = runner.infer(str(p), mode="viterbi", **kw)
+
+    assert raw["n_windows"] > 50, "窗口太少，下面的比较说明不了问题"
+    for out in (stable, vit):
+        # 后处理只动 segments，窗口数是同一份推理结果
+        assert out["n_windows"] == raw["n_windows"]
+
+    def shape(o):
+        return {c: len(o["segments"].get(c) or []) for c in CLASSES}
+
+    assert shape(stable) != shape(raw), (
+        f"stable 跟 raw 的片段数一模一样（{shape(raw)}），后处理很可能是直通的")
+    assert shape(vit) != shape(stable), (
+        f"viterbi 跟 stable 一模一样（{shape(stable)}），algo= 参数很可能没传进去")
+
+
+def test_stable_window_geometry_comes_from_the_model_not_label_service(runner,
+                                                                      tmp_path,
+                                                                      monkeypatch):
+    """window_s / stride_s 要按**端侧模型自己**的 window_size/hz 算。
+
+    读 label_service 的配置的话，线上模型换了窗口长度，端侧模型的片段
+    时间戳会整体错位——而错位量是个小数，看结果看不出来。
+    """
+    import edge_service
+    ls_config, ls_post = _need_postprocess()
+
+    seen = {}
+
+    def spy(windows, classes, targets, window_s, stride_s, *a, **k):
+        seen["window_s"] = window_s
+        seen["stride_s"] = stride_s
+        return ls_post.stabilize(windows, classes, targets, window_s, stride_s,
+                                 *a, **k)
+
+    monkeypatch.setattr(edge_service, "load_postprocess",
+                        lambda: (ls_config, types.SimpleNamespace(
+                            StableParams=ls_post.StableParams, stabilize=spy)))
+    p = tmp_path / "geo.csv"
+    _write_csv(str(p), n_rows=HZ * 120, seed=12)
+    runner.infer(str(p), device_hz=HZ, min_windows=1, max_gap=2,
+                 targets=CLASSES, mode="stable")
+    assert seen["window_s"] == pytest.approx(N_T / float(HZ))
+    assert seen["stride_s"] == pytest.approx((N_T // 2) / float(HZ))
+
+
+def test_http_defaults_to_every_class_not_just_scratching(runner, tmp_path):
+    """不传 labels 时要跑**全部类别**。
+
+    原来写死 ["抓挠"]，平台上于是只出抓挠的片段，活动/睡觉/未佩戴/甩身体
+    一个都没有——而那几类占了绝大多数窗口。表现是"模型只会认抓挠"。
+    """
+    import edge_service
+    h = edge_service.Handler.__new__(edge_service.Handler)
+    h.runners = {"edge_cnn_i8": runner}
+    h.default_tag = "edge_cnn_i8"
+    h.nas_root = str(tmp_path)
+    _write_csv(str(tmp_path / "all.csv"), n_rows=HZ * 200, seed=13)
+    r = h._one({"path": "all.csv", "mode": "raw"})
+    assert "error" not in r, r
+    assert set(r["segments"]) == set(CLASSES), r["segments"].keys()
+
+
+def test_explicit_labels_still_win_over_the_default(runner, tmp_path):
+    """平台显式传 labels 时不能被"全部类别"覆盖掉。"""
+    import edge_service
+    h = edge_service.Handler.__new__(edge_service.Handler)
+    h.runners = {"edge_cnn_i8": runner}
+    h.default_tag = "edge_cnn_i8"
+    h.nas_root = str(tmp_path)
+    _write_csv(str(tmp_path / "one.csv"), n_rows=HZ * 60, seed=14)
+    r = h._one({"path": "one.csv", "mode": "raw", "labels": ["抓挠"]})
+    assert "error" not in r, r
+    assert set(r["segments"]) == {"抓挠"}
+
+
+def test_windows_are_not_returned_to_the_platform(runner, tmp_path):
+    """windows 是给后处理用的中间量，几千条。回给平台会把响应撑大几十倍。"""
+    import edge_service
+    h = edge_service.Handler.__new__(edge_service.Handler)
+    h.runners = {"edge_cnn_i8": runner}
+    h.default_tag = "edge_cnn_i8"
+    h.nas_root = str(tmp_path)
+    _write_csv(str(tmp_path / "w.csv"), n_rows=HZ * 60, seed=15)
+    r = h._one({"path": "w.csv", "mode": "raw"})
+    assert "windows" not in r, "中间量漏给平台了"
+    # 但内部要有——后处理靠它
+    out = runner.infer(str(tmp_path / "w.csv"), HZ, 1, 2, CLASSES, mode="raw")
+    assert len(out["windows"]) == out["n_windows"] > 0
+
+
+# ── 日志：infer_file 的 stdout 不能糊满服务日志 ───────────────────────────
+
+
+def test_infer_file_chatter_is_swallowed(runner, tmp_path, capsys):
+    """infer_file 即使 quiet=True 也会打【汇总】/【片段】，**每个类别一遍**。
+
+    5 个类别 × 每天几百个样本 = 日志里全是这个，真正的报错被冲掉。
+    （这一条要是没了，表现是"日志有内容"，不是报错——所以必须钉住。）
+    """
+    p = tmp_path / "quiet.csv"
+    _write_csv(str(p), n_rows=HZ * 120, seed=16)
+    capsys.readouterr()
+    runner.infer(str(p), HZ, min_windows=1, max_gap=2, targets=CLASSES)
+    out = capsys.readouterr().out
+    assert "【" not in out, f"infer_file 的输出漏出来了：{out[:400]}"
+
+
+def test_chatter_is_replayed_when_it_blows_up(runner, tmp_path, capsys,
+                                              monkeypatch):
+    """出错时那些行是唯一的线索，必须原样吐回来。
+
+    一律吞掉的话，报错的样本只剩一行 traceback，而 traceback 指向的是
+    infer_file 内部——最需要上下文的时候上下文正好没了。
+    """
+    import infer_csv_scratch
+
+    def boom(*a, **k):
+        print("【汇总】崩之前打的这行")
+        raise RuntimeError("炸了")
+
+    monkeypatch.setattr(infer_csv_scratch, "infer_file", boom)
+    p = tmp_path / "boom.csv"
+    _write_csv(str(p), n_rows=HZ * 30, seed=17)
+    capsys.readouterr()
+    with pytest.raises(RuntimeError, match="炸了"):
+        runner.infer(str(p), HZ, min_windows=1, max_gap=2, targets=CLASSES)
+    assert "崩之前打的这行" in capsys.readouterr().out
