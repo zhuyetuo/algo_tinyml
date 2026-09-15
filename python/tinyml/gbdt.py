@@ -67,6 +67,39 @@ class Booster:
         """softmax 保序，所以 argmax 直接在 margin 上取，跟先 softmax 再 argmax 一样。"""
         return int(np.argmax(self.margins(x)))
 
+    def truncate(self, rounds):
+        """只留前 `rounds` 轮。**这跟一开始就用 n_estimators=rounds 训出来的模型
+        完全相同，不是近似**——boosting 是顺序累加的，第 k 棵树拟合的是前 k-1 棵
+        之后的残差，所以前 K 棵树跟总共训多少轮无关。
+
+        （对比：随机森林按深度截断**是**近似——原来那些分裂是冲着"后面还要再分
+        好几层"选的，半路砍掉用的是一批并非为浅树优化的分裂点。GBDT 没这个问题。）
+
+        所以「减到多少轮、掉多少点」这条曲线，用一个训好的模型就能精确算出来，
+        一次重训都不用。
+        """
+        keep = int(rounds) * self.n_classes
+        if keep <= 0 or keep > self.n_trees:
+            raise ValueError(f"rounds={rounds} 超出范围（总共 {self.n_trees // self.n_classes} 轮）")
+        n_nodes = int(self.tree_offset[keep])
+        # 节点数组按树先序排列，所以前 keep 棵树的节点就是前 n_nodes 个，
+        # 不用重新编号——孩子下标都指向本树内部，天然还在范围里
+        used_leaves = self.node_feature[:n_nodes][self.node_left[:n_nodes] == -1]
+        max_leaf = int(used_leaves.max()) + 1 if len(used_leaves) else 0
+        return Booster(
+            n_features=self.n_features,
+            n_classes=self.n_classes,
+            base_score=self.base_score,
+            tree_offset=self.tree_offset[:keep + 1].copy(),
+            node_feature=self.node_feature[:n_nodes].copy(),
+            node_threshold=self.node_threshold[:n_nodes].copy(),
+            node_left=self.node_left[:n_nodes].copy(),
+            node_right=self.node_right[:n_nodes].copy(),
+            node_missing_left=self.node_missing_left[:n_nodes].copy(),
+            leaf_value=self.leaf_value[:max_leaf].copy(),
+            class_names=self.class_names,
+        )
+
     def predict_proba(self, x):
         m = self.margins(x).astype(np.float64)
         e = np.exp(m - m.max())     # 减最大值防溢出

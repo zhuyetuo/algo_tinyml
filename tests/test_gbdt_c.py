@@ -154,3 +154,40 @@ def test_argmax_在_margin_上取跟先_softmax_再取一样():
         x = rng.normal(0, 2, size=8).astype(np.float32)
         m = b.margins(x)
         assert int(np.argmax(m)) == int(np.argmax(softmax_ref(m)))
+
+
+def test_截断到前_K_轮_跟只训_K_轮完全相同():
+    """GBDT 的截断是**精确**的，不是近似——boosting 顺序累加，第 k 棵树拟合的是
+    前 k-1 棵之后的残差，所以前 K 棵树跟总共训多少轮无关。
+
+    这条是"不用重训就能拿到 轮数→掉点 曲线"的全部依据，所以要钉死：
+    造一个 6 轮的模型，截断到 3 轮，跟直接用前 3 轮的树构建出来的必须一模一样。
+    """
+    n_feat, n_cls, rounds = 6, 3, 6
+    rng = np.random.default_rng(21)
+    dumps = [stump(int(rng.integers(0, n_feat)), float(rng.normal()),
+                   float(rng.normal()), float(rng.normal()))
+             for _ in range(rounds * n_cls)]
+    full = from_xgboost_dumps(dumps, n_feat, n_cls, base_score=0.3)
+    cut = full.truncate(3)
+    direct = from_xgboost_dumps(dumps[:3 * n_cls], n_feat, n_cls, base_score=0.3)
+
+    assert cut.n_trees == direct.n_trees == 9
+    xs = rng.normal(0, 1, size=(50, n_feat)).astype(np.float32)
+    for x in xs:
+        a, b = cut.margins(x), direct.margins(x)
+        assert np.array_equal(a, b), f"截断 {a} ≠ 直接构建 {b}"
+
+
+def test_截断保留的是完整的轮不是半轮():
+    """多分类一轮 = n_classes 棵树。截断到"2.5 轮"会让某些类别比别人多一棵树，
+    margin 就系统性偏了——而模型照样给得出结果。"""
+    n_cls = 5
+    dumps = [stump(0, 0.0, 1.0, 1.0) for _ in range(4 * n_cls)]
+    b = from_xgboost_dumps(dumps, 1, n_cls)
+    for r in (1, 2, 3, 4):
+        assert b.truncate(r).n_trees == r * n_cls
+    with pytest.raises(ValueError, match="超出范围"):
+        b.truncate(5)
+    with pytest.raises(ValueError, match="超出范围"):
+        b.truncate(0)
