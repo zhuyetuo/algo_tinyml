@@ -39,6 +39,32 @@ def _macro_f1(y, p, n):
     return float(np.mean(out))
 
 
+def budget_table(budget, n_classes=3):
+    """(棵数 × 深度) 的组合各占多少 flash。按满树算，是**上界**。
+
+    真实的树不满（纯了就停），通常是上界的 40~70%，所以卡在边界上的组合要实测。
+    这张表的用处是先把明显没戏的排除掉——省得在 200 棵 × 深 8 上白调半天。
+    """
+    per_node = 14 + 0.5 * n_classes * 4
+    print(f"\n满树上界（{per_node:.0f} B/节点，{n_classes} 分类），预算 "
+          f"{budget / 1024:.0f}KB：")
+    print(f"{'':>7}" + "".join(f"{'d=' + str(d):>12}" for d in range(3, 8)))
+    for n in (50, 100, 200, 300):
+        row = f"{n:>4} 棵"
+        for d in range(3, 8):
+            kb = n * (2 ** (d + 1) - 1) * per_node / 1024
+            mark = "✓" if kb * 1024 <= budget else ("~" if kb * 1024 <= budget * 1.5 else "✗")
+            row += f"{kb:>10.0f}KB{mark}"
+        print(row)
+    print("  ✓=预算内  ~=树不满时可能进得去，要实测  ✗=没戏")
+    print("""
+  **但体积塞得下不等于该这么做。** RF 的准来自"深树低偏差 + bagging 降方差"，
+  限深把低偏差那一半拿掉了，而 bagging 只降方差、不降偏差——同样的节点预算下，
+  GBDT（本来就为浅树设计，用 boosting 补偏差）几乎一定更好。
+  所以**限深的 RF ≈ 一个更差的 GBDT**。下面那条曲线要是掉得厉害，别硬调 RF，
+  直接换 GBDT 试。""")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -86,6 +112,7 @@ def main():
         print(line)
 
     print(f"\nflash 预算 {args.budget:,} B（{args.budget / 1024:.0f} KB）")
+    budget_table(args.budget, n_cls)
     print("\n不剪：")
     report("原样", full)
 
