@@ -17,6 +17,20 @@
 #include "tm_forest_model.h"
 #include "tm_feat_cfg.h"
 
+/* golden vector 是可选的（导出时给了 --features / --windows 才有）。
+ * 用 __has_include 而不是让调用方传宏：宏传漏了就静默变成"没有 golden"，
+ * 而那会被当成"自检通过"——最不该默认的方向。 */
+#if defined(__has_include)
+#if __has_include("tm_forest_golden.h")
+#include "tm_forest_golden.h"
+#define TM_HAS_RF_GOLDEN 1
+#endif
+#if __has_include("tm_pipeline_golden.h")
+#include "tm_pipeline_golden.h"
+#define TM_HAS_PIPELINE_GOLDEN 1
+#endif
+#endif
+
 int thr_n_ch(void)       { return tm_feat_cfg.n_ch; }
 int thr_n_t(void)        { return tm_feat_cfg.n_t; }
 int thr_n_classes(void)  { return TM_F_N_CLASSES; }
@@ -60,4 +74,93 @@ int thr_infer_batch(const float *wins, int n, float *proba, int8_t *classes)
 int thr_features(const float *win, float *out)
 {
     return tm_features(&tm_feat_cfg, win, out);
+}
+
+/* ── golden vector 自检 ──────────────────────────────────────────────────
+ *
+ * 两份分开验，不合成一个：
+ *   · 森林自检从**特征**进（tm_forest_golden.h）——只验树的遍历和叶子。
+ *   · 整条链自检从**窗口**进（tm_pipeline_golden.h）——多验了特征提取，
+ *     以及特征排列顺序跟模型训练时对不对得上。
+ * 混在一起的话，一旦对不上，分不清是特征错了还是森林错了。
+ *
+ * 比的是 float 的**位模式**，不是差值小于某个阈值。用容差的话，
+ * "编译器开了 -ffast-math"这种问题会被放过去——它造成的差异往往正好在
+ * 容差里面，但它会随输入放大。
+ *
+ * 返回不一致的个数；-1 = 推理本身失败；-2 = 没有 golden（**不算通过**）。
+ */
+
+#if defined(TM_HAS_RF_GOLDEN) || defined(TM_HAS_PIPELINE_GOLDEN)
+static int bits_differ(float a, float b)
+{
+    uint32_t x, y;
+    memcpy(&x, &a, sizeof x);
+    memcpy(&y, &b, sizeof y);
+    return x != y;
+}
+#endif
+
+int thr_selftest_forest(void)
+{
+#if defined(TM_HAS_RF_GOLDEN)
+    static float proba[TM_F_N_CLASSES];
+    int bad = 0;
+    for (int i = 0; i < TM_F_GOLDEN_N; i++) {
+        const float *x = tm_forest_golden_in + (size_t)i * TM_F_N_FEATURES;
+        const float *want = tm_forest_golden_out + (size_t)i * TM_F_N_CLASSES;
+        (void)tm_forest_predict(&tm_forest, x, proba);
+        for (int c = 0; c < TM_F_N_CLASSES; c++) {
+            if (bits_differ(proba[c], want[c])) {
+                bad++;
+            }
+        }
+    }
+    return bad;
+#else
+    return -2;
+#endif
+}
+
+int thr_golden_n(void)
+{
+#if defined(TM_HAS_RF_GOLDEN)
+    return TM_F_GOLDEN_N;
+#else
+    return 0;
+#endif
+}
+
+int thr_selftest_pipeline(void)
+{
+#if defined(TM_HAS_PIPELINE_GOLDEN)
+    static float feat[TM_FEAT_DIM];
+    static float proba[TM_F_N_CLASSES];
+    int bad = 0;
+    for (int i = 0; i < TM_P_GOLDEN_N; i++) {
+        const float *x = tm_pipeline_in + (size_t)i * TM_P_N_CH * TM_P_N_T;
+        const float *want = tm_pipeline_proba + (size_t)i * TM_F_N_CLASSES;
+        if (tm_features(&tm_feat_cfg, x, feat) != 0) {
+            return -1;
+        }
+        (void)tm_forest_predict(&tm_forest, feat, proba);
+        for (int c = 0; c < TM_F_N_CLASSES; c++) {
+            if (bits_differ(proba[c], want[c])) {
+                bad++;
+            }
+        }
+    }
+    return bad;
+#else
+    return -2;
+#endif
+}
+
+int thr_pipeline_golden_n(void)
+{
+#if defined(TM_HAS_PIPELINE_GOLDEN)
+    return TM_P_GOLDEN_N;
+#else
+    return 0;
+#endif
 }

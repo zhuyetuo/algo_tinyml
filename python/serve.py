@@ -114,6 +114,10 @@ class RfEngine:
         L.thr_features.restype = ctypes.c_int
         L.thr_features.argtypes = [ctypes.POINTER(ctypes.c_float),
                                    ctypes.POINTER(ctypes.c_float)]
+        for name in ("thr_selftest_forest", "thr_selftest_pipeline",
+                     "thr_golden_n", "thr_pipeline_golden_n"):
+            getattr(L, name).restype = ctypes.c_int
+            getattr(L, name).argtypes = []
 
         self.n_ch = L.thr_n_ch()
         self.n_t = L.thr_n_t()
@@ -128,7 +132,23 @@ class RfEngine:
             raise ValueError(
                 f"特征维度对不上：tm_features 产出 {self.feat_dim} 维，"
                 f"森林按 {self.n_features} 维训的。导出时的窗口/通道数配错了。")
+        self.golden_n = L.thr_golden_n()
+        self.pipeline_golden_n = L.thr_pipeline_golden_n()
         self.lock = threading.Lock()
+
+    def selftest(self):
+        """两份 golden 分开验，返回 [(名字, 条数, 不一致个数)]。
+
+        **"没有 golden"不算通过**，用 -1 条数标出来。导出时忘了给
+        --features/--windows 的话这里会是 0 条，而 0 条"全部通过"
+        是这类自检最经典的失效方式。
+        """
+        with self.lock:
+            out = [("森林（从特征进）", self.golden_n,
+                    int(self.lib.thr_selftest_forest())),
+                   ("整条链（从窗口进）", self.pipeline_golden_n,
+                    int(self.lib.thr_selftest_pipeline()))]
+        return out
 
     def features(self, win):
         """算一个窗口的特征。单独暴露是为了能跟 Python 参考分开对账——

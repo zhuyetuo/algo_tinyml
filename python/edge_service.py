@@ -287,6 +287,27 @@ def main():
             eng = serve.RfEngine(serve.build_rf(gens[tag]))
             print(f"  {tag:<16} [RF] {eng.n_ch}×{eng.n_t}，{eng.n_classes} 类，"
                   f"{eng.n_features} 维特征（在 C 里算）")
+            fatal = False
+            for name, n, bad in eng.selftest():
+                if bad == -2:
+                    # **没有 golden 不算通过。** 导出时忘了给 --features/--windows
+                    # 就是这个结果，而"0 条全部通过"是这类自检最经典的失效方式
+                    print(f"    {name:<18} ⚠ 没导 golden vector，验不了。"
+                          f"重新 export_rf.py 时带上 --features / --windows")
+                elif bad == -1:
+                    print(f"    {name:<18} ✗ 推理直接失败了")
+                    fatal = True
+                elif bad == 0:
+                    print(f"    {name:<18} ✓ {n} 条逐位一致")
+                else:
+                    print(f"    {name:<18} ✗ {bad} 个值对不上（共 {n} 条）")
+                    fatal = True
+            if fatal:
+                sys.exit(
+                    "RF 的 golden vector 自检没过。**先别怀疑模型**，按这个顺序查：\n"
+                    "  ①编译选项漏了 -ffp-contract=off，或者别处塞了 -ffast-math；\n"
+                    "  ②导出的 tm_forest_model.c 跟验过的不是同一份；\n"
+                    "  ③导出时的窗口长度/通道数跟训练时不一致。")
         else:
             eng = serve.Engine(serve.build(gens[tag]))
             bad = eng.selftest()
