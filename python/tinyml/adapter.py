@@ -47,13 +47,29 @@ class ModelAdapter:
                 f"（没有 estimators_），实际是 {type(model)}")
 
     # ── 沿着各自的轴变小 ────────────────────────────────────────────────
-    def variant(self, v):
-        """v 对 GBDT 是轮数，对 RF 是 max_depth。返回一个能 scores() 的对象。"""
+    def variant(self, v, n_trees=None, quantize_leaves=False):
+        """v 对 GBDT 是轮数，对 RF 是 max_depth。返回一个能 scores() 的对象。
+
+        n_trees / quantize_leaves 只对 RF 有意义，因为**端上真正要跑的那一格是
+        「棵数 × 深度 × uint8 叶子」三件事一起生效之后的模型**。只按深度截断
+        得到的事件级指标对应不上任何一个塞得进 flash 的配置——拿那个数
+        去跟 CNN 比，是在比两个不同的东西。
+
+        GBDT 传这两个参数**直接报错**，不静默忽略：减树对 GBDT 是非法的
+        （树是顺序的，第 k 棵拟合前 k-1 棵的残差），静默忽略会让调用方
+        以为自己评的是减过树的模型。
+        """
         if self.kind == "gbdt":
+            if n_trees is not None or quantize_leaves:
+                raise ValueError(
+                    "n_trees / quantize_leaves 只对 RF 有意义。GBDT 的树是顺序的，"
+                    "只能从头按轮数截断、不能挑树；叶子存的也不是概率。")
             return _GbdtView(self.obj.truncate(int(v)))
         from .forest import from_sklearn
-        return _RfView(from_sklearn(self._sk, class_names=self.class_names,
-                                    max_depth=int(v)))
+        from .forest import quantize_leaves as _ql
+        f = from_sklearn(self._sk, class_names=self.class_names,
+                         max_depth=int(v), n_trees=n_trees)
+        return _RfView(_ql(f) if quantize_leaves else f)
 
     def full(self):
         return _GbdtView(self.obj) if self.kind == "gbdt" else _RfView(self.obj)

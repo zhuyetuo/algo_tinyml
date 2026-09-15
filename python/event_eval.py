@@ -142,6 +142,13 @@ def main():
     ap.add_argument("--focus", required=True)
     ap.add_argument("--rounds", default="",
                     help="要扫的点。GBDT 是轮数，RF 是 max_depth。留空=自动")
+    ap.add_argument("--trees", type=int, default=0,
+                    help="[只对 RF] 只取前 n 棵。**要评的是端上真跑的那一格**，"
+                         "而那一格是棵数和深度一起生效的——只截深度得到的数"
+                         "对应不上任何一个塞得进 flash 的配置")
+    ap.add_argument("--quantize-leaves", action="store_true",
+                    help="[只对 RF] 叶子概率量化成 uint8，跟端上一致。"
+                         "这会**改变判决**（相差不到 1/255 的两类会翻），所以要实测")
     ap.add_argument("--min-windows", type=int, default=3)
     ap.add_argument("--max-gap", type=int, default=2)
     ap.add_argument("--force", action="store_true",
@@ -190,8 +197,19 @@ def main():
     print(hdr)
     print("-" * len(hdr))
     axis = [int(v) for v in args.rounds.split(",") if v] or ad.default_axis()
+    n_trees = args.trees or None
+    if (n_trees or args.quantize_leaves) and ad.kind != "rf":
+        sys.exit("--trees / --quantize-leaves 只对随机森林有意义，"
+                 f"这个模型是 {ad.kind}。")
+    if n_trees or args.quantize_leaves:
+        bits = []
+        if n_trees:
+            bits.append(f"只取前 {n_trees} 棵")
+        if args.quantize_leaves:
+            bits.append("叶子量化成 uint8")
+        print(f"（{('、'.join(bits))}——跟端上一致）\n")
     for r in axis:
-        t = ad.variant(r)
+        t = ad.variant(r, n_trees=n_trees, quantize_leaves=args.quantize_leaves)
         pred = np.array([int(np.argmax(t.scores(x))) for x in X])
         hits = pred == fi
         tp = int(np.sum(hits & (y == fi)))

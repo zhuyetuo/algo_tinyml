@@ -73,3 +73,63 @@ def test_rf_的紧凑体积把叶子表算进去():
     n_leaves = 4       # 上面那棵树有 4 个叶子
     assert v.compact_flash() == 6 * v.n_nodes + n_leaves * 3 * 4
     assert v.compact_flash() < v.flash(), "紧凑布局应该比现在小"
+
+
+# ── 端上真跑的那一格：棵数 × 深度 × uint8 叶子 ─────────────────────────────
+
+
+def _fake_rf_n(n, depth=3):
+    """n 棵一模一样的树。棵数是真的，所以减树的下标逻辑验得到。"""
+    rf = _fake_rf(depth)
+    rf.estimators_ = [_fake_rf(depth).estimators_[0] for _ in range(n)]
+    return rf
+
+
+def test_variant_可以同时按棵数和深度截断():
+    """**只截深度得到的数对应不上任何一个塞得进 flash 的配置。**
+    端上那一格是棵数和深度一起生效的，评估必须评同一个东西。"""
+    ad = ModelAdapter(_fake_rf_n(5), class_names=["a", "b", "c"])
+    full = ad.variant(3)
+    cut = ad.variant(3, n_trees=2)
+    assert cut.f.n_trees == 2 and full.f.n_trees == 5
+    assert cut.n_nodes < full.n_nodes
+
+
+def test_variant_量化叶子会落到_1_over_255_的格子上():
+    ad = ModelAdapter(_fake_rf_n(2), class_names=["a", "b", "c"])
+    q = ad.variant(3, quantize_leaves=True)
+    scaled = np.asarray(q.f.leaf_proba, np.float64) * 255
+    assert np.allclose(scaled, np.round(scaled), atol=1e-6)
+    # 不加这个开关时**不能**被量化——否则"没量化"这条路径就没了
+    assert not np.allclose(np.asarray(ad.variant(3).f.leaf_proba, np.float64) * 255,
+                           np.round(np.asarray(ad.variant(3).f.leaf_proba, np.float64) * 255),
+                           atol=1e-6)
+
+
+def test_量化叶子确实会改判决而不是白给():
+    """叶子量化不是免费的——相差不到 1/255 的两类会翻。
+    如果这条永远不触发，说明量化根本没接上。"""
+    ad = ModelAdapter(_fake_rf_n(3), class_names=["a", "b", "c"])
+    a, b = ad.variant(3), ad.variant(3, quantize_leaves=True)
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(200, 3)).astype(np.float32)
+    sa = np.array([a.scores(x) for x in X])
+    sb = np.array([b.scores(x) for x in X])
+    assert not np.array_equal(sa, sb), "量化之后分数一模一样，量化没生效"
+
+
+class _FakeBoosterModel:
+    """只要有 get_booster，ModelAdapter 就当它是 GBDT。"""
+    def get_booster(self):
+        raise AssertionError("不该走到这里")
+
+
+def test_gbdt_传减树参数要报错而不是静默忽略(monkeypatch):
+    """**静默忽略是最坏的**：调用方会以为自己评的是减过树的模型，
+    而 GBDT 减树本来就是非法的（树是顺序的，第 k 棵拟合前 k-1 棵的残差）。"""
+    ad = ModelAdapter(_fake_rf_n(3), class_names=["a", "b", "c"])
+    ad.kind = "gbdt"          # 只改类型，走到那条分支即可
+    with pytest.raises(ValueError, match="只对 RF"):
+        ad.variant(3, n_trees=2)
+    with pytest.raises(ValueError, match="只对 RF"):
+        ad.variant(3, quantize_leaves=True)
