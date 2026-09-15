@@ -289,3 +289,328 @@ def test_model_path_encodes_the_tag(runner, tmp_path):
     r = h._one({"path": "g.csv", "mode": "raw"})
     assert r.get("model_path") == "edge://edge_cnn_i8.edge", r
     assert os.path.splitext(os.path.basename(r["model_path"]))[0] == "edge_cnn_i8"
+
+
+# ── RF 那条路线 ───────────────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def rf_runner(tmp_path_factory):
+    """一个小森林，走 tm_features + tm_forest 的真实 C 路径。
+
+    树是手工造的（不需要 sklearn，这台机器上也没有）：验的是**导出 + C 推理 +
+    跟 infer_file 的接缝**，sklearn 只是上游来源，它的解析另有测试。
+    """
+    import edge_service
+    import serve
+    from tinyml.export_features_c import export as export_feat_cfg
+    from tinyml.export_forest_c import export as export_forest
+    from tinyml.features import n_features
+    from tinyml.forest import Forest
+
+    edge_service.add_imu_train(IMU_TRAIN)
+    nfeat = n_features(N_CH)
+    rng = np.random.default_rng(3)
+
+    # 每棵树：根按某个特征分，两个叶子。简单但走的是真实的遍历代码
+    n_trees = 6
+    feat, thr, left, right, offs, leaves = [], [], [], [], [0], []
+    for t in range(n_trees):
+        base = len(feat)
+        feat += [int(rng.integers(0, nfeat)), len(leaves), len(leaves) + 1]
+        thr += [float(rng.normal(0, 1)), 0.0, 0.0]
+        left += [base + 1, -1, -1]
+        right += [base + 2, -1, -1]
+        for _ in range(2):
+            # **叶子要有峰**，像真森林那样。第一版用的是均匀随机再归一化，
+            # 6 棵树一平均就趋近 1/5——于是"没有被 softmax 压平"那条断言
+            # 测的不是 softmax，是我的假数据本来就接近均匀。
+            p = np.full(N_CLS, 0.02)
+            p[int(rng.integers(0, N_CLS))] = 0.92
+            leaves.append((p / p.sum()).astype(np.float32))
+        offs.append(len(feat))
+
+    forest = Forest(
+        n_features=nfeat, n_classes=N_CLS,
+        tree_offset=np.asarray(offs, np.int32),
+        node_feature=np.asarray(feat, np.int32),
+        node_threshold=np.asarray(thr, np.float32),
+        node_left=np.asarray(left, np.int32),
+        node_right=np.asarray(right, np.int32),
+        leaf_proba=np.stack(leaves).astype(np.float32),
+        class_names=tuple(CLASSES),
+    )
+    gen = tmp_path_factory.mktemp("gen_rf")
+    files = export_forest(forest)
+    files.update(export_feat_cfg(N_T, N_CH, N_T, float(HZ)))
+    for name, content in files.items():
+        (gen / name).write_text(content, encoding="utf-8")
+
+    eng = serve.RfEngine(serve.build_rf(str(gen), out_so=str(gen / "rf.so")))
+    meta = {"classes": CLASSES, "window_size": N_T, "hz": HZ, "stride": N_T // 2,
+            "n_channels": N_CH, "gravity_aligned": True, "label_mode": "majority",
+            "ch_mean": [0.0] * N_CH, "ch_std": [1.0] * N_CH}
+    return edge_service.EdgeRunner("edge_rf_d10", eng, meta, IMU_TRAIN, kind="rf")
+
+
+def test_rf_feature_dim_matches_the_forest(rf_runner):
+    """tm_features 产出的维度必须等于森林训练时的维度。
+
+    对不上**不会崩**——森林按下标去读越界的特征，读到相邻内存，
+    给出一个看起来完全正常的概率。所以这一条在构造时就拦。
+    """
+    e = rf_runner.engine
+    assert e.feat_dim == e.n_features == 193
+
+
+def test_rf_csv_to_segments_end_to_end(rf_runner, tmp_path):
+    """RF 也走同一条 infer_file，出来的片段结构必须跟 CNN 那条一样——
+    平台那边是同一套解析代码。"""
+    p = tmp_path / "rf.csv"
+    _write_csv(str(p), n_rows=HZ * 90, seed=11)
+    out = rf_runner.infer(str(p), HZ, min_windows=1, max_gap=2, targets=CLASSES)
+    assert out["n_windows"] > 0
+    for label, segs in out["segments"].items():
+        for seg in segs:
+            for k in ("start_ts", "end_ts", "conf_max", "conf_mean"):
+                assert k in seg, f"{label} 的片段缺字段 {k}"
+
+
+def test_rf_probabilities_are_not_softmaxed_again(rf_runner, tmp_path):
+    """森林给的已经是概率（各树叶子概率的平均）。再过一次 softmax 会把分布
+    压平，置信度全错——而那不会报错，只是所有片段的 conf 都往 0.2 靠。"""
+    from tinyml.edge_model import EdgeRF
+    m = EdgeRF(rf_runner.engine, CLASSES)
+    X = np.random.default_rng(7).normal(0, 1, (12, N_T, N_CH)).astype(np.float32)
+    p = m.predict_proba(X)
+    assert np.allclose(p.sum(axis=1), 1.0, atol=1e-5)
+    # 均匀分布是 1/5=0.2。softmax 过一遍会把最大值压到 0.2 附近；
+    # 没过的话，随机叶子概率的最大值应当明显高于均匀
+    # **直接跟"再过一次 softmax 会变成什么"比**，不拍阈值。
+    # 前两版我拍了 0.25 和 0.5，一个太松一个太紧——而"多少算有峰"取决于
+    # 几棵树投给几个类别，是个跟被测行为无关的量。自校准的比较没这个问题。
+    from tinyml.edge_model import softmax
+    flattened = softmax(p)
+    assert p.max() > flattened.max() * 1.5, (
+        f"森林给的最大概率 {p.max():.3f}，跟再过一次 softmax 的结果 "
+        f"{flattened.max():.3f} 差不多——多半是真的又过了一次")
+
+
+def test_rf_is_dl_flag_is_true(rf_runner):
+    """infer_file 靠这个字段决定要不要在 Python 里算手工特征。
+
+    RF 这条**特征也在 C 里算**，所以要拿到的是原始窗口，必须是 True。
+    写成 False 的话 infer_file 会先算一遍 scipy 特征再喂进来——
+    形状还正好是 193，不会报错，但算的是另一套。
+    """
+    assert rf_runner.model.is_dl is True
+
+
+def test_rf_features_come_from_c_not_scipy(rf_runner):
+    """C 的特征跟 Python 参考实现对得上（同一份算法的两个实现）。
+
+    注意这里比的**不是** imu_train 的 scipy 版——那两者做不到逐位一致
+    （float64 vs float32、FFT 实现不同），tm_features.h 顶部写明了。
+    比的是 python/tinyml/features.py，它是 C 那份的参考实现。
+    """
+    from tinyml.features import extract_one
+    rng = np.random.default_rng(5)
+    x = rng.normal(0, 1, (N_CH, N_T)).astype(np.float32)
+    got = rf_runner.engine.features(x)                      # C 吃 [C, T]
+    # **extract_one 吃的是 [T, C]，跟 C 相反。**第一版我直接把 [C,T] 传进去，
+    # 它当成 T=8、C=16 算出了 281 维——形状检查当场拦下了。
+    # 这正是这类接缝测试要抓的错，只不过这次是在测试里犯的。
+    want = np.asarray(extract_one(x.T, float(HZ), nperseg=N_T), np.float32)
+    assert got.shape == want.shape
+    bad = np.flatnonzero(~np.isclose(got, want, rtol=1e-4, atol=1e-5))
+    assert not len(bad), (
+        f"{len(bad)} 维特征对不上，头几个下标 {bad[:5].tolist()}\n"
+        f"C={got[bad[0]]}  Python={want[bad[0]]}")
+
+
+def test_feature_dim_mismatch_is_refused_at_load_time(tmp_path):
+    """森林按 N 维训的，但 tm_features 产出 M 维——**必须在加载时就炸**。
+
+    这不是假想的错法：export_rf.py 的 --channels 填成 6（而模型是 8 通道训的）
+    就会得到这个结果。而它**不会崩也不会报错**——森林按下标去读越界的特征，
+    读到相邻内存，给出一个看起来完全正常的概率。
+    等到推理时才发现是不可能的，因为那时候没有任何异常可看。
+    """
+    import serve
+    from tinyml.export_features_c import export as export_feat_cfg
+    from tinyml.export_forest_c import export as export_forest
+    from tinyml.forest import Forest
+
+    # 森林按 6 通道（171 维）训，特征配置按 8 通道（193 维）导 —— 对不上
+    forest = Forest(
+        n_features=171, n_classes=N_CLS,
+        tree_offset=np.asarray([0, 1], np.int32),
+        node_feature=np.asarray([0], np.int32),
+        node_threshold=np.asarray([0.0], np.float32),
+        node_left=np.asarray([-1], np.int32),
+        node_right=np.asarray([-1], np.int32),
+        leaf_proba=np.full((1, N_CLS), 1.0 / N_CLS, np.float32),
+        class_names=tuple(CLASSES),
+    )
+    gen = tmp_path / "mismatch"
+    gen.mkdir()
+    files = export_forest(forest)
+    files.update(export_feat_cfg(N_T, 8, N_T, float(HZ)))   # 8 通道 → 193 维
+    for name, content in files.items():
+        (gen / name).write_text(content, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="特征维度对不上"):
+        serve.RfEngine(serve.build_rf(str(gen), out_so=str(gen / "bad.so")))
+
+
+def _rf_export(tmp_dir, with_forest_golden=True, with_pipeline_golden=True, seed=3):
+    """导一份带（或不带）golden 的 RF。返回 (目录, forest)。"""
+    from tinyml.export_features_c import export as export_feat_cfg
+    from tinyml.export_forest_c import export as export_forest
+    from tinyml.export_pipeline_c import export as export_pipeline
+    from tinyml.features import n_features
+    from tinyml.forest import Forest
+
+    nfeat = n_features(N_CH)
+    rng = np.random.default_rng(seed)
+    feat, thr, left, right, offs, leaves = [], [], [], [], [0], []
+    for _ in range(4):
+        base = len(feat)
+        feat += [int(rng.integers(0, nfeat)), len(leaves), len(leaves) + 1]
+        thr += [float(rng.normal(0, 1)), 0.0, 0.0]
+        left += [base + 1, -1, -1]
+        right += [base + 2, -1, -1]
+        for _ in range(2):
+            p = np.full(N_CLS, 0.02)
+            p[int(rng.integers(0, N_CLS))] = 0.92
+            leaves.append((p / p.sum()).astype(np.float32))
+        offs.append(len(feat))
+    forest = Forest(
+        n_features=nfeat, n_classes=N_CLS,
+        tree_offset=np.asarray(offs, np.int32),
+        node_feature=np.asarray(feat, np.int32),
+        node_threshold=np.asarray(thr, np.float32),
+        node_left=np.asarray(left, np.int32),
+        node_right=np.asarray(right, np.int32),
+        leaf_proba=np.stack(leaves).astype(np.float32),
+        class_names=tuple(CLASSES))
+
+    gx = rng.normal(0, 1, (6, nfeat)).astype(np.float32) if with_forest_golden else None
+    files = export_forest(forest, golden_x=gx)
+    files.update(export_feat_cfg(N_T, N_CH, N_T, float(HZ)))
+    if with_pipeline_golden:
+        wins = rng.normal(0, 1, (4, N_T, N_CH)).astype(np.float32)
+        files.update(export_pipeline(forest, wins, float(HZ), nperseg=N_T))
+    for name, content in files.items():
+        (tmp_dir / name).write_text(content, encoding="utf-8")
+    return tmp_dir, forest
+
+
+def test_rf_golden_selftest_passes(tmp_path):
+    """导了 golden 的话，C 算出来必须跟 Python 参考**逐位**相同。
+
+    比位模式不是比差值：用容差的话，"编译器开了 -ffast-math" 这种问题会被
+    放过去——它造成的差异往往正好在容差里面，但会随输入放大。
+    """
+    import serve
+    d = tmp_path / "g"
+    d.mkdir()
+    _rf_export(d)
+    eng = serve.RfEngine(serve.build_rf(str(d), out_so=str(d / "g.so")))
+    report = eng.selftest()
+    assert len(report) == 2
+    for name, n, bad in report:
+        assert n > 0, f"{name} 一条 golden 都没有"
+        assert bad == 0, f"{name} 有 {bad} 个值对不上"
+
+
+def test_missing_golden_is_not_reported_as_pass(tmp_path):
+    """**没有 golden 不算通过。**
+
+    导出时忘了给 --features/--windows 就是这个结果，而"0 条全部通过"
+    是这类自检最经典的失效方式——它永远是绿的，而且完全没有验证任何东西。
+    """
+    import serve
+    d = tmp_path / "nog"
+    d.mkdir()
+    _rf_export(d, with_forest_golden=False, with_pipeline_golden=False)
+    eng = serve.RfEngine(serve.build_rf(str(d), out_so=str(d / "n.so")))
+    for name, n, bad in eng.selftest():
+        assert bad == -2, f"{name} 没有 golden 却报了 {bad}"
+        assert n == 0
+
+
+def test_golden_selftest_catches_a_tampered_model(tmp_path):
+    """把导出的森林改一个阈值，自检必须红。
+
+    这一条钉的是"自检真的在比"——上面两条只能说明它跑通了，
+    说明不了它有没有在比对。改一个阈值是最小的、最像"不小心"的改动。
+    """
+    import re
+
+    import serve
+    d = tmp_path / "tamper"
+    d.mkdir()
+    _rf_export(d)
+    src = (d / "tm_forest_model.c").read_text(encoding="utf-8")
+    # 改**叶子**，不是改阈值。
+    #
+    # 第一版改的是根节点阈值，结果自检是绿的——原阈值是 -2.56，而特征是
+    # N(0,1)，本来就几乎全走右边，改成更负的仍然全走右边，一条都没翻。
+    # 改叶子是确定性的：每个输入必定落到某个叶子上。
+    #
+    # 顺带：字面量是**十六进制浮点**（0x1.8p-2f）不是十进制——导出器故意用它，
+    # 因为十六进制能精确往返。我第一版按十进制写正则，一个都匹配不上。
+    line = next(ln for ln in src.splitlines() if "tm_forest_leaf" in ln)
+    tampered = re.sub(r"-?0x[0-9a-f.]+p[+-]\d+f", "0x1.0p-1f", line)
+    assert tampered != line, f"没改动任何叶子：{line[:120]}"
+    (d / "tm_forest_model.c").write_text(src.replace(line, tampered, 1),
+                                         encoding="utf-8")
+
+    eng = serve.RfEngine(serve.build_rf(str(d), out_so=str(d / "t.so")))
+    bad_total = sum(bad for _, _, bad in eng.selftest() if bad > 0)
+    assert bad_total > 0, "改了模型自检却没红——那它什么都没在比"
+
+
+def test_golden_selftest_catches_a_one_ulp_difference(tmp_path):
+    """叶子只改 **1 个 ULP**，自检也必须红。
+
+    这一条钉的是"比的是 float 的位模式，不是差值小于某个阈值"。
+    上面那条改叶子改得很狠，用 1e-3 的容差照样能发现——它证明不了这一点
+    （变异测试里把位比较换成容差比较，那条照样绿）。
+
+    为什么在意 1 个 ULP：位模式比较真正要抓的是 `-ffast-math`、
+    "被优化成乘倒数"这类编译选项问题。它们造成的差异往往就是几个 ULP，
+    正好落在任何合理的容差里面——**但它会随输入放大**。
+    """
+    import re
+    import struct
+
+    import serve
+    d = tmp_path / "ulp"
+    d.mkdir()
+    _rf_export(d)
+    src = (d / "tm_forest_model.c").read_text(encoding="utf-8")
+    line = next(ln for ln in src.splitlines() if "tm_forest_leaf" in ln)
+    def nudge(mo):
+        """按 float32 的位表示加 1，再打回十六进制浮点。
+
+        直接在十六进制字面量上改一位是不行的——float32 尾数 24 位，
+        而字面量写了 13 位十六进制（float64 的宽度），改错位置会一步跨过好几个 ULP。
+        """
+        v = np.float32(float.fromhex(mo.group(0).rstrip("f")))
+        bits = struct.unpack("<I", struct.pack("<f", v))[0]
+        return f"{struct.unpack('<f', struct.pack('<I', bits + 1))[0].hex()}f"
+
+    # **所有**叶子各推 1 ULP，不是只推第一个。
+    # 只推第一个时自检是绿的：那个叶子是树 0 的左叶，而根阈值是 -2.56、
+    # 特征是 N(0,1)，几乎没有输入会走到它——跟上面改阈值那次是同一个陷阱。
+    tampered = re.sub(r"-?0x[0-9a-f.]+p[+-]\d+f", nudge, line)
+    assert tampered != line, "没改动任何叶子"
+    (d / "tm_forest_model.c").write_text(src.replace(line, tampered, 1),
+                                         encoding="utf-8")
+
+    eng = serve.RfEngine(serve.build_rf(str(d), out_so=str(d / "u.so")))
+    bad_total = sum(bad for _, _, bad in eng.selftest() if bad > 0)
+    assert bad_total > 0, \
+        "差了 1 个 ULP 自检却没红——那它比的是容差，不是位模式"
