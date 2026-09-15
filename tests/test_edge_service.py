@@ -614,3 +614,123 @@ def test_golden_selftest_catches_a_one_ulp_difference(tmp_path):
     bad_total = sum(bad for _, _, bad in eng.selftest() if bad > 0)
     assert bad_total > 0, \
         "差了 1 个 ULP 自检却没红——那它比的是容差，不是位模式"
+
+
+# ── 紧凑编码那条（--compact 导出的） ──────────────────────────────────────
+
+
+def _rf_export_compact(tmp_dir, seed=3, golden=True):
+    """导一份**紧凑编码**的 RF（7 B/节点 + uint8 叶子）。"""
+    from tinyml.export_features_c import export as export_feat_cfg
+    from tinyml.export_forest_compact_c import export as export_compact
+    from tinyml.features import n_features
+    from tinyml.forest import Forest
+    from tinyml.forest_compact import CompactForest
+
+    nfeat = n_features(N_CH)
+    rng = np.random.default_rng(seed)
+    feat, thr, left, right, offs, leaves = [], [], [], [], [0], []
+
+    def build(d):
+        i = len(feat)
+        if d == 0:
+            feat.append(len(leaves))
+            thr.append(0.0)
+            left.append(-1)
+            right.append(-1)
+            p = np.full(N_CLS, 0.02)
+            p[int(rng.integers(0, N_CLS))] = 0.92
+            leaves.append((p / p.sum()).astype(np.float32))
+            return i
+        feat.append(int(rng.integers(0, nfeat)))
+        thr.append(float(rng.normal(0, 1)))
+        left.append(-1)
+        right.append(-1)
+        li, ri = build(d - 1), build(d - 1)
+        left[i], right[i] = li, ri
+        return i
+
+    for _ in range(4):
+        build(3)
+        offs.append(len(feat))
+
+    forest = Forest(
+        n_features=nfeat, n_classes=N_CLS,
+        tree_offset=np.asarray(offs, np.int32),
+        node_feature=np.asarray(feat, np.int32),
+        node_threshold=np.asarray(thr, np.float32),
+        node_left=np.asarray(left, np.int32),
+        node_right=np.asarray(right, np.int32),
+        leaf_proba=np.stack(leaves).astype(np.float32),
+        class_names=tuple(CLASSES))
+    cf = CompactForest(forest)
+    gx = rng.normal(0, 1, (8, nfeat)).astype(np.float32) if golden else None
+    files = export_compact(cf, golden_x=gx)
+    files.update(export_feat_cfg(N_T, N_CH, N_T, float(HZ)))
+    for name, content in files.items():
+        (tmp_dir / name).write_text(content, encoding="utf-8")
+    return cf
+
+
+@pytest.fixture(scope="module")
+def rfc_runner(tmp_path_factory):
+    import edge_service
+    import serve
+    edge_service.add_imu_train(IMU_TRAIN)
+    d = tmp_path_factory.mktemp("gen_rfc")
+    _rf_export_compact(d)
+    eng = serve.RfEngine(serve.build_rf(str(d), out_so=str(d / "rfc.so")))
+    meta = {"classes": CLASSES, "window_size": N_T, "hz": HZ, "stride": N_T // 2,
+            "gravity_aligned": True, "label_mode": "majority"}
+    return edge_service.EdgeRunner("edge_rf_d10", eng, meta, IMU_TRAIN, kind="rf")
+
+
+def test_build_rf_picks_compact_automatically(rfc_runner):
+    """导出目录里有 tm_forest_c_model.c 就走紧凑那条，不用传开关。
+
+    传开关的话，导的是紧凑版而开关忘了改，会以一堆 include 错误的形式炸出来，
+    而不是一句话说清缺什么。
+    """
+    e = rfc_runner.engine
+    assert e.n_features == 193 and e.feat_dim == 193
+    assert e.classes == CLASSES
+
+
+def test_compact_golden_selftest_passes(rfc_runner):
+    """紧凑版的 golden 存的是**整数票数**——整数累加跟指令集无关，
+    所以对不上一定是编码或解析错了，不可能是"数值误差"。"""
+    report = rfc_runner.engine.selftest()
+    forest = [r for r in report if "森林" in r[0]][0]
+    assert forest[1] > 0, "一条 golden 都没有"
+    assert forest[2] == 0, f"{forest[2]} 个票数对不上"
+
+
+def test_compact_has_no_pipeline_golden_and_says_so(rfc_runner):
+    """紧凑版暂时没有"整条链"的 golden。必须报 -2（没有），**不能报 0**——
+    "0 条全部通过"永远是绿的，而且什么都没验。"""
+    report = rfc_runner.engine.selftest()
+    pipe = [r for r in report if "整条链" in r[0]][0]
+    assert pipe[2] == -2 and pipe[1] == 0
+
+
+def test_compact_csv_to_segments_end_to_end(rfc_runner, tmp_path):
+    """紧凑 RF 也走同一条 infer_file，片段结构跟 CNN 那条一样。"""
+    p = tmp_path / "rfc.csv"
+    _write_csv(str(p), n_rows=HZ * 90, seed=13)
+    out = rfc_runner.infer(str(p), HZ, min_windows=1, max_gap=2, targets=CLASSES)
+    assert out["n_windows"] > 0
+    for label, segs in out["segments"].items():
+        for seg in segs:
+            for k in ("start_ts", "end_ts", "conf_max", "conf_mean"):
+                assert k in seg, f"{label} 的片段缺字段 {k}"
+            assert 0.0 <= seg["conf_max"] <= 1.0
+
+
+def test_compact_probabilities_sum_to_one(rfc_runner):
+    """C 里把整数票数还原成概率给平台用。和必须是 1——
+    除以的是票数总和，不是棵数（叶子量化之后每棵树贡献的总和不再是 255）。"""
+    from tinyml.edge_model import EdgeRF
+    m = EdgeRF(rfc_runner.engine, CLASSES)
+    X = np.random.default_rng(17).normal(0, 1, (10, N_T, N_CH)).astype(np.float32)
+    p = m.predict_proba(X)
+    assert np.allclose(p.sum(axis=1), 1.0, atol=1e-5)

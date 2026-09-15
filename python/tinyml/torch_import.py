@@ -36,17 +36,39 @@ def _as_numpy(v):
     return np.asarray(v, dtype=np.float32)
 
 
-def load_meta(json_path):
+# 两条路线要的字段不一样，**不能用同一套必填项**：
+#
+#   · CNN 吃原始窗口，训练时对输入做了逐通道 z-score，所以端上必须有
+#     ch_mean / ch_std（tm_prep 用），少了就是输入分布跟训练时对不上。
+#   · RF 吃 193 维手工特征，**不做任何归一化**——森林的阈值就是按原始量纲的
+#     特征值训的。给它 ch_mean 反而是错的。
+#
+# 我一开始用同一个 load_meta 去读 RF 的 ml_rf.json，报"缺 ch_mean"。
+# 那不是 json 的问题，是我把 CNN 的加载器套到了 RF 上。
+_COMMON = ("classes", "window_size", "hz")
+_CNN_ONLY = ("ch_mean", "ch_std", "n_channels")
+
+
+def load_meta(json_path, kind="cnn"):
+    """读 imu_train 的训练元数据。kind: "cnn"（dl_*.json）或 "rf"（ml_*.json）。"""
+    if kind not in ("cnn", "rf"):
+        raise ValueError(f"kind={kind}，只支持 cnn / rf")
     with open(json_path, encoding="utf-8") as f:
         m = json.load(f)
-    for k in ("classes", "ch_mean", "ch_std", "window_size", "n_channels"):
+    need = _COMMON + (_CNN_ONLY if kind == "cnn" else ())
+    for k in need:
         if k not in m:
-            raise ValueError(f"{json_path} 里缺 {k}；这个 .json 跟 imu_train 的 train.py 对不上")
-    std = np.asarray(m["ch_std"], np.float64)
-    if np.any(std <= 0):
-        # std 为 0 意味着那一路通道在训练集上是常数。除下去会得到 inf/nan，
-        # 而 nan 一路传到 argmax 会安静地变成"总是第 0 类"
-        raise ValueError(f"ch_std 里有非正值：{std.tolist()}；那一路通道在训练集上是常数？")
+            raise ValueError(
+                f"{json_path} 里缺 {k}（按 {kind} 读的）。\n"
+                "  CNN 要的是 imu_train 的 dl_*.json，RF 要的是 ml_*.json——"
+                "两者字段不同，别指错。")
+    if kind == "cnn":
+        std = np.asarray(m["ch_std"], np.float64)
+        if np.any(std <= 0):
+            # std 为 0 意味着那一路通道在训练集上是常数。除下去会得到 inf/nan，
+            # 而 nan 一路传到 argmax 会安静地变成"总是第 0 类"
+            raise ValueError(
+                f"ch_std 里有非正值：{std.tolist()}；那一路通道在训练集上是常数？")
     return m
 
 

@@ -69,25 +69,41 @@ def build(gen_dir, out_so=None, cc="gcc"):
 
 
 def build_rf(gen_dir, out_so=None, cc="gcc"):
-    """编 RF 那条路线的 .so（tm_features + tm_forest）。
+    """编 RF 那条路线的 .so。紧凑编码和老 SoA 编码**自动识别**。
 
     跟 build() 分开，因为两条路线的导出文件名不同——合成一个带开关的函数，
     "只导了其中一条"时会报一堆莫名其妙的 include 错误，而不是一句话说清缺什么。
     """
     gen_dir = os.path.abspath(os.path.expanduser(gen_dir))
-    need = ["tm_forest_model.c", "tm_forest_model.h", "tm_feat_cfg.c", "tm_feat_cfg.h"]
-    missing = [f for f in need if not os.path.exists(os.path.join(gen_dir, f))]
+    has = lambda f: os.path.exists(os.path.join(gen_dir, f))  # noqa: E731
+
+    # 两种编码**按导出目录里有什么文件自动选**，不让调用方传开关：
+    # 传开关的话，导的是紧凑版而开关忘了改，会以一堆 include 错误的形式炸出来，
+    # 而不是一句话说清。两份宿主包装导出的符号名完全相同，Python 这边不用管。
+    compact = has("tm_forest_c_model.c")
+    if compact:
+        model_c, host_c = "tm_forest_c_model.c", "tm_host_rfc.c"
+        runtime = "tm_forest_c.c"
+        need = ["tm_forest_c_model.c", "tm_forest_c_model.h",
+                "tm_feat_cfg.c", "tm_feat_cfg.h"]
+    else:
+        model_c, host_c = "tm_forest_model.c", "tm_host_rf.c"
+        runtime = "tm_forest.c"
+        need = ["tm_forest_model.c", "tm_forest_model.h",
+                "tm_feat_cfg.c", "tm_feat_cfg.h"]
+    missing = [f for f in need if not has(f)]
     if missing:
         sys.exit(f"{gen_dir} 里缺 {missing}。\n"
-                 "  先跑 export_rf.py 生成，--out 指到这个目录。")
+                 "  先跑 export_rf.py 生成，--out 指到这个目录。\n"
+                 "  128KB 预算下基本只能用紧凑编码，记得带 --compact。")
     out_so = out_so or os.path.join(tempfile.mkdtemp(), "tm_host_rf.so")
     cmd = [cc, "-O2", "-std=c99", "-Wall", "-Wextra", "-Werror",
            "-ffp-contract=off", "-fno-math-errno", "-fPIC", "-shared",
            f"-I{FW}", f"-I{gen_dir}",
-           os.path.join(FW, "tm_features.c"), os.path.join(FW, "tm_forest.c"),
-           os.path.join(gen_dir, "tm_forest_model.c"),
+           os.path.join(FW, "tm_features.c"), os.path.join(FW, runtime),
+           os.path.join(gen_dir, model_c),
            os.path.join(gen_dir, "tm_feat_cfg.c"),
-           os.path.join(ROOT, "host", "tm_host_rf.c"),
+           os.path.join(ROOT, "host", host_c),
            "-lm", "-o", out_so]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:

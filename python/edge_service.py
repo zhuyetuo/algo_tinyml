@@ -252,7 +252,9 @@ def main():
                          "标签里含 rf 的走 RF 路线（tm_features+tm_forest），"
                          "否则走 CNN（tm_prep+tm_invoke）")
     ap.add_argument("--meta", action="append", required=True, metavar="TAG=JSON",
-                    help="端侧模型：标签=imu_train 的 dl_*.json。可以给多次")
+                    help="端侧模型：标签=imu_train 的元数据 json。可以给多次。"
+                         "CNN 用 dl_*.json（带 ch_mean/ch_std），"
+                         "RF 用 ml_*.json（不需要归一化，没那两项）")
     ap.add_argument("--imu-train", default=os.path.expanduser("~/imu_train"))
     ap.add_argument("--nas-root", default="/", help="平台传的相对路径相对于哪里")
     ap.add_argument("--resample", default="poly", choices=["poly", "training_match"],
@@ -279,10 +281,12 @@ def main():
         sys.exit(f"--gen 和 --meta 的标签对不上：{sorted(gens)} vs {sorted(metas)}")
 
     for tag in sorted(gens):
-        meta = load_meta(os.path.expanduser(metas[tag]))
         # 按标签选路线。写死"含 rf 就是 RF"看着土，但比自动探测导出目录里
         # 有什么文件可靠——两条都导过的目录会让自动探测选错，而选错不报错
         kind = "rf" if "rf" in tag.lower() else "cnn"
+        # 两条路线的元数据字段不同：CNN 要 ch_mean/ch_std（tm_prep 用），
+        # RF 不做归一化所以没有那两项。按路线读，别用同一套必填项
+        meta = load_meta(os.path.expanduser(metas[tag]), kind=kind)
         if kind == "rf":
             eng = serve.RfEngine(serve.build_rf(gens[tag]))
             print(f"  {tag:<16} [RF] {eng.n_ch}×{eng.n_t}，{eng.n_classes} 类，"
