@@ -44,13 +44,16 @@ python/
   train_torch.py         训练（**唯一依赖 torch 的文件**），输出纯 numpy 的 model.npz
   quantize_and_export.py 量化 + 导出，只要 numpy
   tinyml/forest.py       随机森林：从 sklearn 抽成扁平数组 + 参考前向
-  tinyml/export_forest_c.py  导出 tm_forest_model.c/h + tm_forest_golden.h
-  export_rf.py           把平台在用的 .pkl 导成板上的 C（要 sklearn）
+  tinyml/features.py     193 维手工特征的参考实现（纯 numpy float32）
+  tinyml/export_forest_c.py / export_features_c.py   导出森林和特征常量表
+  export_rf.py           把平台在用的 .pkl + 特征表一起导成板上的 C（要 sklearn）
   rf_footprint.py        量 RF 搬过去占多少 flash（要 sklearn）
+  verify_against_scipy.py  量端侧特征 vs scipy 版差多少、**判别翻了多少**（要 scipy）
 firmware/tinyml/
   tm_runtime.c/h         int8 推理（conv1d / maxpool / dense），无 malloc、无 float
   tm_window.c/h          环形缓冲 → 窗口 → 量化
   tm_forest.c/h          随机森林推理（照抄 sklearn 的概率平均，不是多数投票）
+  tm_features.c/h        193 维手工特征（含基-2 FFT、Welch、时域统计）
 tests/                   C ↔ Python 逐位对照（现场用 gcc 编）
 docs/chip_choice.md      芯片选型
 ```
@@ -133,6 +136,23 @@ void on_imu_sample(const float s[6]) {
 }
 ```
 
+走 RF 那一路的话，窗口这一层不做量化，直接攒 float：
+
+```c
+#include "tm_features.h"
+#include "tm_feat_cfg.h"
+#include "tm_forest.h"
+#include "tm_forest_model.h"
+
+static float win[TM_FEAT_N_CH * TM_FEAT_N_T];   /* 通道在前 */
+static float feat[TM_FEAT_DIM];
+static float proba[TM_F_N_CLASSES];
+
+/* 攒满一个窗口之后 */
+tm_features(&tm_feat_cfg, win, feat);
+int cls = tm_forest_predict(&tm_forest, feat, proba);
+```
+
 **上板第一件事是跑 golden vector**，别直接上真实数据：
 
 ```c
@@ -186,9 +206,11 @@ for (int i = 0; i < TM_GOLDEN_N; i++) {
    ```
    超了多半也可解：**限深往往比砍树掉点少**——不限深的树尾部都是只覆盖几个样本的
    过拟合分支，那部分是噪声不是信息。
-2. **193 维特征要在 C 里重写一遍（工作量，不是可行性）**——`np.percentile` 的插值
-   方式、`find_peaks` 的判定、Welch 的分段和窗函数，每一个都是一处可能跟 scipy
-   写岔的地方。活儿不难但很碎，而且同样要拿 golden vector 钉住。
+2. ~~193 维特征要在 C 里重写一遍~~ **已经做完了**（`tm_features.c`）。写的时候
+   踩到的几处"写错了不会报错"：`np.percentile` 默认是线性插值不是取最近点、
+   `find_peaks` 的平台算一个峰、`np.sign` 对正好等于 0 给 0、Welch 的窗是**周期**
+   Hann、单边谱除首尾外要乘 2、峰度是 Fisher 的（减 3）。每一条都写成了
+   变异测试能逮住的用例。
 
 关于**浮点能不能两边一致**：算术核心能——全程锁 float32、关掉 FMA 合并
 （`-ffp-contract=off`），IEEE-754 的加减乘除和 sqrt 都是精确定义的。对不齐的是 libm
@@ -205,7 +227,7 @@ for (int i = 0; i < TM_GOLDEN_N; i++) {
 | | int8 CNN | 随机森林 |
 |---|---|---|
 | 模型体积 | ~1KB | 要量（`rf_footprint.py` / `export_rf.py` 都会打印） |
-| 前处理 | 只要窗口 + 量化，已实现 | **193 维手工特征要在 C 里重写，这部分还没做** |
+| 前处理 | 只要窗口 + 量化 | 193 维手工特征（含 FFT/Welch），已实现 |
 | 算术 | 定点，板上跟 PC **逐位相同** | float32，逐位相同要靠 `-ffp-contract=off`，已验证 |
 | 跟平台一致 | 两个模型、两套表现 | **同一个模型、同一套结论** |
 | 代码 | `tm_runtime.c` + `tm_window.c` | `tm_forest.c` |
@@ -214,10 +236,27 @@ for (int i = 0; i < TM_GOLDEN_N; i++) {
 RF 路线的 golden vector 比的是概率的**位模式**（`%08x`），不是 argmax——只比 argmax
 的话，一个已经算错、只是恰好还没把类别翻过去的实现能一路混到量产。
 
-**RF 还差最后一块：特征提取。** 模型本身（树的遍历、概率平均、并列取下标小的、
-`<=` 走左）已经导出并逐位验过了，但端上还得先有那 193 维特征才能喂给它。
-`np.percentile` 的插值方式、`find_peaks` 的判定、Welch 的分段和窗函数——每一个
-都要在 C 里重写并跟 scipy 对齐。活儿不难但很碎，是这条路线上剩下的主要工作量。
+### RF 的一致性分两层，别混
+
+```
+imu_train/src/ml/features.py   scipy + float64    ← 平台在跑的，是基准
+tinyml/features.py             numpy + float32    ← 参考实现，逐行对着上面写
+firmware/tinyml/tm_features.c  C + float          ← 板上跑的
+```
+
+**参考实现 ↔ C 是逐位一致的**（除频谱熵——它用 `logf`，属于 libm，各实现不保证
+正确舍入，测试单独给它 1 ULP 容差，其余全部逐位）。
+
+**参考实现 ↔ scipy 不是，而且做不到**：scipy 全程 float64，M4F 只有单精度 FPU；
+FFT 算法也不同，浮点加法不满足结合律。所以这一层只能量：
+
+```bash
+python python/verify_against_scipy.py --windows windows.npy --model xxx.pkl --hz 16
+```
+
+它的**主输出不是特征差多少，是判别翻了多少**——特征差第几位小数不重要，森林
+判别翻没翻才重要。脚本还会看翻掉的样本原本置信度多高：翻的都是低置信度样本
+就是边界抖动，有高置信度样本被翻那是 bug。
 
 怎么选，等体积数出来：
 
