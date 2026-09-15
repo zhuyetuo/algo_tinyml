@@ -90,6 +90,10 @@ def exe(tmp_path_factory):
          # 没有它，编译器可以把 a*b+c 合成一次 FMA（少一次舍入），跟 Python
          # 分两步算的结果末位就不同。这是整条链里最容易被忽略的一个开关
          "-ffp-contract=off",
+         # sqrtf 变成单条 vsqrt.f32 指令（M4F 上代码更小也更快）。IEEE 规定 sqrt
+         # 必须正确舍入，硬件指令和 libm 给的是同一个数——所以这个开关**不该**
+         # 改变任何结果。加进测试就是为了证明这一点，而不是相信它。
+         "-fno-math-errno",
          "-fsanitize=undefined", "-fno-sanitize-recover=all",
          f"-I{FW}", f"-I{d}", os.path.join(FW, "tm_features.c"),
          str(d / "tm_feat_cfg.c"), os.path.join(ROOT, "tests", "host_features.c"),

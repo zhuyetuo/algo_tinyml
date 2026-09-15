@@ -63,6 +63,7 @@ docs/rf_size.md          RF 体积怎么算、要不要量化剪枝
 docs/frameworks.md       Cortex-M4F 上有哪些推理框架、为什么我们都没用
 docs/market.md           市面上的项圈（FitBark/Fi/Tractive/Maven/Whistle）是不是端侧推理
 docs/model_choice.md     端侧选哪个模型（1D-CNN / GBDT / LR / RF 的体积对照）
+docs/features_cost.md    193 维特征贵在哪、能不能不用 float32、怎么砍
 tools/host_sim.c         在 PC 上跑板上那份 C，喂真实数据
 ```
 

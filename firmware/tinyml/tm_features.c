@@ -282,6 +282,22 @@ static float corr(const float *xi, const float *xj, int n)
     return (fsum(tmp, n) / (float)n) / (si * sj);
 }
 
+#ifdef TM_BENCH
+/* 只在做性能剖析时导出内部函数（tools/bench_features.c 用）。
+ * 平时不导出：它们是实现细节，暴露出去就会有人绕过 tm_features 直接调，
+ * 那样特征的拼接顺序就没有唯一的出处了。 */
+void tm_bench_time_stats(const tm_feat_cfg_t *c, const float *x, int n, float *out)
+{
+    (void)c;
+    time_stats(x, n, out);
+}
+
+void tm_bench_freq_stats(const tm_feat_cfg_t *c, const float *x, int n, float *out)
+{
+    freq_stats(c, x, n, out);
+}
+#endif
+
 int tm_feat_dim(const tm_feat_cfg_t *cfg)
 {
     int n = 11 * cfg->n_ch + 8 * (cfg->n_ch < 6 ? cfg->n_ch : 6);

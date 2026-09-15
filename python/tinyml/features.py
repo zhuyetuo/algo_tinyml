@@ -315,3 +315,45 @@ def n_features(n_ch):
     if n_ch >= 6:
         n += 8 + 2 * (N_TIME_FEATS + N_FREQ_FEATS) + N_TIME_FEATS
     return n
+
+
+# ── 特征分组：砍特征只能按「计算组」砍，不能按单个特征砍 ────────────────────
+#
+# 这一点是砍特征时最容易搞错的地方：同一个通道的 11 个时域统计量**共享同一趟
+# 循环和同一次排序**，砍掉其中几个几乎不省时间；要省就得整组砍掉（那个通道
+# 的时域特征全不要），才能跳过整趟计算。频域 8 维共享一次 FFT，同理。
+#
+# 所以下面按「一次计算产出哪些维度」来分组，而不是按语义分。
+
+def feature_groups(n_ch=8):
+    """→ [(组名, start, stop, 计算类型)]，start/stop 是特征向量里的下标区间。
+
+    计算类型：time = 一趟时域统计（含排序）；freq = 一次 FFT + Welch；
+    cheap = 只是几次加减乘（SMA、相关系数）；derive = 先要派生出一路新信号。
+
+    顺序必须跟 extract_one 的拼接顺序一致。这里用循环生成而不是写死一张表，
+    是为了改通道数时它自己跟着变——写死的表迟早跟代码分家，而分家之后
+    "砍掉第 100 维"会砍到完全不相干的东西上。
+    """
+    names = ["acc_x", "acc_y", "acc_z", "gyr_x", "gyr_y", "gyr_z", "pitch", "roll"]
+    g, p = [], 0
+    for c in range(n_ch):
+        nm = names[c] if c < len(names) else f"ch{c}"
+        g.append((f"{nm} 时域", p, p + N_TIME_FEATS, "time"))
+        p += N_TIME_FEATS
+    for c in range(min(6, n_ch)):
+        nm = names[c] if c < len(names) else f"ch{c}"
+        g.append((f"{nm} 频域", p, p + N_FREQ_FEATS, "freq"))
+        p += N_FREQ_FEATS
+    if n_ch >= 6:
+        g.append(("全局 SMA+相关系数", p, p + 8, "cheap"))
+        p += 8
+        for nm in ("acc 模长", "gyro 模长"):
+            g.append((f"{nm} 时域", p, p + N_TIME_FEATS, "derive+time"))
+            p += N_TIME_FEATS
+            g.append((f"{nm} 频域", p, p + N_FREQ_FEATS, "freq"))
+            p += N_FREQ_FEATS
+        g.append(("jerk 模长 时域", p, p + N_TIME_FEATS, "derive+time"))
+        p += N_TIME_FEATS
+    assert p == n_features(n_ch), f"分组覆盖 {p} 维，但总共 {n_features(n_ch)} 维"
+    return g
