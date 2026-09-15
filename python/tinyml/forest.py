@@ -58,6 +58,15 @@ class Forest:
         return int(np.argmax(self.predict_proba(x)))
 
 
+def _pick_names(explicit, model):
+    if explicit is not None and len(explicit):
+        return tuple(explicit)
+    auto = getattr(model, "classes_", None)
+    if auto is None:
+        return ()
+    return tuple(auto)
+
+
 def _leaf_proba(t, i):
     """节点 i 的类别分布，归一成概率。
 
@@ -73,7 +82,8 @@ def _leaf_proba(t, i):
     return (v / ssum if ssum > 0 else np.full_like(v, 1.0 / len(v))).astype(np.float32)
 
 
-def from_sklearn(model, class_names=None, max_depth=None, min_samples_leaf=None) -> Forest:
+def from_sklearn(model, class_names=None, max_depth=None, min_samples_leaf=None,
+                 n_trees=None) -> Forest:
     """从 sklearn 的 RandomForestClassifier 抽出来，可选**就地截断**。
 
     max_depth / min_samples_leaf 不是重训，是**把已经训好的树在某个深度剪掉**：
@@ -90,6 +100,15 @@ def from_sklearn(model, class_names=None, max_depth=None, min_samples_leaf=None)
     ests = getattr(model, "estimators_", None)
     if ests is None:
         raise TypeError(f"不是随机森林（没有 estimators_），实际是 {type(model)}")
+
+    # **只取前 n 棵是合法的**：RF 的树是 bagging 出来的、互相独立同分布，
+    # 取哪几棵在统计上没有区别。
+    # （GBDT 完全不同——那边树是顺序的，第 k 棵拟合前 k-1 棵的残差，
+    #  所以只能从头截断，不能挑。这个区别不能混。）
+    if n_trees is not None:
+        if not (1 <= n_trees <= len(ests)):
+            raise ValueError(f"n_trees={n_trees} 超出范围（总共 {len(ests)} 棵）")
+        ests = ests[:n_trees]
 
     offsets = [0]
     feat, thr, left, right = [], [], [], []
@@ -151,7 +170,10 @@ def from_sklearn(model, class_names=None, max_depth=None, min_samples_leaf=None)
         node_left=np.asarray(left, np.int32),
         node_right=np.asarray(right, np.int32),
         leaf_proba=np.stack(leaves).astype(np.float32),
-        class_names=tuple(class_names or getattr(model, "classes_", []) or ()),
+        # **不能写 `class_names or getattr(...) or ()`**：sklearn 的 classes_ 是
+        # numpy 数组，对数组用 `or` 会抛 "truth value ambiguous"。这种写法在
+        # 别处（list）能跑，恰恰是最容易漏掉的那种。
+        class_names=_pick_names(class_names, model),
     )
 
 

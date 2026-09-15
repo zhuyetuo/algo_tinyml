@@ -68,8 +68,9 @@ def main():
     ap.add_argument("--model", required=True, help="训练产出的 .pkl")
     ap.add_argument("--flash-budget", type=int, default=128 * 1024,
                     help="留给模型的 flash 字节数，默认 128KB")
-    ap.add_argument("--leaf-bytes", type=int, default=4,
-                    help="一个叶子存多少字节。存 argmax 用 1，存 n_classes 个概率就按类别数给")
+    ap.add_argument("--leaf-bytes", type=int, default=0,
+                    help="一个叶子存多少字节。留空=按模型的类别数自动算"
+                         "（存 n_classes 个 float32 概率）。存 argmax 才是 1")
     args = ap.parse_args()
 
     try:
@@ -82,6 +83,14 @@ def main():
     ests = getattr(model, "estimators_", None)
     if ests is None:
         sys.exit(f"{args.model} 里不是随机森林（没有 estimators_），实际是 {type(model)}")
+
+    # 叶子字节数按类别数自动算。**之前默认 4 是错的**——5 分类的叶子要存 5 个
+    # float32 概率 = 20 字节，按 4 算会把体积低估 4 倍多，而那个数是拿来做决策的
+    n_cls = len(getattr(model, "classes_", []) or [])
+    if not args.leaf_bytes:
+        args.leaf_bytes = max(n_cls, 1) * 4
+        print(f"叶子按 {n_cls} 个类别 × float32 = {args.leaf_bytes} B 算"
+              f"（--leaf-bytes 可覆盖）")
 
     stats = [tree_stats(e) for e in ests]
     n_trees = len(stats)
