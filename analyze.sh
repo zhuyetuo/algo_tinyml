@@ -56,7 +56,7 @@ hr "4. 两个零 flash 成本的旋钮"
 python python/tune_operating_point.py --model "$MODEL" \
     --features "$FEATS" --labels "$LABELS" \
     --classes "$CLASSES" --focus "$FOCUS" \
-    --rounds 50,100,200 --min-windows 3,5,8,12 --bias -1.5,-1,-0.5,0,0.5
+    --rounds 50,100,200 --min-windows 3,5,8,12 --bias=-1.5,-1,-0.5,0,0.5
 
 hr "5. 树用到了哪些特征"
 python python/feature_usage.py --model "$MODEL" --channels 8 2>/dev/null \
@@ -80,7 +80,7 @@ if [ -f "$RF_FULL" ]; then
     hr "9. RF：两个零成本旋钮（偏置范围按概率给，比 GBDT 小两个数量级）"
     python python/tune_operating_point.py --model "$RF_FULL" \
         --features "$FEATS" --labels "$LABELS" --classes "$CLASSES" --focus "$FOCUS" \
-        --min-windows 3,5,8,12 --bias -0.3,-0.2,-0.1,0,0.1
+        --min-windows 3,5,8,12 --bias=-0.3,-0.2,-0.1,0,0.1
 
     hr "10. RF：树用了哪些特征"
     python python/feature_usage.py --model "$RF_FULL" --channels 8

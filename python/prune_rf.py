@@ -111,6 +111,12 @@ def main():
     ap.add_argument("--labels", help="[N] 留出集标签 .npy")
     ap.add_argument("--budget", type=int, default=128 * 1024, help="留给模型的 flash 字节")
     ap.add_argument("--depths", default="", help="要扫的深度，逗号分隔；默认自动")
+    ap.add_argument("--trees", default="",
+                    help="另外扫一遍棵数（比如 20,50,100）。**RF 减树是合法的**——"
+                         "树是 bagging 出来的、独立同分布，取前 n 棵在统计上没区别。"
+                         "GBDT 不行，那边树是顺序的。")
+    ap.add_argument("--depth-with-trees", type=int, default=0,
+                    help="扫棵数时固定用这个 max_depth（配合 --trees）")
     ap.add_argument("--min-samples-leaf", default="",
                     help="另外扫一遍 min_samples_leaf，逗号分隔（比如 1,5,10,20）")
     args = ap.parse_args()
@@ -161,6 +167,14 @@ def main():
     print("\n按深度剪：")
     for d in depths:
         report(f"max_depth={d}", from_sklearn(model, max_depth=d))
+
+    trees = [int(v) for v in args.trees.split(",") if v]
+    if trees:
+        d = args.depth_with_trees or None
+        tag_d = f"、深度限到 {d}" if d else "、不限深"
+        print(f"\n按棵数剪{tag_d}（RF 的树独立同分布，取前 n 棵是合法的）：")
+        for n in trees:
+            report(f"{n} 棵", from_sklearn(model, max_depth=d, n_trees=n))
 
     msl = [int(v) for v in args.min_samples_leaf.split(",") if v]
     if msl:

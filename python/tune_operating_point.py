@@ -60,8 +60,12 @@ def main():
     ap.add_argument("--focus", required=True)
     ap.add_argument("--rounds", default="50,100,200")
     ap.add_argument("--min-windows", default="3,5,8,12")
+    # 注意这个值几乎总是以 `-` 开头，argparse 会把它当成另一个选项。
+    # 命令行里必须写成 `--bias=-1.5,...`（等号不能少）——踩过一次，
+    # 所以这里在报错信息里直接说清楚
     ap.add_argument("--bias", default="-1.5,-1,-0.5,0,0.5",
-                    help="给目标类别 margin 加的常数。负数=更保守（少报）")
+                    help="给目标类别的分数加的常数，逗号分隔。负数=更保守（少报）。"
+                         "**值以 - 开头时必须写成 --bias=-1,-0.5,0 的形式**")
     ap.add_argument("--max-gap", type=int, default=2)
     ap.add_argument("--top", type=int, default=12)
     args = ap.parse_args()

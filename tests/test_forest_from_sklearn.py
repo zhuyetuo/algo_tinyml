@@ -250,3 +250,34 @@ def test_分组的边界跟实际拼接顺序一致():
     assert np.array_equal(f_base[a:b], f_mod[a:b]), "改了 gyr_x，acc 模长不该变"
     a, b = groups["gyro 模长 时域"]
     assert not np.array_equal(f_base[a:b], f_mod[a:b]), "改了 gyr_x，gyro 模长该变"
+
+
+def test_只取前_n_棵树():
+    """RF 的树是 bagging 出来的、独立同分布，取前 n 棵在统计上没区别——
+    所以「减树」是 RF 特有的、合法的杠杆。
+
+    **GBDT 完全不同**：那边树是顺序的，第 k 棵拟合前 k-1 棵的残差，只能从头
+    截断不能挑。两者混了的话，GBDT 挑几棵出来的模型是废的，而它照样给得出结果。
+    """
+    m = SimpleNamespace(estimators_=[_depth3(), _stump(), _depth3()], n_features_in_=3)
+    assert from_sklearn(m).n_trees == 3
+    assert from_sklearn(m, n_trees=2).n_trees == 2
+    assert from_sklearn(m, n_trees=1).n_trees == 1
+    with pytest.raises(ValueError, match="超出范围"):
+        from_sklearn(m, n_trees=4)
+    with pytest.raises(ValueError, match="超出范围"):
+        from_sklearn(m, n_trees=0)
+
+
+def test_减树和限深可以叠加():
+    m = SimpleNamespace(estimators_=[_depth3(), _depth3()], n_features_in_=3)
+    f = from_sklearn(m, n_trees=1, max_depth=1)
+    assert f.n_trees == 1 and len(f.node_feature) == 3
+
+
+def test_classes_是_numpy_数组时不崩():
+    """sklearn 的 classes_ 是 ndarray。写成 `a or b` 会抛 truth value ambiguous——
+    这种写法对 list 能跑，恰恰最容易漏。"""
+    m = SimpleNamespace(estimators_=[_stump()], n_features_in_=3,
+                        classes_=np.array(["a", "b", "c"]))
+    assert len(from_sklearn(m).class_names) == 3
