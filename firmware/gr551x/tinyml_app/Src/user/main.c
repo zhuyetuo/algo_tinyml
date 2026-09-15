@@ -16,6 +16,7 @@
 #include "scatter_common.h"
 #include "user_periph_setup.h"
 
+#include "tinyml_bench.h"
 #include "tinyml_selftest.h"
 #include "tinyml_task.h"
 
@@ -32,6 +33,48 @@ static const tm_task_cfg_t s_task_cfg = {
     .max_gap_windows = 2,
 };
 
+/* 上电就把真实耗时打出来。**这个数不能估**——它直接决定占空比和功耗，
+ * 而 PC 上量的 286 µs/窗口对 64MHz 的 M4F 没有参考价值（指令集不同、
+ * 频率差 50 倍）。让板子自己数，插上就知道。
+ *
+ * 放在自检**之后**：自检没过的话算出来的东西本来就不可信，测它的速度没有意义。 */
+static void tinyml_report_speed(void)
+{
+    tm_bench_report_t b;
+
+    if (tm_bench_run(&b) != 0) {
+        APP_LOG_WARNING("测速跳过：DWT 周期计数器没走（没接调试时钟？）。"
+                        "别把耗时当成 0——是没测到，不是很快。");
+        return;
+    }
+
+    APP_LOG_INFO("── 推理耗时（实测，主频 %u Hz）──", (unsigned)b.cpu_hz);
+    if (b.cnn_first) {
+        APP_LOG_INFO("  CNN   首次 %u 周期 = %u us（占空比 %u/1000，按每秒一窗）",
+                     (unsigned)b.cnn_first,
+                     (unsigned)tm_bench_report_us(b.cnn_first, &b),
+                     (unsigned)tm_bench_duty_permille(b.cnn_first, &b, 1000));
+        APP_LOG_INFO("  CNN   均值 %u 周期 = %u us",
+                     (unsigned)b.cnn_mean,
+                     (unsigned)tm_bench_report_us(b.cnn_mean, &b));
+    }
+    if (b.feat_first || b.rf_first) {
+        /* 特征和森林分开报：RF 这条路上特征提取往往比模型本身还贵，
+         * 合在一起的话"该优化哪一半"就没法回答 */
+        APP_LOG_INFO("  特征  首次 %u 周期 = %u us",
+                     (unsigned)b.feat_first,
+                     (unsigned)tm_bench_report_us(b.feat_first, &b));
+        APP_LOG_INFO("  森林  首次 %u 周期 = %u us",
+                     (unsigned)b.rf_first,
+                     (unsigned)tm_bench_report_us(b.rf_first, &b));
+        APP_LOG_INFO("  RF合计 %u us（占空比 %u/1000，按每秒一窗）",
+                     (unsigned)tm_bench_report_us(b.feat_first + b.rf_first, &b),
+                     (unsigned)tm_bench_duty_permille(b.feat_first + b.rf_first,
+                                                      &b, 1000));
+    }
+}
+
+
 static void tinyml_boot_check(void)
 {
     tm_selftest_report_t rep;
@@ -39,6 +82,7 @@ static void tinyml_boot_check(void)
     if (tm_selftest_run(&rep) == 0) {
         s_inference_trusted = true;
         APP_LOG_INFO("tinyml 自检通过：%d 条 golden vector 逐位一致", rep.n_checked);
+        tinyml_report_speed();
         tm_task_init(&s_task, &s_task_cfg);
         return;
     }

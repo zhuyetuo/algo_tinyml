@@ -43,7 +43,9 @@ PRJ_C_SRC_FILES := \
     $(TINYML_ROOT)/tm_forest.c \
     $(TINYML_ROOT)/tm_features.c \
     ../Src/user/tinyml_task.c \
-    ../Src/user/tinyml_selftest.c
+    ../Src/user/tinyml_selftest.c \
+    ../Src/user/tinyml_bench.c \
+    $(TINYML_ROOT)/tm_bench.c
 
 # 导出的模型和常量表。走 wildcard 是因为两条路线（CNN / RF）导出的文件名不同，
 # 只带其中一条的时候不该因为另一条的文件不存在而编不过
