@@ -58,11 +58,34 @@ class Forest:
         return int(np.argmax(self.predict_proba(x)))
 
 
-def from_sklearn(model, class_names=None) -> Forest:
-    """从 sklearn 的 RandomForestClassifier 抽出来。
+def _leaf_proba(t, i):
+    """节点 i 的类别分布，归一成概率。
 
-    只读 tree_ 的那几个扁平数组，不依赖 sklearn 的对象结构——这样换 sklearn 版本
-    也不容易崩（tree_ 的这几个字段十来年没变过）。
+    sklearn 1.3 之后 tree_.value 对分类器存的是**比例**不是样本数（以前是样本数）。
+    除以自己的和之后两种情况结果一样，所以这里不去判版本——判版本的代码迟早
+    会在某个没见过的版本上悄悄给错数。
+    """
+    v = np.asarray(t.value[i], np.float64).reshape(-1)
+    ssum = v.sum()
+    # 全零在正常训练里不会出现，但 sample_weight 全零之类的边角会。给均匀分布，
+    # 别让 0/0 = nan 一路传到 argmax（nan 比较永远是 False，argmax 会返回 0，
+    # 于是"这棵树坏了"表现成"它总投第一类"）
+    return (v / ssum if ssum > 0 else np.full_like(v, 1.0 / len(v))).astype(np.float32)
+
+
+def from_sklearn(model, class_names=None, max_depth=None, min_samples_leaf=None) -> Forest:
+    """从 sklearn 的 RandomForestClassifier 抽出来，可选**就地截断**。
+
+    max_depth / min_samples_leaf 不是重训，是**把已经训好的树在某个深度剪掉**：
+    该节点直接变成叶子，类别分布用 sklearn 在那个节点上已经存好的 value。
+    这在数学上等价于"训练时就设了这个 max_depth"吗？**不等价**——训练时限深的话，
+    分裂点的选择会不同。但它有一个大得多的好处：**不用重训就能拿到
+    「深度 → 体积 → 准确率」这条曲线**，而重训一轮要等很久。先用它定个范围，
+    真正上线前再按定下来的参数重训一次。
+
+    只读 tree_ 的那几个扁平数组，不依赖 sklearn 的对象结构——那几个字段
+    （children_left/right、feature、threshold、value、weighted_n_node_samples）
+    十来年没变过。
     """
     ests = getattr(model, "estimators_", None)
     if ests is None:
@@ -71,30 +94,53 @@ def from_sklearn(model, class_names=None) -> Forest:
     offsets = [0]
     feat, thr, left, right = [], [], [], []
     leaves = []
+
     for est in ests:
         t = est.tree_
-        base = offsets[-1]
         cl = np.asarray(t.children_left, np.int64)
         cr = np.asarray(t.children_right, np.int64)
-        for i in range(int(t.node_count)):
-            if cl[i] == -1:
-                v = np.asarray(t.value[i], np.float64).reshape(-1)
-                s = v.sum()
-                # 叶子上存的是各类样本数，要归一成概率。全零在正常训练里不会出现，
-                # 但 sample_weight 全零之类的边角情况会——那时候给均匀分布，
-                # 而不是让它变成 nan 一路传到 argmax
-                p = (v / s) if s > 0 else np.full_like(v, 1.0 / len(v))
+        n_samples = np.asarray(getattr(t, "weighted_n_node_samples",
+                                       np.full(t.node_count, np.inf)), np.float64)
+
+        def emit(src, depth):
+            """先序发出子树，返回它在扁平数组里的下标。
+
+            孩子的下标要等孩子发完才知道，所以先占位再回填——递归里直接写
+            base + children_left[i] 那种写法只在"不截断"时成立，一截断就全错位了。
+            """
+            idx = len(feat)
+            # min_samples_leaf 照抄 sklearn 的含义：**两个孩子都**至少有这么多样本，
+            # 这个分裂才保留。看本节点自己的样本数是错的——那样参数名就在骗人，
+            # 剪出来的树跟"训练时设同一个值"完全不是一回事。
+            split_too_small = (
+                min_samples_leaf is not None and cl[src] != -1
+                and (n_samples[cl[src]] < min_samples_leaf
+                     or n_samples[cr[src]] < min_samples_leaf)
+            )
+            is_leaf = (
+                cl[src] == -1
+                or (max_depth is not None and depth >= max_depth)
+                or split_too_small
+            )
+            if is_leaf:
                 feat.append(len(leaves))
-                leaves.append(p.astype(np.float32))
+                leaves.append(_leaf_proba(t, src))
                 thr.append(np.float32(0.0))
                 left.append(-1)
                 right.append(-1)
-            else:
-                feat.append(int(t.feature[i]))
-                thr.append(np.float32(t.threshold[i]))
-                left.append(base + int(cl[i]))
-                right.append(base + int(cr[i]))
-        offsets.append(base + int(t.node_count))
+                return idx
+            feat.append(int(t.feature[src]))
+            thr.append(np.float32(t.threshold[src]))
+            left.append(-1)
+            right.append(-1)
+            li = emit(int(cl[src]), depth + 1)
+            ri = emit(int(cr[src]), depth + 1)
+            left[idx] = li
+            right[idx] = ri
+            return idx
+
+        emit(0, 0)
+        offsets.append(len(feat))
 
     return Forest(
         n_features=int(getattr(model, "n_features_in_", 0)),

@@ -265,6 +265,11 @@ python python/verify_against_scipy.py --windows windows.npy --model xxx.pkl --hz
 判别翻没翻才重要。脚本还会看翻掉的样本原本置信度多高：翻的都是低置信度样本
 就是边界抖动，有高置信度样本被翻那是 bug。
 
+**RF 的体积怎么估、要不要量化剪枝**：见 [docs/rf_size.md](docs/rf_size.md)。
+一句话——**约 20 B/节点，每加一层深度翻倍；剪枝是前提，量化基本不用做**
+（超了 100 倍的时候，量化省的那 20% 没有意义）。`python/prune_rf.py` 能
+**不重训**就给出「深度 → 体积 → macro-F1」整张表。
+
 怎么选，等体积数出来：
 
 ```bash
