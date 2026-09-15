@@ -335,8 +335,8 @@ def main():
     print(f"\nNAS 根：{Handler.nas_root}")
     print(f"默认模型：{Handler.default_tag}")
     print("\n开着了，Ctrl-C 停：")
-    for u in serve.urls(args.host, port):
-        print(f"  {u}api/v1/label/infer")
+    for u in serve.urls(args.host, port, "api/v1/label/infer"):
+        print(f"  {u}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

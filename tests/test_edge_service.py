@@ -734,3 +734,70 @@ def test_compact_probabilities_sum_to_one(rfc_runner):
     X = np.random.default_rng(17).normal(0, 1, (10, N_T, N_CH)).astype(np.float32)
     p = m.predict_proba(X)
     assert np.allclose(p.sum(axis=1), 1.0, atol=1e-5)
+
+
+def test_compact_pipeline_golden_covers_feature_order(tmp_path):
+    """整条链的 golden：窗口 → 特征 → 森林，**整数票数**。
+
+    比只验森林多覆盖一样东西：**特征的排列顺序**。那一维错位不会崩、
+    不会报错，只会让每个阈值都对到别的特征上，而模型照样给得出结果——
+    这是 RF 这条路上唯一没被别的自检覆盖的接缝。
+    """
+    import serve
+    from tinyml.export_forest_compact_c import pipeline_golden
+
+    d = tmp_path / "pg"
+    d.mkdir()
+    cf = _rf_export_compact(d)
+    W = np.random.default_rng(23).normal(0, 1, (6, N_T, N_CH)).astype(np.float32)
+    (d / "tm_forest_c_pipeline_golden.h").write_text(
+        pipeline_golden(cf, W, float(HZ), N_T), encoding="utf-8")
+
+    eng = serve.RfEngine(serve.build_rf(str(d), out_so=str(d / "pg.so")))
+    pipe = [r for r in eng.selftest() if "整条链" in r[0]][0]
+    assert pipe[1] == 6, f"应该有 6 条 golden，实际 {pipe[1]}"
+    assert pipe[2] == 0, f"{pipe[2]} 个票数对不上——多半是特征顺序或窗口尺寸错了"
+
+
+def test_pipeline_golden_refuses_wrong_feature_dim(tmp_path):
+    """窗口的通道数/长度跟森林训练时不一致，必须**在生成 golden 时就炸**。
+
+    不拦的话会生成一份"自洽但错误"的 golden：板上跑出来跟它一致，
+    于是自检通过，而整条链算的是另一套特征。
+    """
+    from tinyml.export_forest_compact_c import pipeline_golden
+    d = tmp_path / "bad"
+    d.mkdir()
+    cf = _rf_export_compact(d)
+    W = np.zeros((2, N_T, 6), np.float32)       # 6 通道，森林是 8 通道训的
+    with pytest.raises(ValueError, match="维特征"):
+        pipeline_golden(cf, W, float(HZ), N_T)
+
+
+def test_pipeline_selftest_actually_compares(tmp_path):
+    """把 golden 里的票数改一个，整条链自检必须红。
+
+    **这一条是补一个真实的漏**：上面那条只断言"没有不一致"，
+    而一个根本不做比较的实现也满足它——变异测试里把 C 侧的比较整段删掉，
+    测试照样绿。要证明它真的在比，只能改数据看它红。
+    """
+    import re
+
+    import serve
+    from tinyml.export_forest_compact_c import pipeline_golden
+
+    d = tmp_path / "tamperp"
+    d.mkdir()
+    cf = _rf_export_compact(d)
+    W = np.random.default_rng(29).normal(0, 1, (4, N_T, N_CH)).astype(np.float32)
+    g = pipeline_golden(cf, W, float(HZ), N_T)
+
+    # 改第一个票数。加 1 就够——整数比较没有容差这回事
+    m = re.search(r"(_pipeline_votes\[\] = \{)(-?\d+)", g)
+    assert m, "没找到票数数组"
+    g = g[:m.start(2)] + str(int(m.group(2)) + 1) + g[m.end(2):]
+    (d / "tm_forest_c_pipeline_golden.h").write_text(g, encoding="utf-8")
+
+    eng = serve.RfEngine(serve.build_rf(str(d), out_so=str(d / "tp.so")))
+    pipe = [r for r in eng.selftest() if "整条链" in r[0]][0]
+    assert pipe[2] > 0, "改了 golden 自检却没红——那它根本没在比"

@@ -21,6 +21,10 @@
 #include "tm_forest_c_golden.h"
 #define TM_HAS_FC_GOLDEN 1
 #endif
+#if __has_include("tm_forest_c_pipeline_golden.h")
+#include "tm_forest_c_pipeline_golden.h"
+#define TM_HAS_FCP_GOLDEN 1
+#endif
 #endif
 
 int thr_n_ch(void)       { return tm_feat_cfg.n_ch; }
@@ -114,7 +118,47 @@ int thr_golden_n(void)
 #endif
 }
 
-/* 紧凑版暂时没有"整条链"的 golden（从窗口进那份）。
- * 返回 -2 而不是 0，**"没有"不能当成"通过"**。 */
-int thr_selftest_pipeline(void) { return -2; }
-int thr_pipeline_golden_n(void) { return 0; }
+/* 整条链：原始窗口 → 特征 → 森林。
+ *
+ * 比只验森林多覆盖**特征的排列顺序**——那一维错位不会崩、不会报错，
+ * 只会让每个阈值都对到别的特征上，而模型照样给得出结果。
+ * 这是 RF 这条路上唯一没被别的自检覆盖的接缝。
+ *
+ * 票数是整数，所以对不上**一定是特征那一段错了**（顺序/窗口长度/通道数），
+ * 不可能是森林的数值误差。 */
+int thr_selftest_pipeline(void)
+{
+#if defined(TM_HAS_FCP_GOLDEN)
+    static float feat[TM_FEAT_DIM];
+    static int32_t votes[TM_FC_N_CLASSES];
+    int bad = 0;
+    for (int i = 0; i < TM_FCP_GOLDEN_N; i++) {
+        const float *x = tm_forest_c_pipeline_in
+                         + (size_t)i * TM_FCP_N_CH * TM_FCP_N_T;
+        const int32_t *want = tm_forest_c_pipeline_votes
+                              + (size_t)i * TM_FC_N_CLASSES;
+        if (tm_features(&tm_feat_cfg, x, feat) != 0) {
+            return -1;
+        }
+        (void)tm_forest_c_predict(&tm_forest_c, feat, votes);
+        for (int c = 0; c < TM_FC_N_CLASSES; c++) {
+            if (votes[c] != want[c]) {
+                bad++;
+            }
+        }
+    }
+    return bad;
+#else
+    /* **"没有"不能当成"通过"** —— 报 -2，调用方会明说验不了 */
+    return -2;
+#endif
+}
+
+int thr_pipeline_golden_n(void)
+{
+#if defined(TM_HAS_FCP_GOLDEN)
+    return TM_FCP_GOLDEN_N;
+#else
+    return 0;
+#endif
+}

@@ -63,6 +63,12 @@ def main():
     ap.add_argument("--channels", type=int, default=8, help="6=acc+gyr，8=再加 pitch/roll")
     ap.add_argument("--nperseg", type=int, default=32)
     ap.add_argument("--hz", type=float, default=16.0)
+    ap.add_argument("--windows", default="",
+                    help="[N, T, C] 的**原始窗口** .npy，用来生成"
+                         "「整条链」的 golden（窗口 → 特征 → 森林）。"
+                         "比只验森林多覆盖**特征的排列顺序**——那一维错位不会崩、"
+                         "不会报错，只会让每个阈值都对到别的特征上。"
+                         "用 dump_holdout.py --raw 导")
     ap.add_argument("--compact", action="store_true",
                     help="导紧凑编码（7 B/节点 + uint8 叶子）而不是原来的 SoA。"
                          "**体积差两倍多**，128KB 预算下基本只能用这个。"
@@ -118,6 +124,30 @@ def main():
     if args.compact:
         cf = CompactForest(forest)
         files = dict(export_compact(cf, golden_x=golden))
+        if args.windows:
+            from tinyml.export_forest_compact_c import pipeline_golden
+            wp = os.path.expanduser(args.windows)
+            if not os.path.exists(wp):
+                sys.exit(f"--windows 找不到：{wp}\n"
+                         "  用 dump_holdout.py --raw 导一份原始窗口。")
+            W = np.load(wp)
+            # dump_holdout --raw 存的是 [N, C, T]（channel-first），
+            # 而 extract_one 吃 [T, C]。**转置一次**——不转的话
+            # 通道数和窗口点数互换，算出来的维度对不上，当场就会炸；
+            # 但如果两者恰好相等，就会安静地算出一堆错的特征
+            if W.ndim != 3:
+                sys.exit(f"--windows 要 [N, C, T] 三维，给的是 {W.shape}")
+            if W.shape[1] == W.shape[2]:
+                sys.exit(f"窗口 {W.shape} 的通道数和点数相等，分不出哪维是哪维。"
+                         "手工转置好再传。")
+            W = W.transpose(0, 2, 1) if W.shape[1] == args.channels else W
+            n_pick = min(16, len(W))
+            files[f"tm_forest_c_pipeline_golden.h"] = pipeline_golden(
+                cf, W[:n_pick], args.hz, args.nperseg)
+            print(f"整条链 golden {n_pick} 条（窗口 → 特征 → 森林，整数票数）")
+        else:
+            print("没给 --windows，**整条链的 golden 没有**——"
+                  "特征排列顺序那一段验不了。用 dump_holdout.py --raw 导一份再传。")
         sz = cf.flash_bytes()
         total = sum(sz.values())
         print(f"\n紧凑编码（7 B/节点 + uint8 叶子）：")
