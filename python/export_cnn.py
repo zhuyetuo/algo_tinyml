@@ -23,7 +23,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from tinyml import export, forward_int, quantize  # noqa: E402
+from tinyml import export, forward_int, forward_int_batch, quantize  # noqa: E402
+from tinyml.progress import bar, chunks  # noqa: E402
 from tinyml.export_c import _arena_bytes  # noqa: E402
 from tinyml.torch_import import load_cnn, normalize  # noqa: E402
 
@@ -89,9 +90,18 @@ def main():
     qnet = quantize(net, calib, class_names=classes)
 
     # ── 实测：float vs int8，在**整个留出集**上 ──────────────────────────
-    f_pred = np.array([int(np.argmax(net.forward(x))) for x in Xn])
-    q_pred = np.array([int(np.argmax(forward_int(qnet, qnet.quantize_input(x))[0]))
-                       for x in Xn])
+    # 分段跑而不是一个大矩阵乘：一次算完两万多条的话进度条不会动，
+    # 而且中间张量会很大（256 通道 × 8 点 × N）。段大小按经验取，不是调出来的。
+    f_pred = np.empty(len(Xn), np.int64)
+    q_pred = np.empty(len(Xn), np.int64)
+    CH = 512
+    with bar((len(Xn) + CH - 1) // CH, "评估留出集") as pb:
+        for s, e in chunks(len(Xn), CH):
+            blk = Xn[s:e]
+            f_pred[s:e] = [int(np.argmax(net.forward(x))) for x in blk]
+            xq = np.stack([qnet.quantize_input(x) for x in blk])
+            q_pred[s:e] = np.argmax(forward_int_batch(qnet, xq), axis=1)
+            pb.update()
     n_cls = len(classes)
     f_macro, f_per = macro_f1(y, f_pred, n_cls)
     q_macro, q_per = macro_f1(y, q_pred, n_cls)
@@ -102,7 +112,8 @@ def main():
     print(f"{'macro':<10}{f_macro:>10.4f}{q_macro:>10.4f}{q_macro - f_macro:>+9.4f}")
     print(f"\nfloat 与 int8 判别一致率 {float(np.mean(f_pred == q_pred)):.4f}")
 
-    sat = float(np.mean([np.mean(np.abs(qnet.quantize_input(x)) >= 127) for x in Xn]))
+    sat = float(np.mean([np.mean(np.abs(qnet.quantize_input(x)) >= 127)
+                         for x in Xn[::max(1, len(Xn) // 2000)]]))
     print(f"输入饱和比例 {sat:.4f}"
           + ("   ← 偏高，校准集可能没覆盖到剧烈动作" if sat > 0.02 else ""))
 
