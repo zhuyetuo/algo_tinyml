@@ -60,3 +60,25 @@ def test_波浪号会展开(name, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / "m.pkl").write_bytes(b"x")
     assert mod.resolve_model("~/m.pkl") == str(tmp_path / "m.pkl")
+
+
+def test_prune_gbdt_也有路径检查():
+    mod = _load("prune_gbdt")
+    with pytest.raises(SystemExit) as e:
+        mod.resolve_model("results/nope/x.pkl")
+    assert os.path.abspath("results/nope/x.pkl") in str(e.value)
+
+
+def test_prf_和_macro_f1_算得对():
+    """指标算错的话整张剪枝表就是错的，而它看起来完全正常。"""
+    mod = _load("prune_gbdt")
+    import numpy as np
+    y = np.array([0, 0, 1, 1, 2])
+    p = np.array([0, 1, 1, 1, 0])
+    # 类别 1：tp=2（下标2,3），fp=1（下标1），fn=0 → P=2/3, R=1.0
+    pr, rc, f1 = mod.prf(y, p, 1)
+    assert pr == pytest.approx(2 / 3) and rc == pytest.approx(1.0)
+    assert f1 == pytest.approx(2 * (2 / 3) / (2 / 3 + 1))
+    # 类别 2 一个都没预测对 → F1=0，不该是 nan
+    assert mod.prf(y, p, 2)[2] == 0.0
+    assert not np.isnan(mod.macro_f1(y, p, 3))
