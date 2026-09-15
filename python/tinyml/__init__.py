@@ -16,3 +16,5 @@ from .features import extract_one, n_features  # noqa: F401
 from .export_features_c import export as export_feat_cfg  # noqa: F401
 from .gbdt import Booster, from_xgboost, from_xgboost_dumps  # noqa: F401
 from .export_gbdt_c import export as export_gbdt  # noqa: F401
+from .gbdt_compact import CompactBooster  # noqa: F401
+from .export_gbdt_compact_c import export as export_gbdt_compact  # noqa: F401

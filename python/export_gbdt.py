@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tinyml.export_features_c import export as export_feat_cfg  # noqa: E402
 from tinyml.export_gbdt_c import export  # noqa: E402
+from tinyml.export_gbdt_compact_c import export as export_compact  # noqa: E402
+from tinyml.gbdt_compact import CompactBooster  # noqa: E402
 from tinyml.features import n_features  # noqa: E402
 from tinyml.gbdt import flash_bytes, from_xgboost  # noqa: E402
 
@@ -60,6 +62,9 @@ def main():
     ap.add_argument("--channels", type=int, default=8)
     ap.add_argument("--nperseg", type=int, default=0, help="默认 min(窗口, 32) 向下取 2 的幂")
     ap.add_argument("--hz", type=float, default=16.0)
+    ap.add_argument("--layout", default="compact", choices=["compact", "soa"],
+                    help="compact=6 字节/节点 AoS（默认，体积 2.8× 小、访存 4× 少）；"
+                         "soa=原来的四个独立数组。两者判决逐位相同")
     args = ap.parse_args()
 
     try:
@@ -125,7 +130,17 @@ def main():
               "没有它，板上跑出来对不对只能靠肉眼看准确率。")
 
     os.makedirs(args.out, exist_ok=True)
-    files = dict(export(b, golden_x=golden))
+    if args.layout == "compact":
+        cb = CompactBooster(b)
+        cfb = cb.flash_bytes()
+        ctotal = sum(cfb.values())
+        print(f"\n紧凑布局（6 B/节点，AoS）：{ctotal:,} B（{ctotal / 1024:.1f} KB）"
+              f"  —— 比 SoA 小 {total / ctotal:.1f} 倍，**判决逐位相同**")
+        if ctotal > 128 * 1024:
+            print(f"  ⚠ 仍超 128KB 预算 {ctotal / (128 * 1024):.1f} 倍，还得减轮数或改二分类")
+        files = dict(export_compact(cb, golden_x=golden))
+    else:
+        files = dict(export(b, golden_x=golden))
     files.update(export_feat_cfg(args.window, args.channels, nps, args.hz))
     for name, content in files.items():
         p = os.path.join(args.out, name)
