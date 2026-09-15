@@ -83,3 +83,43 @@ def test_打乱过的数据会被拒绝():
 def test_一条目标类别都没有时明确报错():
     _, err = ev.check_ordered(np.zeros(10, int), 2)
     assert err and "一条" in err
+
+
+def test_类别偏置只挪工作点_不改模型():
+    """给某个类别的 margin 加常数，等价于把判决门槛挪一挪。
+    板上就是一次加法（或折进 base_score），**零 flash 成本**。
+
+    这里钉住两条性质：①偏置足够负时该类别一条都不报；②足够正时全报。
+    中间是单调的——单调性是"这个旋钮可调"的前提，不单调的话调参就没意义了。
+    """
+    import numpy as np
+    rng = np.random.default_rng(0)
+    M = rng.normal(0, 1, size=(500, 5)).astype(np.float32)
+    fi = 2
+    counts = []
+    for bias in (-10.0, -1.0, 0.0, 1.0, 10.0):
+        adj = M.copy()
+        adj[:, fi] += np.float32(bias)
+        counts.append(int((adj.argmax(axis=1) == fi).sum()))
+    assert counts[0] == 0, "偏置 -10 还有报的"
+    assert counts[-1] == len(M), "偏置 +10 还没全报"
+    assert counts == sorted(counts), f"命中数随偏置不单调：{counts}"
+
+
+def test_min_windows_调大只会让事件变少():
+    """min_windows 是 precision/recall 之间的旋钮。调大只能让事件更少——
+    不单调的话这个旋钮就没法用了。"""
+    import numpy as np
+    rng = np.random.default_rng(3)
+    hits = rng.random(2000) < 0.25
+    counts = [len(ev.to_events(hits, mw, 2)) for mw in (1, 2, 3, 5, 8, 12)]
+    assert counts == sorted(counts, reverse=True), counts
+
+
+def test_min_windows_变了真值事件数也会变():
+    """容易踩的坑：调 min_windows 的时候，**真值那一侧也要用同一个参数**重新聚合。
+    只改预测侧的话，比较的就是两套不同定义下的事件，P/R 全是错的。"""
+    import numpy as np
+    y = np.array([0] * 10 + [2] * 4 + [0] * 10 + [2] * 15 + [0] * 5)
+    assert len(ev.to_events(y == 2, 3, 2)) == 2
+    assert len(ev.to_events(y == 2, 8, 2)) == 1, "min_windows 调大后短的真事件应该消失"
