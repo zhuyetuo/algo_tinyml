@@ -62,6 +62,20 @@
         "models/acc_only_rf/ml_rf.json",
         "~/imu_train/results_acc_only/*_acc_only/16hz_remap_custom_3class/rf/ml_rf.json"
       ]
+    },
+    {
+      "tag": "acc3_rf",
+      "kind": "sk",
+      "optional": true,
+      "_说明": "只有加速计的版本：acc 三轴 + 由它派生的 pitch/roll，5 通道 113 维。推理链照常算 193 维，按 ml_rf.json 里的 feature_select 取 113 列。训法见 imu_train/acc3/README.md。",
+      "gen": [
+        "models/acc3_rf/ml_rf.pkl",
+        "~/imu_train/results_acc3/*_acc3/16hz_remap_custom_3class/rf/ml_rf.pkl"
+      ],
+      "meta": [
+        "models/acc3_rf/ml_rf.json",
+        "~/imu_train/results_acc3/*_acc3/16hz_remap_custom_3class/rf/ml_rf.json"
+      ]
     }
   ]
 }
