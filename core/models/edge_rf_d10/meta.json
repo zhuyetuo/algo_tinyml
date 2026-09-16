@@ -1,0 +1,46 @@
+{
+  "hz": 16,
+  "model": "rf",
+  "accuracy": 0.8830128205128205,
+  "macro_f1": 0.8149937781067124,
+  "classes": [
+    "\u6d3b\u52a8",
+    "\u7761\u89c9",
+    "\u6293\u6320",
+    "\u672a\u4f69\u6234",
+    "\u7529\u8eab\u4f53"
+  ],
+  "gravity_aligned": true,
+  "window_size": 16,
+  "stride": 8,
+  "window_s": 1.0,
+  "stride_s": 0.5,
+  "label_mode": "majority",
+  "per_class": {
+    "\u6d3b\u52a8": {
+      "precision": 0.7987,
+      "recall": 0.8659,
+      "f1-score": 0.8309
+    },
+    "\u7761\u89c9": {
+      "precision": 0.9633,
+      "recall": 0.8319,
+      "f1-score": 0.8928
+    },
+    "\u6293\u6320": {
+      "precision": 0.8579,
+      "recall": 0.5902,
+      "f1-score": 0.6993
+    },
+    "\u672a\u4f69\u6234": {
+      "precision": 0.8106,
+      "recall": 0.9689,
+      "f1-score": 0.8827
+    },
+    "\u7529\u8eab\u4f53": {
+      "precision": 0.75,
+      "recall": 0.7895,
+      "f1-score": 0.7692
+    }
+  }
+}
