@@ -1264,3 +1264,186 @@ def test_postprocess_is_loaded_once_not_every_call():
     a = edge_service.load_postprocess()
     b = edge_service.load_postprocess()
     assert a[0] is b[0] and a[1] is b[1]
+
+
+# ── board 模式：用板上那份后处理跑整条链 ──────────────────────────────────
+
+
+def test_board_mode_matches_the_service_side_postprocess(runner, tmp_path):
+    """`board` 和 `viterbi` 走的是**两份不同实现**的同一套规则，结果要一致。
+
+    服务端那份是离线 viterbi（整条序列 DP + 回溯），板上那份是流式、
+    有界回溯。我在合成数据上量过 18 万窗口 100% 一致；这一条把它放到
+    **真正的服务调用路径**上再验一遍——从 CSV 进、经过真实的预处理和推理，
+    而不是直接喂概率数组。
+
+    这条要是分家了，"web 上验证的就是板子会报的"这句话就不成立了。
+    """
+    _need_postprocess()
+    p = tmp_path / "board.csv"
+    _write_csv(str(p), n_rows=HZ * 400, seed=21)
+    kw = dict(device_hz=HZ, min_windows=1, max_gap=2, targets=CLASSES)
+
+    py = runner.infer(str(p), mode="viterbi", **kw)
+    bd = runner.infer(str(p), mode="board", **kw)
+
+    assert py["n_windows"] > 100, "窗口太少，这条测试说明不了问题"
+    assert bd["n_windows"] == py["n_windows"]
+
+    def flat(o):
+        return sorted((lab, s["start_ts"], s["end_ts"], s["n_windows"])
+                      for lab, items in o["segments"].items() for s in items)
+
+    a, b = flat(py), flat(bd)
+    assert a, "服务端那份一段都没出，这条测试在空转"
+    assert b == a, (
+        f"板上后处理跟服务端分家了\n"
+        f"  服务端 {len(a)} 段，板上 {len(b)} 段\n"
+        f"  只在服务端：{[x for x in a if x not in b][:4]}\n"
+        f"  只在板上：{[x for x in b if x not in a][:4]}")
+
+
+def test_board_mode_reports_its_forced_counts(runner, tmp_path):
+    """两个"强制"计数要回给平台。
+
+    它们是有界回溯**唯一**可能跟离线结果分家的地方。只存在本机日志里的话，
+    "两边一致"这句话在平台上没有任何可核对的依据。
+    """
+    import edge_service
+    _need_postprocess()
+    h = edge_service.Handler.__new__(edge_service.Handler)
+    h.runners = {"edge_cnn_i8": runner}
+    h.default_tag = "edge_cnn_i8"
+    h.nas_root = str(tmp_path)
+    _write_csv(str(tmp_path / "b.csv"), n_rows=HZ * 200, seed=22)
+    r = h._one({"path": "b.csv", "mode": "board"})
+    assert "error" not in r, r
+    assert "board_forced" in r, "没把强制计数回给平台"
+    assert set(r["board_forced"]) == {"forced_settle", "forced_split"}
+    # 正常数据上应该都是 0；不是 0 也不算错，但要看得见
+    assert all(isinstance(v, int) for v in r["board_forced"].values())
+
+
+def test_board_is_a_real_mode_not_silently_treated_as_viterbi(runner, tmp_path):
+    """board 必须真的走 C，不能悄悄退回 Python。
+
+    退回去的话这条路就白做了——平台上标着 @board，跑的却是服务端那份，
+    而结果看起来完全正常。所以这里直接盯 C 那个入口有没有被调到。
+    """
+    import edge_service
+    import post_board
+    _need_postprocess()
+    called = {"n": 0}
+    real = post_board.stabilize
+
+    def spy(*a, **k):
+        called["n"] += 1
+        return real(*a, **k)
+
+    edge_service.post_board = None      # 确保走的是模块内的 import，不是缓存
+    post_board.stabilize = spy
+    try:
+        p = tmp_path / "c.csv"
+        _write_csv(str(p), n_rows=HZ * 100, seed=23)
+        runner.infer(str(p), device_hz=HZ, min_windows=1, max_gap=2,
+                     targets=CLASSES, mode="board")
+    finally:
+        post_board.stabilize = real
+    assert called["n"] == 1, "board 模式没走板上那份 C"
+
+
+def test_unknown_mode_still_refused(runner):
+    """加了 board 之后，别的 mode 照样要拒。"""
+    import edge_service
+    h = edge_service.Handler.__new__(edge_service.Handler)
+    h.runners = {"edge_cnn_i8": runner}
+    h.default_tag = "edge_cnn_i8"
+    h.nas_root = "/"
+    r = h._one({"path": "/x", "mode": "onboard"})
+    assert "error" in r and "onboard" in r["error"]
+
+
+def _board_windows(spec, conf=0.95):
+    """按 [(类别下标, 窗口数)] 造窗口，直接喂 post_board。
+
+    端到端那条测试用的是随机权重模型跑随机数据，**它不会产生
+    「甩身体—抓挠—甩身体」这种结构**，所以抓挠吞并那条规则根本没被走到。
+    这里手工造一段能走到的。
+    """
+    import datetime as dt
+    t0 = dt.datetime(2026, 9, 16, 10, 0, 0)
+    out, i = [], 0
+    for c, k in spec:
+        for _ in range(k):
+            p = np.full(len(CLASSES), (1.0 - conf) / (len(CLASSES) - 1))
+            p[c] = conf
+            out.append({
+                "ts": (t0 + dt.timedelta(milliseconds=i * 500)
+                       ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                "probs": {CLASSES[j]: float(p[j]) for j in range(len(CLASSES))},
+                "label": CLASSES[int(np.argmax(p))], "spec": None})
+            i += 1
+    return out
+
+
+def test_board_resolves_the_scratch_class_by_name(runner):
+    """抓挠/甩身体的类别号要**按名字查**，不能写死下标。
+
+    写死的话板上的吞并规则会作用到别的类别上——段还在、数量还对，
+    只是内容全错，不报错。
+    （变异测试：把 `classes.index(scratch)` 换成 0，端到端那条测试照样绿，
+    因为随机数据走不到这条规则。所以这里手工造一段。）
+    """
+    _, ls_post = _need_postprocess()
+    import post_board
+    # 活动20 → 甩身体2 → 抓挠6 → 甩身体2 → 活动20
+    w = _board_windows([(0, 20), (4, 2), (2, 6), (4, 2), (0, 20)])
+    p = ls_post.StableParams()
+
+    right = post_board.stabilize(w, CLASSES, CLASSES, 1.0, 0.5, p)
+    wrong = post_board.stabilize(w, CLASSES, CLASSES, 1.0, 0.5, p, scratch="活动")
+    assert right != wrong, "抓挠类别号换了结果却一样，这条测试验不到东西"
+
+    sc = right[CLASSES[2]]
+    assert len(sc) == 1, right
+    # 抓挠 6 窗 + 前后各 2 窗甩身体被吞并 = 10
+    assert sc[0]["n_windows"] == 10, \
+        f"该吞并前后的甩身体（6+2+2），实际 {sc[0]['n_windows']}"
+
+
+def test_board_matches_the_python_postprocess_on_that_shape(runner):
+    """同一段构造数据，板上那份和服务端那份要给出一样的结果。
+
+    端到端那条比的是随机数据；这一条比的是**真正会触发规则**的那种形状。
+    """
+    ls_config, ls_post = _need_postprocess()
+    import post_board
+    w = _board_windows([(0, 20), (4, 2), (2, 6), (4, 2), (0, 20)])
+    p = ls_post.StableParams()
+    a = post_board.stabilize(w, CLASSES, CLASSES, 1.0, 0.5, p)
+    b = ls_post.stabilize(w, CLASSES, CLASSES, 1.0, 0.5, "majority", p,
+                          algo="viterbi")
+
+    def flat(o):
+        return sorted((k, s["start_ts"], s["end_ts"], s["n_windows"])
+                      for k, v in o.items() for s in v)
+
+    assert flat(a), "一段都没出，这条测试在空转"
+    assert flat(a) == flat(b), f"板上 {flat(a)}\n服务端 {flat(b)}"
+
+
+def test_board_build_keeps_the_fp_flags():
+    """编 .so 时必须带 -ffp-contract=off。
+
+    允许 FMA 合并的话中间结果少一次舍入，跟板上算出来的末位就不同——
+    而那足以在阈值附近把判决翻过去，于是这条路跑出来的就不再是
+    "板子会报什么"了。
+
+    **这个在 x86 上观察不到**（这几步运算构不成 FMA 模式），所以只能
+    在源码上钉住。观察不到不等于不重要：它是给 ARM 那边的保证。
+    """
+    import post_board
+    import inspect
+    src = inspect.getsource(post_board._build)
+    assert "-ffp-contract=off" in src, "编译开关丢了，跟板上不再逐位一致"
+    assert "-fno-math-errno" in src

@@ -56,7 +56,7 @@ def lib():
            # 就不是板上会算出来的东西了。跟别的 host harness 同一套开关
            "-ffp-contract=off", "-fno-math-errno", "-fPIC", "-shared",
            f"-I{FW}", os.path.join(FW, "tm_post.c"),
-           os.path.join(HERE, "host_post.c"), "-lm", "-o", so]
+           os.path.join(HERE, "..", "service", "host_post.c"), "-lm", "-o", so]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         pytest.fail(f"编不过：\n{r.stderr}")
