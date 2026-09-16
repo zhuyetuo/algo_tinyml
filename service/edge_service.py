@@ -147,8 +147,18 @@ class EdgeRunner:
         self.kind = kind
         # 两条路线的包装不同，但对 infer_file 来说都是一个有 predict_proba
         # 的对象——这正是复用整条预处理链的前提
-        self.model = EdgeCNN(engine, meta["classes"]) if kind == "cnn" \
-            else EdgeRF(engine, meta["classes"])
+        if kind == "sk":
+            # 服务器上的 sklearn 模型（imu_train 的 ml_*.pkl）。engine 是 None——
+            # 这条路线不过 C，所以没有引擎，也没有 golden vector 可验
+            self.model = engine
+        else:
+            self.model = EdgeCNN(engine, meta["classes"]) if kind == "cnn" \
+                else EdgeRF(engine, meta["classes"])
+        # infer_file 靠这个决定要不要在 Python 里算手工特征。
+        # C 那两条要**原始窗口**（特征在 C 里算），sklearn 那条要**特征**。
+        # 写反了 sklearn 会当场抱怨维度，但 C 那边不会——它照样能跑，
+        # 只是算的是另一套特征（形状正好也是 193）
+        self.is_dl = (kind != "sk")
         self.classes = list(meta["classes"])
         self.window_size = int(meta["window_size"])
         self.model_hz = int(meta["hz"])
@@ -188,7 +198,7 @@ class EdgeRunner:
                         output_dir=out_dir, min_windows=min_windows,
                         keep_isolated=(min_windows <= 1),
                         label_mode=self.label_mode, resample_method=self.resample,
-                        target_labels=targets, is_dl=True,
+                        target_labels=targets, is_dl=self.is_dl,
                     )
             except Exception:
                 sys.stdout.write(noise.getvalue())
@@ -461,7 +471,7 @@ def load_models_config(path):
         sys.exit(f"{path} 里没有 models 列表")
     base = os.path.dirname(path)
 
-    def resolve(v, what):
+    def resolve(v, what, optional=False):
         """v 可以是一个路径，也可以是**一串候选**（按顺序取第一个找得到的）。
 
         候选串是给"仓库里带了一份、训练机上还有一份"这种情况用的：
@@ -482,6 +492,15 @@ def load_models_config(path):
                          + "\n  ".join(hits))
             if hits:
                 return hits[0]
+        if optional:
+            # 实验模型（还没训出来的那种）不该把整个服务拖住。**但要吵**——
+            # 安静跳过的话，平台上少一个选项，而服务日志里一切正常，
+            # 人会以为是平台没刷新
+            print(f"\n⚠ {what} 找不到，这个模型**不挂**（它标了 optional）。试过：",
+                  file=sys.stderr)
+            for t in tried:
+                print(f"    {t}", file=sys.stderr)
+            return None
         sys.exit(f"{what} 找不到，试过：\n  " + "\n  ".join(tried))
 
     out = []
@@ -498,12 +517,24 @@ def load_models_config(path):
         for k in ("gen", "meta"):
             if not m.get(k):
                 sys.exit(f"{path} 里模型 {tag} 缺 {k}")
+        # sk **必须显式写**，不从 tag 猜：标签里带 rf 的 sklearn 模型
+        # （acc_only_rf 就是）会被猜成 C 那条 rf 路线，然后报"找不到
+        # tm_forest_model.c"——而那个错误跟"忘了写 kind"看不出关系
         kind = str(m.get("kind") or ("rf" if "rf" in tag.lower() else "cnn"))
-        if kind not in ("cnn", "rf"):
-            sys.exit(f"{path} 里模型 {tag} 的 kind={kind!r} 不认识，只有 cnn / rf")
-        out.append({"tag": tag, "kind": kind,
-                    "gen": resolve(m["gen"], f"模型 {tag} 的导出目录"),
-                    "meta": resolve(m["meta"], f"模型 {tag} 的 meta json")})
+        if kind not in ("cnn", "rf", "sk"):
+            sys.exit(f"{path} 里模型 {tag} 的 kind={kind!r} 不认识，"
+                     "只有 cnn / rf / sk")
+        # optional：文件不在就跳过这个模型，别让服务起不来。
+        # 只给实验模型用——**默认是 False**，正式模型路径写错了必须当场报错，
+        # 不然的话平台上少一个模型，而没有任何人会注意到
+        opt = bool(m.get("optional"))
+        gen = resolve(m["gen"], f"模型 {tag} 的导出目录", opt)
+        meta_p = resolve(m["meta"], f"模型 {tag} 的 meta json", opt) if gen else None
+        if gen is None or meta_p is None:
+            continue
+        out.append({"tag": tag, "kind": kind, "gen": gen, "meta": meta_p})
+    if not out:
+        sys.exit(f"{path} 里一个模型都挂不上（都标了 optional 而且文件都不在？）")
     return out
 
 
@@ -565,8 +596,20 @@ def main():
         tag, kind = spec["tag"], spec["kind"]
         # 两条路线的元数据字段不同：CNN 要 ch_mean/ch_std（tm_prep 用），
         # RF 不做归一化所以没有那两项。按路线读，别用同一套必填项
-        meta = load_meta(spec["meta"], kind=kind)
-        if kind == "rf":
+        # sk 的 meta 就是 imu_train 的 ml_*.json，跟 C 那条 rf 路线同一份格式
+        meta = load_meta(spec["meta"], kind="rf" if kind == "sk" else kind)
+        if kind == "sk":
+            from tinyml import sk_model
+            eng = sk_model.load(spec["gen"], meta["classes"])
+            n_feat = eng.n_features
+            print(f"  {tag:<16} [sklearn] {len(meta['classes'])} 类，"
+                  f"{n_feat if n_feat is not None else '?'} 维特征"
+                  f"（在 Python 里算，**不是板上那份 C**）")
+            # 这条路线**没有 golden vector 可验**，而前面两条都有。
+            # 不说的话，启动日志里它跟验过的模型长得一样
+            print(f"    {'逐位自检':<18} — 这条跑的是服务器上的 sklearn，"
+                  "没有 C 可对，导出成 C 之后才谈得上逐位一致")
+        elif kind == "rf":
             eng = serve.RfEngine(serve.build_rf(spec["gen"]))
             print(f"  {tag:<16} [RF] {eng.n_ch}×{eng.n_t}，{eng.n_classes} 类，"
                   f"{eng.n_features} 维特征（在 C 里算）")

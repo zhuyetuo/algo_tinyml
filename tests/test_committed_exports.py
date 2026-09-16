@@ -147,8 +147,13 @@ def test_edge_models_prefers_the_in_repo_meta():
         assert isinstance(meta, list), f"{m['tag']} 的 meta 不是候选列表"
         assert not meta[0].startswith("~"), \
             f"{m['tag']} 的第一候选是 {meta[0]}，应该是仓库里那份"
-        assert meta[0].startswith(m["gen"]), \
-            f"{m['tag']} 的第一候选该在它自己的导出目录里"
+        # gen 也可以是候选列表（跟 meta 一个道理），而且 kind: sk 的 gen
+        # 指到的是 .pkl **文件**不是目录。所以这里比"两者在同一个目录下"，
+        # 不比字符串前缀——前缀写法在这两种情况下都会挂
+        gen0 = m["gen"][0] if isinstance(m["gen"], list) else m["gen"]
+        gen_dir = os.path.dirname(gen0) if os.path.splitext(gen0)[1] else gen0
+        assert os.path.dirname(meta[0]) == gen_dir.rstrip("/"), \
+            f"{m['tag']} 的第一候选（{meta[0]}）该跟模型放在一起（{gen_dir}）"
 
 
 def test_meta_candidates_fall_back_to_the_training_box():
