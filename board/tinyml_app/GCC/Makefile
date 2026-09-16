@@ -29,8 +29,12 @@ endif
 # 跑起来才踩到不存在的内存。
 CHIP ?= gr5513
 
-TINYML_ROOT := ../../../tinyml
-GEN_DIR     ?= ../../../generated
+# 共用的那份 C。**服务和板子编的是同一份文件**——这不是巧合，是这个仓库
+# 存在的理由：两边各留一份的话迟早分家，而分家的表现是"平台上看着对、
+# 板上不对"，查不到。
+TINYML_ROOT := ../../../core
+# 上板的模型。默认 CNN 那份；烧 RF 的话 make GEN_DIR=../../../core/models/edge_rf_d10
+GEN_DIR     ?= ../../../core/models/edge_cnn_i8
 
 #########################################################################################
 ### 我们自己的源文件
@@ -52,7 +56,8 @@ PRJ_C_SRC_FILES := \
 # 导出的模型和常量表。走 wildcard 是因为两条路线（CNN / RF）导出的文件名不同，
 # 只带其中一条的时候不该因为另一条的文件不存在而编不过
 PRJ_C_SRC_FILES += $(wildcard $(GEN_DIR)/tm_model.c)
-PRJ_C_SRC_FILES += $(wildcard $(GEN_DIR)/tm_forest_model.c)
+PRJ_C_SRC_FILES += $(wildcard $(GEN_DIR)/tm_forest_model.c) 
+PRJ_C_SRC_FILES += $(wildcard $(GEN_DIR)/tm_forest_c_model.c)
 PRJ_C_SRC_FILES += $(wildcard $(GEN_DIR)/tm_feat_cfg.c)
 
 #########################################################################################
@@ -110,7 +115,8 @@ PRJ_C_INCLUDE_PATH := \
 ifneq ($(wildcard $(GEN_DIR)/tm_model.c),)
 ROUTE_DEFINES += -DTM_HAS_CNN
 endif
-ifneq ($(wildcard $(GEN_DIR)/tm_forest_model.c),)
+ifneq ($(wildcard $(GEN_DIR)/tm_forest_model.c) 
+PRJ_C_SRC_FILES += $(wildcard $(GEN_DIR)/tm_forest_c_model.c),)
 ROUTE_DEFINES += -DTM_HAS_RF
 endif
 ifneq ($(wildcard $(GEN_DIR)/tm_forest_golden.h),)
@@ -180,7 +186,8 @@ BUILD := build
 SELFTEST_SRC := $(TINYML_ROOT)/tm_runtime.c $(TINYML_ROOT)/tm_forest.c \
                 $(TINYML_ROOT)/tm_features.c ../Src/user/tinyml_selftest.c \
                 $(wildcard $(GEN_DIR)/tm_model.c) \
-                $(wildcard $(GEN_DIR)/tm_forest_model.c) \
+                $(wildcard $(GEN_DIR)/tm_forest_model.c) 
+PRJ_C_SRC_FILES += $(wildcard $(GEN_DIR)/tm_forest_c_model.c) \
                 $(wildcard $(GEN_DIR)/tm_feat_cfg.c)
 
 LDFLAGS += -Wl,--gc-sections

@@ -5,7 +5,7 @@
 
     imu_train/src/ml/features.py   scipy + float64   ← 训练和平台在用的那份，是基准
     tinyml/features.py             纯 numpy + float32 ← 这份，逐行对着上面写的
-    firmware/tinyml/tm_features.c  C + float          ← 板上跑的那份
+    core/tm_features.c  C + float          ← 板上跑的那份
 
 **这份 ↔ C 是逐位一致的**（tests/test_features_c.py 现场编译对答案）。
 **这份 ↔ scipy 不是**，而且做不到：

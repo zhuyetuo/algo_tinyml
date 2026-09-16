@@ -11,7 +11,7 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
 
 from tinyml.forest import Forest, compact_flash_bytes, quantize_leaves
 

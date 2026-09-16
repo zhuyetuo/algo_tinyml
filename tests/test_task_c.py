@@ -13,7 +13,7 @@ import sys
 import pytest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-APP = os.path.join(ROOT, "firmware", "gr551x", "tinyml_app", "Src", "user")
+APP = os.path.join(ROOT, "board", "tinyml_app", "Src", "user")
 
 HARNESS = r"""
 #include <stdio.h>

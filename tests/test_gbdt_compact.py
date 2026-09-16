@@ -18,7 +18,7 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
 
 from tinyml.export_gbdt_compact_c import export, pack_nodes  # noqa: E402
 from tinyml.gbdt import from_xgboost_dumps  # noqa: E402
@@ -27,7 +27,7 @@ from tinyml.gbdt_compact import (  # noqa: E402
 )
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-FW = os.path.join(ROOT, "firmware", "tinyml")
+FW = os.path.join(ROOT, "core")
 
 
 def _node(nid, fi, thr, yes, no, missing_yes=True):

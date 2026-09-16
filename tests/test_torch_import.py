@@ -15,7 +15,7 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
 
 from tinyml.net import Conv1D, Dense, MaxPool1D  # noqa: E402
 from tinyml.torch_import import load_meta, normalize  # noqa: E402

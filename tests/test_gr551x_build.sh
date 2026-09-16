@@ -8,8 +8,8 @@ cd "$(dirname "$0")/.."
 command -v arm-none-eabi-gcc >/dev/null || { echo "跳过：没有 arm-none-eabi-gcc"; exit 0; }
 [ -n "${SDK_ROOT:-}" ] || { echo "跳过：没给 SDK_ROOT"; exit 0; }
 
-GEN="${GEN_DIR:-$(pwd)/firmware/generated}"
+GEN="${GEN_DIR:-$(pwd)/core/models/generated}"
 [ -d "$GEN" ] || { echo "跳过：$GEN 不存在，先跑 export_rf.py 或 quantize_and_export.py"; exit 0; }
 
-cd firmware/gr551x/tinyml_app/GCC
+cd board/tinyml_app/GCC
 make SDK_ROOT="$SDK_ROOT" GEN_DIR="$GEN" objs

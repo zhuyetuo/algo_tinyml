@@ -1,6 +1,6 @@
 """在 Ubuntu 服务器上跑**板上那份一模一样的 C**，喂真实数据，出效果和耗时。
 
-不需要板子，不需要交叉编译器——用系统自带的 gcc 把 `firmware/tinyml/*.c` 编出来跑。
+不需要板子，不需要交叉编译器——用系统自带的 gcc 把 `core/*.c` 编出来跑。
 编译选项跟固件一致（尤其 `-ffp-contract=off`），所以**判决结果跟板上逐位相同**。
 
 耗时那一栏是 x86 的数，**跟 Cortex-M4F 没有可比性**，只能用来横向比 RF 和 CNN。
@@ -8,10 +8,10 @@
 
 用法：
     # 1. 先导出模型（要 sklearn 的机器上做，或者把导出的 C 文件拷过来）
-    python python/export_rf.py --model xxx.pkl --features feats.npy --out firmware/generated
+    python service/export_rf.py --model xxx.pkl --features feats.npy --out core/models/generated
 
     # 2. 跑
-    python python/run_host_sim.py --gen firmware/generated \\
+    python service/run_host_sim.py --gen core/models/generated \\
         --data ~/imu_train/data/processed_custom/test.npz
 
 --data 支持两种：
@@ -31,7 +31,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-FW = os.path.join(ROOT, "firmware", "tinyml")
+FW = os.path.join(ROOT, "core")
 
 
 def build(gen_dir, out_dir):
@@ -46,7 +46,7 @@ def build(gen_dir, out_dir):
     missing = [p for p in src if not os.path.exists(p)]
     if missing:
         sys.exit("缺文件：" + "\n  ".join(missing) +
-                 "\n先跑 python/export_rf.py 导出模型和特征表。")
+                 "\n先跑 service/export_rf.py 导出模型和特征表。")
     exe = os.path.join(out_dir, "host_sim")
     cmd = [# host 工具用 gnu99：c99 会把 clock_gettime 藏起来。固件那边仍然是严格 c99
            "gcc", "-std=gnu99", "-O2", "-Wall",
@@ -92,7 +92,7 @@ def macro_f1(y, p, n):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gen", default="firmware/generated", help="导出的 C 文件所在目录")
+    ap.add_argument("--gen", default="core/models/generated", help="导出的 C 文件所在目录")
     ap.add_argument("--data", required=True)
     ap.add_argument("--hop", type=int, default=0, help="窗口步长，默认窗口的一半")
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 个样本")
@@ -102,7 +102,7 @@ def main():
     # 看起来正常的垃圾
     cfg_h = os.path.join(args.gen, "tm_feat_cfg.h")
     if not os.path.exists(cfg_h):
-        sys.exit(f"{cfg_h} 不存在。先跑 python/export_rf.py。")
+        sys.exit(f"{cfg_h} 不存在。先跑 service/export_rf.py。")
     txt = open(cfg_h, encoding="utf-8").read()
 
     def macro(name):

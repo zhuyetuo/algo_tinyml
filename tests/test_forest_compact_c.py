@@ -19,7 +19,7 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
 
 from tinyml.export_forest_compact_c import export  # noqa: E402
 from tinyml.forest import Forest  # noqa: E402
@@ -28,7 +28,7 @@ from tinyml.forest_compact import (  # noqa: E402
 )
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-FW = os.path.join(ROOT, "firmware", "tinyml")
+FW = os.path.join(ROOT, "core")
 
 N_FEAT, N_CLS = 20, 5
 

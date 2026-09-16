@@ -20,7 +20,7 @@ import types
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
 
 IMU_TRAIN = os.path.expanduser(os.environ.get("IMU_TRAIN", "~/imu_train"))
 

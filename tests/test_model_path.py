@@ -19,7 +19,7 @@ SCRIPTS = ["export_gbdt", "export_rf", "prune_rf", "rf_footprint", "feature_usag
 
 
 def _load(name):
-    path = os.path.join(ROOT, "python", f"{name}.py")
+    path = os.path.join(ROOT, "service", f"{name}.py")
     spec = importlib.util.spec_from_file_location(f"_t_{name}", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod

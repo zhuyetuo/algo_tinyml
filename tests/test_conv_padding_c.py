@@ -19,7 +19,7 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
 
 from tinyml import export, forward_int, quantize  # noqa: E402
 from tinyml.net import (  # noqa: E402
@@ -27,7 +27,7 @@ from tinyml.net import (  # noqa: E402
 )
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-FW = os.path.join(ROOT, "firmware", "tinyml")
+FW = os.path.join(ROOT, "core")
 
 N_CH, N_T, N_CLASSES = 8, 16, 5   # 真实配置：8 通道、16 点（1 秒 @16Hz）、5 类
 WIDTHS = [8, 16, 32]

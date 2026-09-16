@@ -3,12 +3,12 @@
 要在有 xgboost + sklearn 的机器上跑。
 
 用法：
-    python python/export_gbdt.py \
+    python service/export_gbdt.py \
         --model ~/imu_train/results_edge/.../xgb/ml_xgb.pkl \
         --features feats.npy \
         --window 16 --channels 8 --hz 16 \
         --classes 活动,睡觉,抓挠,未佩戴,甩身体 \
-        --out firmware/generated
+        --out core/models/generated
 """
 
 import argparse
@@ -54,7 +54,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--features", help="[N, n_features] 的 .npy，用来做 golden vector")
-    ap.add_argument("--out", default="firmware/generated")
+    ap.add_argument("--out", default="core/models/generated")
     ap.add_argument("--golden", type=int, default=8,
                     help="golden vector 条数。每条 = n_features×4 B，别给太多")
     ap.add_argument("--classes", default="")

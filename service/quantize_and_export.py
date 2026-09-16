@@ -5,7 +5,7 @@
     tm_golden.h               golden vector —— 板上跑出来必须逐位相同
 
 用法：
-    python python/quantize_and_export.py --model model.npz --out firmware/generated
+    python python/quantize_and_export.py --model model.npz --out core/models/generated
 """
 
 import argparse
@@ -44,7 +44,7 @@ def from_torch_npz(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--out", default="firmware/generated")
+    ap.add_argument("--out", default="core/models/generated")
     ap.add_argument("--classes", default="", help="类别名，逗号分隔，只用于生成注释和 TM_CLASS_NAMES")
     ap.add_argument("--golden", type=int, default=16)
     args = ap.parse_args()

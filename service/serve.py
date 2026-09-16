@@ -14,8 +14,8 @@
 只用标准库（http.server + ctypes），不装任何东西。
 
 用法：
-    python python/serve.py --gen firmware/generated_cnn_a
-    python python/serve.py --gen firmware/generated_cnn_a \\
+    python service/serve.py --gen core/models/edge_cnn_i8
+    python service/serve.py --gen core/models/edge_cnn_i8 \\
         --raw ~/imu_train/holdout_raw.npy --labels ~/imu_train/holdout_y.npy \\
         --port 8080 --host 0.0.0.0
 
@@ -39,7 +39,7 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-FW = os.path.join(ROOT, "firmware", "tinyml")
+FW = os.path.join(ROOT, "core")
 HOST_C = os.path.join(ROOT, "host", "tm_host.c")
 
 

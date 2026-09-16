@@ -13,7 +13,7 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
 
 from tinyml.fixedpoint import (  # noqa: E402
     INT32_MAX, INT32_MIN,
@@ -24,7 +24,7 @@ from tinyml.fixedpoint import (  # noqa: E402
 )
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-FW = os.path.join(ROOT, "firmware", "tinyml")
+FW = os.path.join(ROOT, "core")
 
 
 def _cases():

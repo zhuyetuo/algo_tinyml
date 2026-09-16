@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
 
 from tinyml import export, forward_int, quantize  # noqa: E402
 from tinyml.net import Conv1D, Dense, FloatNet, MaxPool1D  # noqa: E402
@@ -162,8 +162,8 @@ def test_build_command_contains_required_flags(monkeypatch, tmp_path):
     assert "-ffp-contract=off" in cmd, "FMA 收缩没关掉，结果跟板上对不上"
     assert "-fno-math-errno" in cmd
     # 固件的源文件必须是**原样**编进来的，不能是某个拷贝
-    assert any(c.endswith("firmware/tinyml/tm_runtime.c") for c in cmd)
-    assert any(c.endswith("firmware/tinyml/tm_prep.c") for c in cmd)
+    assert any(c.endswith("core/tm_runtime.c") for c in cmd)
+    assert any(c.endswith("core/tm_prep.c") for c in cmd)
 
 
 # ── 端口 ──────────────────────────────────────────────────────────────────

@@ -10,10 +10,20 @@ firmware/gr551x/tinyml_app/GCC/build/
 # 而且它们是可以从「提交 + 模型指纹」完全复现的。
 release/
 
-# export_cnn.py / export_rf.py 的导出目录。这是产物，不是源码。
-# **更要紧的是别把一份假模型提交进来**：本机自测时会造随机权重的演示导出，
-# 名字跟真的一模一样，提交进去之后谁也分不出来，而它编得过、也能跑。
+# 导出目录（export_cnn.py / export_rf.py 的产物）默认不进仓库：本机自测会造
+# 随机权重的演示导出，名字跟真的一模一样，提交进去之后谁也分不出来，
+# 而它编得过、也能跑、golden 自检还过（拿同一份假权重生成的当然对得上）。
+core/models/generated*/
 firmware/generated*/
+
+# 但**上板用的那两份要进仓库**——不进的话换一台机器 clone 下来既起不了服务
+# 也烧不了板，而训练产出只在训练那台机器上。
+# 提交前必须过 scripts/check_export.py（tests/test_committed_exports.py 会跑），
+# 它拿导出结果跟训练产出的 meta.json 对棵数/类别/几何。
+!core/models/edge_cnn_i8/
+!core/models/edge_cnn_i8/**
+!core/models/edge_rf_d10/
+!core/models/edge_rf_d10/**
 
 # serve_edge.sh 的运行时文件
 .edge_service.pid

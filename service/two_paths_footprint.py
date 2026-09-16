@@ -17,8 +17,8 @@ RF 那条在端上还要算 193 维手工特征（含 Welch/FFT），CNN 那条�
      text+rodata（flash）和 data+bss（RAM），混在一起看会得出错误结论。
 
 用法：
-    python python/two_paths_footprint.py
-    python python/two_paths_footprint.py --cc arm-none-eabi-gcc
+    python service/two_paths_footprint.py
+    python service/two_paths_footprint.py --cc arm-none-eabi-gcc
 """
 
 import argparse
@@ -30,7 +30,7 @@ import sys
 import tempfile
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-FW = os.path.join(ROOT, "firmware", "tinyml")
+FW = os.path.join(ROOT, "core")
 
 # GR5513 是 Cortex-M4F（带单精度 FPU、DSP 指令）。
 # -ffp-contract=off 是硬要求：FMA 收缩会少一次中间舍入，两边就对不上。

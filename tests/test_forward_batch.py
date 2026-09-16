@@ -15,7 +15,7 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
 
 from tinyml import forward_int, forward_int_batch, quantize  # noqa: E402
 from tinyml.net import Conv1D, Dense, FloatNet, MaxPool1D, im2col  # noqa: E402

@@ -117,5 +117,5 @@ uint8_t right;     /* bit0-6 右孩子相对偏移；bit7 NaN 往左；整字节
 
 上面全是按访存次数推的。**真实的耗时和功耗要在板上测**——
 flash 读的实际延迟、cache line 大小、以及 GR551x 的 flash 控制器有没有预取，
-都得看手册或者实测。方法在 [gr551x/README.md](../firmware/gr551x/README.md)
+都得看手册或者实测。方法在 [gr551x/README.md](../board/README.md)
 （DWT 周期计数器）。
