@@ -39,10 +39,24 @@ class SkModel:
     8 通道的推理链上）。所以这里把话说全。
     """
 
-    def __init__(self, model, classes, path=""):
+    def __init__(self, model, classes, path="", feature_select=None):
         self.model = model
         self.classes = list(classes)
         self.path = path
+        # 训练时只用了 193 维里的一部分（比如 acc3 那条只用 113 维非陀螺仪的）。
+        # 推理链照常算 193 维，这里按下标取列 —— 于是 5 通道的模型
+        # **不需要一条新的预处理链**就能上线。
+        #
+        # 下标是训练时存进 ml_*.json 的，不在这里按特征名现筛：
+        # 服务这边依赖的是它自己那份 imu_train，版本一旦跟训练机不同，
+        # 筛出来的下标会整体错位，而错位**不报错**——每一维都对到别的特征上。
+        # from_dim 就是为了让这种错位当场暴露。
+        self.select = None
+        self.select_from = None
+        if feature_select:
+            import numpy as np
+            self.select = np.asarray(feature_select["indices"], np.int64)
+            self.select_from = int(feature_select["from_dim"])
         # 给 EdgeRunner 看的：它靠这个决定传给 infer_file 的 is_dl
         self.is_dl = False
         n_out = getattr(model, "n_classes_", None)
@@ -59,25 +73,40 @@ class SkModel:
     def n_features(self):
         return getattr(self.model, "n_features_in_", None)
 
+    def _select(self, feats):
+        if self.select is None:
+            return feats
+        got = int(getattr(feats, "shape", (0, 0))[-1])
+        if got != self.select_from:
+            raise ValueError(
+                f"{self.path}: 这个模型训练时是从 {self.select_from} 维里取列的，"
+                f"而推理链算出来 {got} 维。\n"
+                "  两边的 imu_train 特征代码不是同一版——按老下标取列**不会报错**，"
+                "只会让每一维都对到别的特征上，模型照样给得出结果。\n"
+                "  把训练机那份 src/ml/features.py 同步过来，或者重训一次。")
+        return feats[:, self.select]
+
     def predict_proba(self, feats):
+        feats = self._select(feats)
         want = self.n_features
         got = getattr(feats, "shape", (None, None))[-1]
         if want is not None and got is not None and int(want) != int(got):
             raise ValueError(
                 f"{self.path}: 这个模型要 {int(want)} 维特征，推理链算出来的是 "
                 f"{int(got)} 维。\n"
-                "  常见原因：模型是用**真 3 通道**（只留 acc 三列）训的，"
-                "只有 57 维；而推理链固定按 8 通道算，是 193 维。\n"
-                "  想只用加速计的话，训练时要用"
-                "「保留 8 通道形状、把陀螺仪置零」那条路"
-                "（imu_train/acc_only/），训出来就是 193 维，能直接挂。")
+                "  推理链固定按 8 通道算，出来是 193 维。想只用加速计的话，"
+                "训练要走 imu_train 里那两条之一：\n"
+                "    acc3/      5 通道（acc3 + pitch/roll）113 维，"
+                "ml_*.json 里带 feature_select，服务按下标取列；\n"
+                "    acc_only/  8 通道形状、陀螺仪置零，193 维，整份直接喂。\n"
+                "  只留 acc 三列直接训出来的是 57 维，那条路这里跑不了。")
         return self.model.predict_proba(feats)
 
     def predict(self, feats):
-        return self.model.predict(feats)
+        return self.model.predict(self._select(feats))
 
 
-def load(pkl_path, classes):
+def load(pkl_path, classes, feature_select=None):
     """读 pkl。joblib 是 imu_train 存模型用的那个，这里必须用同一个。"""
     # **先查路径再 import**：没装 joblib 的机器上，给错路径的人会先看到
     # "No module named 'joblib'"，然后去装一个装完还是错的依赖
@@ -90,4 +119,5 @@ def load(pkl_path, classes):
         raise ImportError(
             "kind: sk 要 joblib（imu_train 存模型用的就是它）："
             "pip install joblib scikit-learn") from e
-    return SkModel(joblib.load(pkl_path), classes, path=pkl_path)
+    return SkModel(joblib.load(pkl_path), classes, path=pkl_path,
+                   feature_select=feature_select)

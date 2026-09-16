@@ -227,10 +227,72 @@ def test_repo_config_marks_the_experimental_model_optional():
     with open(p, encoding="utf-8") as f:
         cfg = json.load(f)
     by = {m["tag"]: m for m in cfg["models"] if isinstance(m, dict) and "tag" in m}
-    assert "acc_only_rf" in by, "edge_models.json 里没有 acc_only_rf"
-    m = by["acc_only_rf"]
-    assert m.get("optional") is True
-    assert m.get("kind") == "sk", "不写 kind 会被 tag 里的 rf 猜成 C 那条路线"
+    for tag in ("acc_only_rf", "acc3_rf"):
+        assert tag in by, f"edge_models.json 里没有 {tag}"
+        assert by[tag].get("optional") is True
+        assert by[tag].get("kind") == "sk", \
+            f"{tag} 不写 kind 会被 tag 里的 rf 猜成 C 那条路线"
     # 正式模型**不能**是 optional：路径写错时必须当场报错
     for tag in ("edge_cnn_i8", "edge_rf_d10"):
         assert not by[tag].get("optional"), f"{tag} 是正式模型，不该标 optional"
+
+
+# ── feature_select：5 通道模型靠它复用 8 通道的推理链 ─────────────────────
+
+
+def _select_cfg(n_from=193, keep=113):
+    return {"from_dim": n_from, "indices": list(range(keep))}
+
+
+def test_feature_select_takes_the_columns_before_predicting():
+    """推理链算 193 维，模型只要其中 113 维——按下标取列。
+
+    这是 5 通道模型能不改预处理链就上线的全部原理。
+    """
+    import numpy as np
+    m = sk_model.SkModel(_FakeForest(n_features=113), CLASSES,
+                         feature_select=_select_cfg())
+    out = m.predict_proba(np.zeros((4, 193), np.float32))
+    assert out.shape == (4, 5)
+
+
+def test_feature_select_rejects_a_different_source_dim():
+    """来的不是 193 维就**当场报错**。
+
+    两边 imu_train 的特征代码不是同一版时，按老下标取列**不会报错**——
+    每一维都对到别的特征上，模型照样给得出结果。from_dim 就是为了
+    让这种错位暴露出来。
+    """
+    import numpy as np
+    m = sk_model.SkModel(_FakeForest(n_features=113), CLASSES, path="acc3.pkl",
+                         feature_select=_select_cfg())
+    with pytest.raises(ValueError) as e:
+        m.predict_proba(np.zeros((4, 200), np.float32))
+    msg = str(e.value)
+    assert "193" in msg and "200" in msg
+    assert "不会报错" in msg, "没说清错位是静默的"
+
+
+def test_predict_also_selects():
+    """predict 走的是同一条路。漏掉的话逐窗口标签用的是没取列的特征。"""
+    import numpy as np
+
+    class _Rec(_FakeForest):
+        seen = None
+
+        def predict(self, X):
+            _Rec.seen = X.shape[1]
+            return np.zeros(len(X), int)
+
+    m = sk_model.SkModel(_Rec(n_features=113), CLASSES,
+                         feature_select=_select_cfg())
+    m.predict(np.zeros((4, 193), np.float32))
+    assert _Rec.seen == 113
+
+
+def test_no_feature_select_passes_everything_through():
+    """老的 8 通道模型没有这个字段，整 193 维全用——行为不能变。"""
+    import numpy as np
+    m = sk_model.SkModel(_FakeForest(n_features=193), CLASSES)
+    assert m.select is None
+    assert m.predict_proba(np.zeros((2, 193), np.float32)).shape == (2, 5)

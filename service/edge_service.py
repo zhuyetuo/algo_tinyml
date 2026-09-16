@@ -600,10 +600,16 @@ def main():
         meta = load_meta(spec["meta"], kind="rf" if kind == "sk" else kind)
         if kind == "sk":
             from tinyml import sk_model
-            eng = sk_model.load(spec["gen"], meta["classes"])
+            # feature_select 是训练时存进 ml_*.json 的（acc3 那条路会存）。
+            # 没有就是老的 8 通道模型，整 193 维全用
+            eng = sk_model.load(spec["gen"], meta["classes"],
+                                feature_select=meta.get("feature_select"))
             n_feat = eng.n_features
+            ch = meta.get("n_channels")
+            sel = f"（从 {eng.select_from} 维里取 {len(eng.select)} 列）" if eng.select is not None else ""
             print(f"  {tag:<16} [sklearn] {len(meta['classes'])} 类，"
-                  f"{n_feat if n_feat is not None else '?'} 维特征"
+                  f"{n_feat if n_feat is not None else '?'} 维特征{sel}"
+                  f"{f'，{ch} 通道' if ch else ''}"
                   f"（在 Python 里算，**不是板上那份 C**）")
             # 这条路线**没有 golden vector 可验**，而前面两条都有。
             # 不说的话，启动日志里它跟验过的模型长得一样
