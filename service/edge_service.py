@@ -217,16 +217,21 @@ class EdgeRunner:
 
         out = {"n_windows": n_windows, "segments": segments,
                "missing_seconds": missing_seconds, "windows": windows}
-        if mode in ("stable", "viterbi"):
+        if mode in ("stable", "viterbi", "board"):
             out["segments"] = self.stabilize(windows, targets, mode)
         return out
 
     def stabilize(self, windows, targets, algo):
-        """走 label_service 那份后处理，**跟线上模型完全同一份代码**。
+        """后处理。
 
-        这样"模型对比"比的才只是模型。自己抄一份的话，两边的滞回门槛、
-        合并规则、最短时长迟早分家，而分家之后对比表里混进了后处理的差异，
-        **那个差异不会显示在任何地方**。
+        algo = stable / viterbi → 走 **label_service 那份**（跟线上同一份代码）。
+        algo = board            → 走 **板子上那份**（core/tm_post.c）。
+
+        为什么要有 board：选 edge:<标签> 时模型和推理已经是板上那份 C 了，
+        但后处理还是服务端的 Python。板上跑的 tm_post.c 是流式、有界回溯的，
+        结构上不一样。两份我量过 18 万窗口 100% 一致，**但那是在我造的数据上**。
+        手里没有板子时，唯一能拿真实数据回答"板子会报什么"的办法就是把这一段
+        也换成板上那份 C。
         """
         ls_config, ls_post = load_postprocess()
         params = ls_post.StableParams(
@@ -247,6 +252,14 @@ class EdgeRunner:
         # 那边是线上模型的几何，端侧模型的窗口可能不一样
         window_s = self.window_size / float(self.model_hz)
         stride_s = self.stride / float(self.model_hz)
+        if algo == "board":
+            import post_board
+            # **参数用同一份**（label_service 的 STABLE_*）。板上的
+            # tm_post_cfg_default 里也是这几个值，改的时候两边一起改——
+            # 这里如果用另一套默认值，比出来的差异就分不清是后处理实现不同
+            # 还是参数不同了
+            return post_board.stabilize(
+                windows, self.classes, targets, window_s, stride_s, params)
         return ls_post.stabilize(
             windows, self.classes, targets, window_s, stride_s,
             self.label_mode, params, algo=algo)
@@ -366,8 +379,9 @@ class Handler(BaseHTTPRequestHandler):
     def _one(self, body, raise_on_error=False):
         try:
             mode = str(body.get("mode") or "raw")
-            if mode not in ("raw", "stable", "viterbi"):
-                raise ValueError(f"mode 只支持 raw / stable / viterbi，给的是 {mode}")
+            if mode not in ("raw", "stable", "viterbi", "board"):
+                raise ValueError(
+                    f"mode 只支持 raw / stable / viterbi / board，给的是 {mode}")
             r = self._runner(body.get("model"))
             path = self._resolve(str(body["path"]))
             device_hz = _as_hz(body.get("device_hz") or r.model_hz)
@@ -380,6 +394,11 @@ class Handler(BaseHTTPRequestHandler):
                           list(targets), mode=mode)
             # windows 是给后处理用的中间量，几千条，没必要回给平台
             res.pop("windows", None)
+            if mode == "board":
+                # 这两个计数是"板上这份跟离线算法可能分家"的**唯一**依据，
+                # 回给平台，别让它只存在于本机日志里
+                import post_board
+                res["board_forced"] = post_board.forced_counts()
             res.update({
                 # model_path 平台用来算 model_tag（取文件名去后缀），
                 # 所以这里给一个能一眼看出是端侧、且带模型标识的假路径
