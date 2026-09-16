@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
 
 from rf_footprint import ENCODINGS, tree_stats  # noqa: E402
 

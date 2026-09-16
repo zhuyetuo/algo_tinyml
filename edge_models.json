@@ -10,7 +10,9 @@
     "字段：",
     "  tag   平台上看到的名字，也是版本串 edge:<tag>。不能重复。",
     "  gen   导出目录（export_cnn.py / export_rf.py --compact 的产物）",
-    "  meta  imu_train 的元数据 json。CNN 用 dl_*.json，RF 用 ml_*.json",
+    "  meta  imu_train 的元数据 json。**可以给一串候选**，按顺序取第一个找得到的：",
+    "        仓库里带的那份排前面，训练机上的原件排后面。这样新克隆的机器",
+    "        （没有 results_edge_*）也能直接起服务。",
     "  kind  cnn / rf。不写就按 tag 里含不含 rf 猜（老规矩）",
     "",
     "gen 和 meta 支持 glob，但必须**唯一匹配**——匹配到多个会当场报错并列出",
@@ -23,14 +25,20 @@
     {
       "tag": "edge_cnn_i8",
       "kind": "cnn",
-      "gen": "firmware/generated_cnn_a",
-      "meta": "~/imu_train/results_edge_a/*/16hz_remap_custom_3class/dl_cnn_best.json"
+      "gen": "core/models/edge_cnn_i8",
+      "meta": [
+        "core/models/edge_cnn_i8/meta.json",
+        "~/imu_train/results_edge_a/*/16hz_remap_custom_3class/dl_cnn_best.json"
+      ]
     },
     {
       "tag": "edge_rf_d10",
       "kind": "rf",
-      "gen": "firmware/generated_rf",
-      "meta": "~/imu_train/results_edge_rf/*/16hz_remap_custom_3class/rf/ml_rf.json"
+      "gen": "core/models/edge_rf_d10",
+      "meta": [
+        "core/models/edge_rf_d10/meta.json",
+        "~/imu_train/results_edge_rf/*/16hz_remap_custom_3class/rf/ml_rf.json"
+      ]
     }
   ]
 }

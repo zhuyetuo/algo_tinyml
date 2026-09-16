@@ -84,7 +84,7 @@ LR 在 193 维手工特征上大概率打不过 GBDT——抓挠这类行为的�
 然后拿第 2 或第 4 去适配端侧。第 3 和第 5 的作用是告诉你"为了塞进端侧，损失了多少"。
 
 > ~~现在 export_rf.py 只支持 sklearn 的 RandomForestClassifier~~
-> **XGBoost 的导出已经做好了**：`python/export_gbdt.py`。三条跟 sklearn 不一样的
+> **XGBoost 的导出已经做好了**：`service/export_gbdt.py`。三条跟 sklearn 不一样的
 > 语义都单独钉了测试（判决是 `<` 不是 `<=`；叶子相加不是平均；树 t 属于类别
 > `t % n_classes`），变异测试确认改坏任意一条都会红。
 > lightgbm / catboost 的 dump 格式不一样，各自要一个解析器——**等定下来用哪个再做**。
@@ -96,6 +96,6 @@ LR 在 193 维手工特征上大概率打不过 GBDT——抓挠这类行为的�
 python python/prune_rf.py --model xxx.pkl --features holdout.npy --labels y.npy
 
 # 任何模型导出之后：完整资源报告
-python python/resource_report.py --gen firmware/generated \
-    --elf firmware/gr551x/tinyml_app/GCC/build/tinyml_app.elf
+python service/resource_report.py --gen firmware/generated \
+    --elf board/tinyml_app/GCC/build/tinyml_app.elf
 ```

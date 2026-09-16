@@ -18,13 +18,13 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
 
 from tinyml.export_features_c import export as export_cfg  # noqa: E402
 from tinyml.features import extract_one, n_features  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-FW = os.path.join(ROOT, "firmware", "tinyml")
+FW = os.path.join(ROOT, "core")
 
 N_T, N_CH, NPERSEG, FS = 16, 8, 16, 16.0
 DIM = n_features(N_CH)

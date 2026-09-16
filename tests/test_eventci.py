@@ -12,7 +12,7 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
 
 from tinyml.eventci import (  # noqa: E402
     describe, event_ci, f1_from, gap_is_meaningful,

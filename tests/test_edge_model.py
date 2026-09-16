@@ -11,7 +11,7 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
 
 from tinyml import export, quantize  # noqa: E402
 from tinyml.edge_model import EdgeCNN, softmax  # noqa: E402

@@ -15,7 +15,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _load():
-    path = os.path.join(ROOT, "python", "event_eval.py")
+    path = os.path.join(ROOT, "service", "event_eval.py")
     spec = importlib.util.spec_from_file_location("_ev", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod

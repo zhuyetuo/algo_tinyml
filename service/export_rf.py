@@ -4,10 +4,10 @@
 导出来的 C 不依赖 sklearn，也不依赖 numpy。
 
 用法：
-    python python/export_rf.py \
+    python service/export_rf.py \
         --model ~/imu_train/results/.../rf/xxx.pkl \
         --features feats.npy \
-        --out firmware/generated
+        --out core/models/generated
 
 --features 是一批**真实特征向量**（[N, n_features] 的 .npy），用来生成 golden vector。
 拿真实的、不是随机的：随机向量会走到树里几乎不可能走到的分支组合上，验的不是
@@ -56,7 +56,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--features", help="[N, n_features] 的 .npy，用来做 golden vector")
-    ap.add_argument("--out", default="firmware/generated")
+    ap.add_argument("--out", default="core/models/generated")
     ap.add_argument("--golden", type=int, default=32)
     ap.add_argument("--classes", default="")
     ap.add_argument("--window", type=int, default=32, help="窗口点数（16Hz×2s=32）")

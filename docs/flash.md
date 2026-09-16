@@ -97,7 +97,7 @@ golden vector 是导出模型时 PC 上算好的「这个输入必须得到这�
 
 自检过了，再往下：喂真实 IMU 数据，看识别结果。
 
-这一步之前可以先在服务器上看——`python python/serve.py` 起的那个页面跑的是
+这一步之前可以先在服务器上看——`python service/serve.py` 起的那个页面跑的是
 **同一份 C**，而且 `tm_invoke` 全程整数、逐位结果跟指令集无关，
 所以 x86 上验过的推理部分等于板上验过。板子要补的只有 `tm_prep` 里那 128 次
 浮点运算（走各自平台的 libm），而 golden vector 自检覆盖不到它——

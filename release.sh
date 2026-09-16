@@ -8,8 +8,8 @@
 #     覆盖掉了没人知道 —— 这是这类项目最常见的一种事故。
 #
 # 用法：
-#   ./release.sh --sdk /path/to/GR551x_SDK --gen firmware/generated_cnn_a
-#   ./release.sh --gen firmware/generated_cnn_a          # 没 SDK：只出体积报告
+#   ./release.sh --sdk /path/to/GR551x_SDK --gen core/models/edge_cnn_i8
+#   ./release.sh --gen core/models/edge_cnn_i8          # 没 SDK：只出体积报告
 #
 # 没有 SDK 也能跑：那时不链接，只编译到 .o 并报体积。体积是现在就能确定的，
 # 完整固件要等有 SDK 的机器。**不会假装成功** —— 产出里会写明缺什么。
@@ -19,7 +19,7 @@ cd "$(dirname "$0")"
 ROOT=$(pwd)
 
 SDK=""
-GEN="firmware/generated_cnn_a"
+GEN="core/models/edge_cnn_i8"
 NOTE=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -57,7 +57,7 @@ cp -r "$GEN" "$OUT/model"
 
 # ── 编译 ──────────────────────────────────────────────────────────────────
 BUILT=no
-cd firmware/gr551x/tinyml_app/GCC
+cd board/tinyml_app/GCC
 if [ -n "$SDK" ]; then
     if [ -f "$SDK/platform/soc/linker/gcc/libble_sdk.a" ]; then
         echo "▶ 完整固件（SDK: $SDK）"
@@ -84,11 +84,11 @@ SIZES=$(
   T=$(mktemp -d)
   CF="-mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 -Os
       -ffp-contract=off -fno-math-errno -std=c99 -ffunction-sections -fdata-sections"
-  for f in firmware/tinyml/tm_runtime.c firmware/tinyml/tm_prep.c \
-           firmware/tinyml/tm_bench.c firmware/tinyml/tm_window.c \
+  for f in core/tm_runtime.c core/tm_prep.c \
+           core/tm_bench.c core/tm_window.c \
            "$GEN"/tm_model.c; do
       [ -f "$f" ] || continue
-      arm-none-eabi-gcc $CF -Ifirmware/tinyml -I"$GEN" -c "$f" \
+      arm-none-eabi-gcc $CF -Icore -I"$GEN" -c "$f" \
           -o "$T/$(basename "$f" .c).o" 2>/dev/null || true
   done
   arm-none-eabi-size -t "$T"/*.o 2>/dev/null
@@ -99,7 +99,7 @@ SIZES=$(
 # 第一版是"build/ 里有什么就拷什么"，结果把上一次残留的 tinyml_app.bin
 # 抄进了一个 README 写着"没有可烧录固件"的目录里——一个自相矛盾、
 # 且来源不明的 .bin。那正是这个脚本存在的理由，却差点由它自己制造出来。
-B=firmware/gr551x/tinyml_app/GCC/build
+B=board/tinyml_app/GCC/build
 if [ "$BUILT" = yes ]; then
     for f in tinyml_app.bin tinyml_app.hex tinyml_app.elf tinyml_app.map; do
         [ -f "$B/$f" ] && cp "$B/$f" "$OUT/"

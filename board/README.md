@@ -1,6 +1,6 @@
 # GR551x 工程接入
 
-把 `firmware/tinyml/` 那几个 .c 挂进 Goodix 的 GR551x SDK。
+把 `core/` 那几个 .c 挂进 Goodix 的 GR551x SDK。
 
 - SDK 下载：<https://www.goodix.com/zh/software_tool/gr551x_sdk>（GitHub 镜像：
   [goodix-ble/GR551x.SDK](https://github.com/goodix-ble/GR551x.SDK)）
@@ -15,7 +15,7 @@
 ## 先跑一下（不需要板子，不需要 SDK 里的 BLE 部分）
 
 ```bash
-cd firmware/gr551x/tinyml_app/GCC
+cd board/tinyml_app/GCC
 make SDK_ROOT=/path/to/GR551x_SDK GEN_DIR=/path/to/generated objs
 ```
 
@@ -47,7 +47,7 @@ make SDK_ROOT=/path/to/GR551x_SDK GEN_DIR=/path/to/generated objs
 **不是"应该能链"——这里真的用 `arm-none-eabi-gcc 13.2` 链出了 .bin。**
 
 ```bash
-cd firmware/gr551x/tinyml_app/GCC
+cd board/tinyml_app/GCC
 make SDK_ROOT=/path/to/GR551x_SDK GEN_DIR=/path/to/generated firmware
 # → build/tinyml_app.{elf,bin,hex,map}
 ```
@@ -94,7 +94,7 @@ golden vector               14,560 B   ← 几乎一半
 它自带一条可以往手机推数据的通道，不用先自己定义 GATT。
 
 1. 复制工程目录，把 `Src/user/tinyml_task.c`、`tinyml_selftest.c` 和
-   `firmware/tinyml/*.c`、导出的 `generated/*.c` 加进它的 `GCC/Makefile`
+   `core/*.c`、导出的 `generated/*.c` 加进它的 `GCC/Makefile`
    的 `PRJ_C_SRC_FILES`，头文件路径加进 `PRJ_C_INCLUDE_PATH`。
 2. **在它的 `COMMON_COMPILE_FLAGS` 里加上 `-ffp-contract=off`。**
 3. 链接脚本用 `GCC/gcc_linker_gr5513.lds`（Keil 用 `Keil_5/` 里对应的 sct）。

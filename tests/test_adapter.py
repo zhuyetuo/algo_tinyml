@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from tinyml.adapter import ModelAdapter  # noqa: E402

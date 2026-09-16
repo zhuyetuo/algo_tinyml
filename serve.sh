@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# 起端侧推理服务（给标注平台调）。
+# 起端侧推理服务（给标注平台调）——**PC 那一侧的入口**。
 #
-#   ./serve_edge.sh            拉代码 + 停旧的 + 前台起（能看到自检输出）
-#   ./serve_edge.sh -d         同上，但后台起，日志落到 logs/edge_service.log
-#   ./serve_edge.sh stop       停掉
-#   ./serve_edge.sh status     看在不在跑
+# 跟 ./board.sh 的关系：两边编的是同一份 core/ 里的 C。这边编成 .so 给
+# Python 调，那边编进固件。各留一份的话迟早分家，而分家的表现是
+# "平台上看着对、板上不对"——查不到。
+#
+#   ./serve.sh            拉代码 + 停旧的 + 前台起（能看到自检输出）
+#   ./serve.sh -d         同上，但后台起，日志落到 logs/edge_service.log
+#   ./serve.sh stop       停掉
+#   ./serve.sh status     看在不在跑
 #
 # 挂哪些模型看 edge_models.json。**加模型改那个文件，不用改这个脚本。**
 # 里面的路径支持 glob（训练产出目录带日期批次），但必须唯一匹配——
@@ -12,7 +16,7 @@
 # 只会让平台上的结果对应到另一份模型。
 #
 # 覆盖默认值（一般用不到）：
-#   PORT=8901 NAS_ROOT=/mnt/nas MODELS=别的.json ./serve_edge.sh
+#   PORT=8901 NAS_ROOT=/mnt/nas MODELS=别的.json ./serve.sh
 
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -89,7 +93,7 @@ ARGS=(
     # **-u（不缓冲）**：不加的话 Python 发现 stdout 不是终端就会开缓冲，
     # 后台起的时候日志文件**一直是空的**，直到缓冲满或进程退出。
     # 服务是常驻的，那意味着实际上永远看不到日志。
-    python -u "$ROOT/python/edge_service.py"
+    python -u "$ROOT/service/edge_service.py"
     --models "$MODELS"
     --imu-train "$IMU_TRAIN"
     --nas-root "$NAS_ROOT"

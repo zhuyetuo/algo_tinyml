@@ -30,12 +30,12 @@
 里加四行，不用改这里的代码。
 
 用法：
-    python python/edge_service.py --models edge_models.json \\
+    python service/edge_service.py --models edge_models.json \\
         --imu-train ~/imu_train --host 0.0.0.0 --port 8900
 
 老写法照样能用（一个模型一对 --gen/--meta）：
-    python python/edge_service.py \\
-        --gen edge_cnn_i8=firmware/generated_cnn_a \\
+    python service/edge_service.py \\
+        --gen edge_cnn_i8=core/models/edge_cnn_i8 \\
         --meta edge_cnn_i8=~/imu_train/results_edge_a/.../dl_cnn_best.json \\
         --imu-train ~/imu_train
 """
@@ -419,14 +419,14 @@ def load_models_config(path):
     **为什么要有这个文件**：后处理这套（稳定版 v2）是跟模型无关的模板——
     窗口几何、类别、label_mode 全部从模型自己的 meta 里来，滞回/合并那套
     参数从 label_service 来。所以"再加一个模型"本该只是加几行数据，
-    而不是改脚本。改脚本的版本里，加模型要动 serve_edge.sh 的三处写死路径，
+    而不是改脚本。改脚本的版本里，加模型要动 serve.sh 的三处写死路径，
     漏掉一处的表现是**服务照常起来，只是少了一个模型**。
 
     格式（models 是个列表，顺序即默认模型的优先级）：
 
         {"models": [
           {"tag": "edge_cnn_i8",
-           "gen":  "firmware/generated_cnn_a",
+           "gen":  "core/models/edge_cnn_i8",
            "meta": "~/imu_train/results_edge_a/*/*/dl_cnn_best.json",
            "kind": "cnn"}
         ]}
@@ -443,10 +443,27 @@ def load_models_config(path):
     base = os.path.dirname(path)
 
     def resolve(v, what):
-        v = os.path.expanduser(str(v))
-        if not os.path.isabs(v):
-            v = os.path.join(base, v)
-        return _pick_one(v, what)
+        """v 可以是一个路径，也可以是**一串候选**（按顺序取第一个找得到的）。
+
+        候选串是给"仓库里带了一份、训练机上还有一份"这种情况用的：
+        新克隆的机器上只有仓库里那份，训练机上两份都在。写死单个路径的话，
+        换台机器 clone 下来服务直接起不来——而模型明明就在仓库里。
+        """
+        cands = v if isinstance(v, list) else [v]
+        tried = []
+        for c in cands:
+            c = os.path.expanduser(str(c))
+            if not os.path.isabs(c):
+                c = os.path.join(base, c)
+            hits = sorted(glob.glob(c)) if any(ch in c for ch in "*?[") else (
+                [c] if os.path.exists(c) else [])
+            tried.append(c)
+            if len(hits) > 1:
+                sys.exit(f"{what} 匹配到 {len(hits)} 个，不猜。写具体一点：\n  "
+                         + "\n  ".join(hits))
+            if hits:
+                return hits[0]
+        sys.exit(f"{what} 找不到，试过：\n  " + "\n  ".join(tried))
 
     out = []
     seen = set()

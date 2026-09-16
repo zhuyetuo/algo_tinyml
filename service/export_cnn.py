@@ -10,7 +10,7 @@
         --remap configs/remap_custom_3class.yaml
 
     # 再量化 + 评估（在 algo_tinyml 目录下）
-    python python/export_cnn.py \\
+    python service/export_cnn.py \\
         --pt ~/imu_train/results/.../dl_cnn_best.pt \\
         --raw ~/imu_train/holdout_raw.npy --labels ~/imu_train/holdout_y.npy
 """

@@ -10,7 +10,7 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
 
 from tinyml import forward_int, make_net, quantize  # noqa: E402
 from tinyml.fixedpoint import (  # noqa: E402

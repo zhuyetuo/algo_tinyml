@@ -6,8 +6,8 @@
   估算 = 按运算量推的，**只能当数量级**，真实耗时要板子上用 DWT 周期计数器测
 
 用法：
-    python python/resource_report.py --gen firmware/generated
-    python python/resource_report.py --gen firmware/generated --elf .../tinyml_app.elf
+    python service/resource_report.py --gen core/models/generated
+    python service/resource_report.py --gen core/models/generated --elf .../tinyml_app.elf
 """
 
 import argparse
@@ -19,7 +19,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-FW = os.path.join(ROOT, "firmware", "tinyml")
+FW = os.path.join(ROOT, "core")
 
 GR5513_FLASH = 512 * 1024
 GR5513_RAM_APP = 112 * 1024          # 128KB 减掉链接脚本前面 16KB 的系统栈
@@ -89,7 +89,7 @@ def _cnn_macs(n_ch, n_t):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gen", default="firmware/generated")
+    ap.add_argument("--gen", default="core/models/generated")
     ap.add_argument("--elf", help="链好的固件 .elf（有的话报整机体积）")
     ap.add_argument("--events-per-day", type=int, default=200)
     ap.add_argument("--event-bytes", type=int, default=16)

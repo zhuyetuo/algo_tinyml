@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FW = os.path.join(HERE, "..", "firmware", "tinyml")
+FW = os.path.join(HERE, "..", "core")
 IMU_TRAIN = os.path.expanduser(os.environ.get("IMU_TRAIN", "~/imu_train"))
 
 pytestmark = pytest.mark.skipif(

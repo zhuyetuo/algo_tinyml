@@ -1,5 +1,29 @@
 # algo_tinyml
 
+## 目录：两个入口，一份共用的核心
+
+| 目录 | 谁用 | 干什么 |
+| --- | --- | --- |
+| **`core/`** | **两边都用** | 板上真正跑的那份 C（tm_prep / tm_runtime / tm_forest / tm_post…）+ `core/models/` 里上板的模型导出 |
+| `service/` | PC | 端侧推理服务：把 `core/` 编成 .so，用 Python 调，给标注平台出结果 |
+| `board/` | 板子 | GR551x 工程：把同一份 `core/` 编进固件 |
+
+两个入口：
+
+```bash
+./serve.sh -d        # 起服务给平台测（PC）
+./board.sh build     # 交叉编译上板（要 SDK_ROOT）
+./board.sh size      # 只看占多少，不用 SDK
+```
+
+**`core/` 为什么不拆成两份**：拆了之后服务跑的就不是板上那份 C 了，而
+这个仓库全部的对照测试（逐位一致、golden vector、后处理 18 万窗口对答案）
+验的都是"两边是同一份"。各留一份的话迟早分家，而分家的表现是
+"平台上看着对、板上不对"——查不到。
+
+---
+
+
 宠物项圈‑微型机器学习，嵌入式端侧推理：把 IMU 行为识别模型量化成 int8，跑在项圈的
 蓝牙芯片 **GR5513BENDU**（Goodix GR551x，Cortex-M4F）上。
 
@@ -50,13 +74,13 @@ python/
   export_gbdt.py         **XGBoost → 板上的 C**（要 xgboost）
   rf_footprint.py        量 RF 搬过去占多少 flash（要 sklearn）
   verify_against_scipy.py  量端侧特征 vs scipy 版差多少、**判别翻了多少**（要 scipy）
-firmware/tinyml/         跟芯片无关的纯 C，PC 上也能编（tests/ 就是这么测的）
+core/         跟芯片无关的纯 C，PC 上也能编（tests/ 就是这么测的）
   tm_runtime.c/h         int8 推理（conv1d / maxpool / dense），无 malloc、无 float
   tm_window.c/h          环形缓冲 → 窗口 → 量化
   tm_forest.c/h          随机森林推理（照抄 sklearn 的概率平均，不是多数投票）
   tm_gbdt.c/h            XGBoost 推理（判决是 < 不是 <=；叶子相加；端上不做 softmax）
   tm_features.c/h        193 维手工特征（含基-2 FFT、Welch、时域统计）
-firmware/gr551x/         挂进 Goodix SDK 的工程（见它自己的 README）
+board/         挂进 Goodix SDK 的工程（见它自己的 README）
   tinyml_app/GCC/Makefile      交叉编译 + 报体积，SDK 用 SDK_ROOT 指过去不复制
   tinyml_app/Src/user/         上板自检（golden vector）、逐窗口判决 → 事件聚合
 tests/                   C ↔ Python 逐位对照（现场用 gcc 编）
@@ -82,11 +106,11 @@ tools/host_sim.c         在 PC 上跑板上那份 C，喂真实数据
 
 ## 在 Ubuntu 服务器上先看效果（不需要板子、不需要交叉编译器）
 
-跑的是 `firmware/tinyml/` 下**板上那份一模一样的 C**，编译选项也跟固件一致
+跑的是 `core/` 下**板上那份一模一样的 C**，编译选项也跟固件一致
 （`-ffp-contract=off`），所以**判决结果跟板上逐位相同**：
 
 ```bash
-python python/run_host_sim.py --gen firmware/generated \
+python service/run_host_sim.py --gen firmware/generated \
     --data ~/imu_train/data/processed_custom/test.npz
 ```
 
@@ -96,8 +120,8 @@ python python/run_host_sim.py --gen firmware/generated \
 资源报告（模型多大、固件多大、运行内存、能存几天）：
 
 ```bash
-python python/resource_report.py --gen firmware/generated \
-    --elf firmware/gr551x/tinyml_app/GCC/build/tinyml_app.elf
+python service/resource_report.py --gen firmware/generated \
+    --elf board/tinyml_app/GCC/build/tinyml_app.elf
 ```
 
 每一行都标了是实测还是估算——体积和内存可以照着用，耗时只能当数量级。
@@ -123,12 +147,12 @@ python python/train_torch.py \
     --channels 6 --window 64 --epochs 40 --out model.npz
 
 # 2. 量化 + 导出 C（只要 numpy）
-python python/quantize_and_export.py \
+python service/quantize_and_export.py \
     --model model.npz --out firmware/generated \
     --classes sleep,active,scratch
 
 # 3. 把这几个文件加进 GR551x 的工程
-#    firmware/tinyml/tm_runtime.c  tm_window.c
+#    core/tm_runtime.c  tm_window.c
 #    firmware/generated/tm_model.c tm_model.h tm_golden.h
 ```
 
@@ -215,7 +239,7 @@ for (int i = 0; i < TM_GOLDEN_N; i++) {
 - ~~没有真正链出 .bin~~ **链得出来，实测过**：用 `arm-none-eabi-gcc 13.2` 对着真
   SDK 链出了 `tinyml_app.bin`。基线（BLE 协议栈+最小应用）104KB flash / 22KB RAM，
   加上整条 tinyml 是 136KB / 25KB。细节和坑见
-  [firmware/gr551x/README.md](firmware/gr551x/README.md)。
+  [board/README.md](board/README.md)。
 - **没有 QMI8658B 的驱动。** 寄存器配置（量程、ODR、FIFO 水位）要对着手册写，
   写错了表现成"特征量纲不对、模型全错"，没凭印象写。
 - **没做性能优化。** 算子是最朴素的三重循环，没用 CMSIS-NN、没用 M4F 的 DSP 指令。
@@ -284,7 +308,7 @@ RF 路线的 golden vector 比的是概率的**位模式**（`%08x`），不是 
 ```
 imu_train/src/ml/features.py   scipy + float64    ← 平台在跑的，是基准
 tinyml/features.py             numpy + float32    ← 参考实现，逐行对着上面写
-firmware/tinyml/tm_features.c  C + float          ← 板上跑的
+core/tm_features.c  C + float          ← 板上跑的
 ```
 
 **参考实现 ↔ C 是逐位一致的**（除频谱熵——它用 `logf`，属于 libm，各实现不保证
