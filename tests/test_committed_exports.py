@@ -182,3 +182,74 @@ def test_other_generated_dirs_are_still_ignored():
     r = subprocess.run(["git", "check-ignore", "core/models/generated_demo/tm_model.h"],
                        cwd=ROOT, capture_output=True, text=True)
     assert r.returncode == 0, "core/models/generated_demo/ 没被挡住，演示导出会被扫进仓库"
+
+
+# ── 类别名不能退化成下标 ──────────────────────────────────────────────────
+
+
+def _export_rf_mod():
+    p = os.path.join(ROOT, "service", "export_rf.py")
+    spec = importlib.util.spec_from_file_location("_export_rf", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_class_names_fall_back_to_the_model_json(tmp_path):
+    """没给 --classes 时从模型旁边那份 .json 读，**不退化成 0..4**。
+
+    板上的 tm_post_cfg.c 是按名字找「抓挠」「甩身体」来配后处理的。
+    名字成了数字，一个都找不到 → 稳定版 v2 后处理静默地不生效，
+    退回老的逐窗口聚合。表现是「上板之后事件比平台多很多」，
+    而那会被当成模型的问题去查。
+    （真事：第一次导 RF 就是这样，check_export 抓出来的。）
+    """
+    m = _export_rf_mod()
+    pkl = tmp_path / "ml_rf.pkl"
+    pkl.write_bytes(b"x")
+    (tmp_path / "ml_rf.json").write_text(
+        json.dumps({"classes": ["活动", "睡觉", "抓挠", "未佩戴", "甩身体"]}),
+        encoding="utf-8")
+    assert m._resolve_class_names("", str(pkl)) == \
+        ["活动", "睡觉", "抓挠", "未佩戴", "甩身体"]
+
+
+def test_explicit_classes_win(tmp_path):
+    m = _export_rf_mod()
+    pkl = tmp_path / "ml_rf.pkl"
+    pkl.write_bytes(b"x")
+    (tmp_path / "ml_rf.json").write_text(
+        json.dumps({"classes": ["a", "b"]}), encoding="utf-8")
+    assert m._resolve_class_names(" x , y ", str(pkl)) == ["x", "y"]
+
+
+def test_no_classes_anywhere_is_an_error_not_a_guess(tmp_path):
+    """两样都没有就**报错**。猜出来的顺序错了不报错，
+    只会让概率安到别的类别上。"""
+    m = _export_rf_mod()
+    pkl = tmp_path / "ml_rf.pkl"
+    pkl.write_bytes(b"x")
+    with pytest.raises(SystemExit) as e:
+        m._resolve_class_names("", str(pkl))
+    assert "类别名" in str(e.value)
+
+
+def test_check_export_catches_index_class_names(tmp_path):
+    """check_export 要拦住"类别名是下标"这种导出。
+
+    这条是实战抓到的：第一次导 RF 没给 --classes，
+    导出里的名字是 ['0','1','2','3','4']。
+    """
+    d = tmp_path / "generated_idx"
+    d.mkdir()
+    (d / "tm_forest_c_model.h").write_text(
+        "#define TM_FC_N_TREES 20\n#define TM_FC_N_NODES 11810\n"
+        'static const char *const TM_FC_CLASS_NAMES[] = {"0", "1", "2", "3", "4"};\n',
+        encoding="utf-8")
+    (d / "tm_forest_c_model.c").write_text("x" * 90_000, encoding="utf-8")
+    (d / "tm_forest_c_golden.h").write_text("x", encoding="utf-8")
+    (d / "meta.json").write_text(json.dumps(
+        {"classes": ["活动", "睡觉", "抓挠", "未佩戴", "甩身体"],
+         "n_estimators": 20}), encoding="utf-8")
+    problems = _check_mod().check(str(d))
+    assert any("类别对不上" in p for p in problems), problems

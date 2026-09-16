@@ -52,6 +52,36 @@ def resolve_model(path):
         hint += f"\n  ~/imu_train/results/ 下现有：{', '.join(sorted(os.listdir(guess))[:5]) or '（空）'}"
     sys.exit(f"找不到模型文件：{p}{hint}")
 
+def _resolve_class_names(arg: str, model_path: str):
+    """类别名：命令行给了就用，没给就**从模型旁边那份 .json 读**。
+
+    不能退化成 0..4 的下标。板上的 tm_post_cfg.c 是按**名字**从
+    TM_FC_CLASS_NAMES 里找「抓挠」「甩身体」的——名字成了 "0".."4" 的话
+    一个都找不到，稳定版 v2 后处理直接不生效，退回老的逐窗口聚合。
+    固件会打一行错误日志，但没人盯日志的话，表现就是"上板之后事件比平台多很多"，
+    而那会被当成模型的问题去查。
+
+    两样都没有才报错——**不猜**。猜出来的类别顺序错了不报错，
+    只会让概率安到别的类别上。
+    """
+    names = [s.strip() for s in (arg or "").split(",") if s.strip()]
+    if names:
+        return names
+    import json as _json
+    jp = os.path.splitext(model_path)[0] + ".json"
+    if os.path.exists(jp):
+        with open(jp, encoding="utf-8") as f:
+            got = (_json.load(f) or {}).get("classes")
+        if got:
+            print(f"类别名取自 {os.path.basename(jp)}：{list(got)}")
+            return list(got)
+    sys.exit(
+        f"拿不到类别名。{jp} 不存在或者里面没有 classes。\n"
+        "  用 --classes 活动,睡觉,抓挠,未佩戴,甩身体 显式给。\n"
+        "  **不退化成 0..4 的下标**：板上按名字找「抓挠」「甩身体」来配后处理，\n"
+        "  名字是数字的话一个都找不到，稳定版 v2 后处理会静默地不生效。")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -81,9 +111,10 @@ def main():
     except ImportError:
         sys.exit("没装 joblib/sklearn。这个脚本要在训练机上跑。")
 
-    bundle = joblib.load(resolve_model(args.model))
+    mpath = resolve_model(args.model)
+    bundle = joblib.load(mpath)
     model = bundle.get("model", bundle) if isinstance(bundle, dict) else bundle
-    names = [s for s in args.classes.split(",") if s] or None
+    names = _resolve_class_names(args.classes, mpath)
     forest = from_sklearn(model, class_names=names)
 
     fb = flash_bytes(forest)
