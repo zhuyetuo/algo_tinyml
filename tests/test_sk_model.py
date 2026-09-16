@@ -221,19 +221,36 @@ def test_sk_kind_is_not_guessed_from_the_tag(tmp_path, edge_service):
 # ── 仓库里那份清单 ────────────────────────────────────────────────────────
 
 
-def test_repo_config_marks_the_experimental_model_optional():
-    """acc_only_rf 是实验模型，没训的机器上不该起不来服务。"""
+def test_repo_config_has_no_sklearn_models():
+    """**这个服务是「板上那份 C」，别往里挂纯 sklearn 的模型。**
+
+    挂进来的话，平台「端侧模型」那一组里会混进一个根本不是板子会跑的东西——
+    而它在界面上跟真正的板上模型长得一模一样。只跑服务器 sklearn 的模型
+    挂到 imu_train/label_service 的 LABEL_MODELS 里，平台上会出现在
+    「服务端模型」那一组。
+
+    kind: sk 这条路代码还在（上面那些测试都在跑），将来真需要在这里挂
+    sklearn 时可以用；这条钉的是**仓库里这份清单**不该有。
+    """
+    p = os.path.join(os.path.dirname(__file__), "..", "edge_models.json")
+    with open(p, encoding="utf-8") as f:
+        cfg = json.load(f)
+    sk = [m["tag"] for m in cfg["models"]
+          if isinstance(m, dict) and m.get("kind") == "sk"]
+    assert not sk, f"这些是纯 sklearn 的，不该挂在端侧服务上：{sk}"
+
+def test_board_models_are_not_optional():
+    """正式模型**不能**是 optional：路径写错时必须当场报错。
+
+    跳过的话服务照常起来只是少了一个模型，平台上那个版本"不存在"，
+    而没有任何人会注意到。
+    """
     p = os.path.join(os.path.dirname(__file__), "..", "edge_models.json")
     with open(p, encoding="utf-8") as f:
         cfg = json.load(f)
     by = {m["tag"]: m for m in cfg["models"] if isinstance(m, dict) and "tag" in m}
-    for tag in ("acc_only_rf", "acc3_rf"):
-        assert tag in by, f"edge_models.json 里没有 {tag}"
-        assert by[tag].get("optional") is True
-        assert by[tag].get("kind") == "sk", \
-            f"{tag} 不写 kind 会被 tag 里的 rf 猜成 C 那条路线"
-    # 正式模型**不能**是 optional：路径写错时必须当场报错
     for tag in ("edge_cnn_i8", "edge_rf_d10"):
+        assert tag in by
         assert not by[tag].get("optional"), f"{tag} 是正式模型，不该标 optional"
 
 

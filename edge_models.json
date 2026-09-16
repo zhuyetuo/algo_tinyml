@@ -19,14 +19,12 @@
     "候选，不会替你挑一个。挑错了不报错，只会让平台上的结果对应到另一份模型。",
     "相对路径相对于本文件所在目录。",
     "",
-    "  kind  cnn / rf / sk。不写就按 tag 里含不含 rf 猜（老规矩）。",
+    "  kind  cnn / rf。不写就按 tag 里含不含 rf 猜（老规矩）。",
     "        cnn / rf 跑的是**板上那份 C**（导出目录里的 .c）；",
-    "        sk 跑的是**服务器上的 sklearn**（imu_train 的 ml_*.pkl），",
-    "        用来在导出成 C 之前先看看一个模型的效果值不值得导。",
-    "        sk 的 gen 指到 .pkl 文件本身，不是目录；kind 必须显式写 sk",
-    "        （标签里带 rf 的会被猜成 C 那条路线）。",
     "  optional  true = 文件不在就跳过这个模型，服务照起（会在日志里吵一句）。",
     "        只给还没训出来的实验模型用。正式模型别加——路径写错时必须当场报错。",
+    "**只跑服务器 sklearn 的模型不挂这里。** 这个服务是「板上那份 C」，挂个 sklearn 进来会让平台上那一组里混进一个不是板子会跑的东西。",
+    "那种模型挂到 imu_train/label_service 的 LABEL_MODELS 里，平台上会出现在「服务端模型」那一组。kind: sk 这条路代码还在（有测试），将来真需要在这里挂 sklearn 时可以用。",
     "",
     "列表里第一个是默认模型（平台不指定 model 时用它）。"
   ],
@@ -47,34 +45,6 @@
       "meta": [
         "core/models/edge_rf_d10/meta.json",
         "~/imu_train/results_edge_rf/*/16hz_remap_custom_3class/rf/ml_rf.json"
-      ]
-    },
-    {
-      "tag": "acc_only_rf",
-      "kind": "sk",
-      "optional": true,
-      "_说明": "只用加速计（陀螺仪置零）训的 RF，跑服务器上的 sklearn。训法见 imu_train/acc_only/README.md。还没训的话这一项会被跳过。",
-      "gen": [
-        "models/acc_only_rf/ml_rf.pkl",
-        "~/imu_train/results_acc_only/*_acc_only/16hz_remap_custom_3class/rf/ml_rf.pkl"
-      ],
-      "meta": [
-        "models/acc_only_rf/ml_rf.json",
-        "~/imu_train/results_acc_only/*_acc_only/16hz_remap_custom_3class/rf/ml_rf.json"
-      ]
-    },
-    {
-      "tag": "acc3_rf",
-      "kind": "sk",
-      "optional": true,
-      "_说明": "只有加速计的版本：acc 三轴 + 由它派生的 pitch/roll，5 通道 113 维。推理链照常算 193 维，按 ml_rf.json 里的 feature_select 取 113 列。训法见 imu_train/acc3/README.md。",
-      "gen": [
-        "models/acc3_rf/ml_rf.pkl",
-        "~/imu_train/results_acc3/*_acc3/16hz_remap_custom_3class/rf/ml_rf.pkl"
-      ],
-      "meta": [
-        "models/acc3_rf/ml_rf.json",
-        "~/imu_train/results_acc3/*_acc3/16hz_remap_custom_3class/rf/ml_rf.json"
       ]
     }
   ]
