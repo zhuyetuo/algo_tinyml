@@ -1,6 +1,6 @@
 #include "tm_post.h"
 
-#include <math.h>
+#include <stdint.h>
 #include <string.h>
 
 /* 跟 Python 那份的 eps 一样：log(max(1e-6, p))。
@@ -8,6 +8,44 @@
  * 也就是"再不可能也不会比这更不可能"。两边必须用同一个值，否则
  * 一个极端窗口就能让路径分叉。 */
 #define TM_POST_EPS 1e-6f
+
+
+/* ── 自己算 log，不用 libm ─────────────────────────────────────────────
+ *
+ * 为什么不用 logf()：**它在两个平台上不是同一份实现**。板上是 newlib，
+ * PC 上（服务的 @board 模式、所有对照测试）是 glibc，末位可能不一样。
+ * 而这个值是 viterbi 的发射项，末位不同就可能在某个接近的地方把路径翻过去。
+ *
+ * 那点差别多半永远碰不上——但"多半"没法验证，而这里有更省事的办法：
+ * 只用 IEEE-754 的浮点加减乘除。那些在两个平台上是**逐位确定**的
+ * （配合 -ffp-contract=off 禁掉 FMA 合并），于是两边算出来一模一样，
+ * 不是"应该一样"，是同一个函数同一套运算。
+ *
+ * 做法是标准的：x = m·2^e，m∈[1,2)；log(x) = e·ln2 + log(m)。
+ * 把 m 规到 [√½, √2) 之后用 atanh 级数，s=(m-1)/(m+1)，|s|≤0.1716，
+ * 截到 s⁹ 项的截断误差约 s¹¹/11 ≈ 2e-10，远在 float 精度之下。
+ */
+static float tm_log(float x)
+{
+    union { float f; uint32_t u; } v;
+    v.f = x;
+    int e = (int)((v.u >> 23) & 0xFFu) - 127;
+    /* 尾数拼回 [1,2) */
+    v.u = (v.u & 0x007FFFFFu) | 0x3F800000u;
+    float m = v.f;
+    if (m > 1.41421356f) { m *= 0.5f; e += 1; }
+
+    const float s = (m - 1.0f) / (m + 1.0f);
+    const float s2 = s * s;
+    /* 2s·(1 + s²/3 + s⁴/5 + s⁶/7 + s⁸/9) */
+    const float poly = 1.0f + s2 * (0.333333343f + s2 * (0.200000003f
+                     + s2 * (0.142857149f + s2 * 0.111111112f)));
+    /* ln2 拆成高低两半：e 最大到 ±127，单精度一次乘会把低位丢光 */
+    const float LN2_HI = 0.693145752f;      /* 前 12 位尾数，末尾是 0 */
+    const float LN2_LO = 1.42860677e-06f;   /* 剩下的部分 */
+    const float ef = (float)e;
+    return ef * LN2_HI + (2.0f * s * poly + ef * LN2_LO);
+}
 
 void tm_post_cfg_default(tm_post_cfg_t *cfg, int n_classes,
                          int scratch_class, int shake_class,
@@ -493,7 +531,7 @@ int tm_post_on_window(tm_post_t *st, const float *probs, uint32_t t_ms,
     float emit[TM_POST_MAX_CLASSES];
     for (int c = 0; c < m; ++c) {
         const float p = probs[c] > TM_POST_EPS ? probs[c] : TM_POST_EPS;
-        emit[c] = logf(p);
+        emit[c] = tm_log(p);
     }
     if (!st->started) {
         memcpy(st->score, emit, sizeof(float) * (size_t)m);

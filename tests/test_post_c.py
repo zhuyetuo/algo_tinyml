@@ -649,3 +649,87 @@ def test_eps_clamp_matches_the_service(lib):
         mine = sorted([(s["cls"], s["start"], s["end"], s["n"]) for s in got],
                       key=lambda x: (x[1], x[0]))
         assert mine == _py_segs_flat(py, t0), f"switch={sw} 时片段分家了"
+
+
+# ── 自己算的 log：不依赖 libm ──────────────────────────────────────────────
+
+
+def test_tm_log_has_no_libm_dependency():
+    """tm_post.c 不能 include <math.h>。
+
+    logf() **在两个平台上不是同一份实现**：板上是 newlib，PC 上是 glibc，
+    末位可能不一样。而它是 viterbi 的发射项，末位不同就可能在某个接近的
+    地方把路径翻过去。
+
+    那点差别多半永远碰不上——但"多半"没法验证（这台机器上没有 ARM 模拟器，
+    量不了 newlib 的 logf）。所以不去量，直接把依赖拿掉：只用 IEEE-754 的
+    加减乘除，两边构造上就一致。
+    """
+    import re
+    with open(os.path.join(FW, "tm_post.c"), encoding="utf-8") as f:
+        raw = f.read()
+    # **先去掉注释再扫**：注释里正写着"为什么不用 logf()"，
+    # 全文搜关键词会把那句解释当成在用它。
+    # （这个跟头我在别处已经栽过一次了——一条扫错东西的检查比没有更糟，
+    #   因为它给了"查过了"的错觉。）
+    src = re.sub(r"/\*.*?\*/", "", raw, flags=re.S)
+    src = re.sub(r"//[^\n]*", "", src)
+    assert "<math.h>" not in src, "又把 math.h 引回来了，两个平台的 libm 会分家"
+    assert "logf(" not in src, "还在用 libm 的 logf"
+    assert "tm_log(" in src
+    # 注释里那句解释要留着——不然下一个人不知道为什么不能用 logf
+    assert "newlib" in raw and "glibc" in raw, "把为什么不用 libm 的说明删了"
+
+
+def test_tm_log_is_accurate_enough(lib):
+    """自己算的 log 要足够准。
+
+    "够准"的标准不是"跟 glibc 逐位相同"——那不可能，也没必要。
+    标准是**解码结果不变**，这条由 test_agreement_at_scale 保证
+    （18 万窗口对 Python 的 math.log，窗口级和片段级都是 100%）。
+    这里只挡住"精度掉到离谱"的改动：相对误差 1e-6 以内。
+    """
+    import ctypes
+    import subprocess
+    import tempfile
+
+    d = tempfile.mkdtemp()
+    probe = os.path.join(d, "probe.c")
+    with open(os.path.join(FW, "tm_post.c"), encoding="utf-8") as f:
+        src = f.read()
+    # 把 static 去掉好从外面调
+    src = src.replace("static float tm_log(", "float tm_log_probe(")
+    src = src.replace("emit[c] = tm_log(p);", "emit[c] = tm_log_probe(p);")
+    with open(probe, "w", encoding="utf-8") as f:
+        f.write(src)
+    so = os.path.join(d, "p.so")
+    r = subprocess.run(
+        ["gcc", "-O2", "-std=c99", "-ffp-contract=off", "-fno-math-errno",
+         "-fPIC", "-shared", f"-I{FW}", probe, "-o", so],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    m = ctypes.CDLL(so)
+    m.tm_log_probe.restype = ctypes.c_float
+    m.tm_log_probe.argtypes = [ctypes.c_float]
+
+    # 概率的有效范围：eps(1e-6) 到 1
+    xs = np.concatenate([
+        np.logspace(-6, 0, 20000).astype(np.float32),
+        np.linspace(1e-6, 1.0, 20000).astype(np.float32)])
+    got = np.array([m.tm_log_probe(float(x)) for x in xs])
+    want = np.log(xs.astype(np.float64))
+    err = np.abs(got - want)
+    # log(1) = 0，那里算相对误差是 0/0 = NaN。所以分两段看：
+    # |log| 大的地方看相对误差，接近 0 的地方看绝对误差。
+    # （第一版直接除，最大误差算出来是 nan——nan < 1e-6 是 False，
+    #   测试挂了才发现。挂了是好事：要是写成 nan 比较恒真，
+    #   这条就成了永远绿的摆设。）
+    big = np.abs(want) > 1e-3
+    rel = err[big] / np.abs(want[big])
+    assert rel.max() < 1e-6, f"最大相对误差 {rel.max():.3e}，太大了"
+    assert err[~big].max() < 1e-6, f"接近 log(1) 处绝对误差 {err[~big].max():.3e}"
+    # 单调性：log 是单调的，实现里的分段规约写错会在边界破掉，
+    # 而破了之后 viterbi 会在那附近做出莫名其妙的选择
+    srt = np.sort(xs)
+    vals = np.array([m.tm_log_probe(float(x)) for x in srt])
+    assert np.all(np.diff(vals) >= -1e-7), "不单调了，分段规约的边界写错了"
