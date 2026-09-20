@@ -42,19 +42,32 @@ case "${1:-}" in
         cd board/tinyml_app/GCC && make SDK_ROOT="$SDK_ROOT" GEN_DIR="$GEN"
         ;;
     size)
-        # 不需要 SDK：只编我们自己这几个文件，看代码段多大
+        # 不需要 SDK：只编我们自己这几个文件，看 flash 和 RAM 各占多少。
+        #
+        # **模型那几个 .c 也编**（$GEN/*.c）。原来只编 core/ 下的运行时，打出来
+        # 七八 KB，看着像"整条 tinyml 很小"——而模型本身是 79~110 KB，占绝大头。
+        # 少算最大的那一块，这个命令就是在误导人做 flash 预算。
         need_model
         command -v arm-none-eabi-gcc >/dev/null || { echo "没有 arm-none-eabi-gcc"; exit 1; }
         tmp=$(mktemp -d)
+        # TM_FEAT_MAX_T：特征缓冲按窗口长度开。不给的话按默认上限 64 编，
+        # bss 4.5KB；按真实窗口（16）编是 2.5KB。固件也该这么给
+        win=$(python3 -c "import json,sys; print(json.load(open('$GEN/meta.json')).get('window_size') or 64)" 2>/dev/null || echo 64)
         for f in core/tm_runtime.c core/tm_prep.c core/tm_post.c core/tm_post_cfg.c \
-                 core/tm_features.c core/tm_forest_c.c; do
+                 core/tm_features.c core/tm_forest_c.c "$GEN"/*.c; do
             [ -f "$f" ] || continue
             arm-none-eabi-gcc -c -Os -std=c99 -mcpu=cortex-m4 -mthumb \
                 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -ffp-contract=off -fno-math-errno \
-                -ffunction-sections -fdata-sections -Icore -I"$GEN" \
+                -ffunction-sections -fdata-sections -DTM_FEAT_MAX_T="$win" \
+                -Icore -I"$GEN" \
                 "$f" -o "$tmp/$(basename "$f" .c).o" 2>/dev/null || echo "  (跳过 $f)"
         done
+        echo "▶ $MODEL（窗口 $win 点，-Os，Cortex-M4F）"
         arm-none-eabi-size "$tmp"/*.o
+        arm-none-eabi-size -t "$tmp"/*.o | tail -1 | awk '{
+            printf "\n合计：flash(text) %d B = %.1f KB    RAM(bss) %d B = %.1f KB\n", $1, $1/1024, $3, $3/1024
+            print  "      模型是 const，落在 flash 里、CPU 直接读，不占 RAM（见 docs/ram_and_cache.md）"
+        }'
         rm -rf "$tmp"
         ;;
     release)

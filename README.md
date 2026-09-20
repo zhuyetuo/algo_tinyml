@@ -80,6 +80,8 @@ core/         跟芯片无关的纯 C，PC 上也能编（tests/ 就是这么测
   tm_forest.c/h          随机森林推理（照抄 sklearn 的概率平均，不是多数投票）
   tm_gbdt.c/h            XGBoost 推理（判决是 < 不是 <=；叶子相加；端上不做 softmax）
   tm_features.c/h        193 维手工特征（含基-2 FFT、Welch、时域统计）
+  models/edge_rf_d10/    上板的随机森林：权重导出成 C（flash 109.9 KB，见「上板占用」）
+  models/edge_cnn_i8/    上板的 int8 CNN：同上（flash 79.0 KB）
 board/         挂进 Goodix SDK 的工程（见它自己的 README）
   tinyml_app/GCC/Makefile      交叉编译 + 报体积，SDK 用 SDK_ROOT 指过去不复制
   tinyml_app/Src/user/         上板自检（golden vector）、逐窗口判决 → 事件聚合
@@ -230,12 +232,56 @@ for (int i = 0; i < TM_GOLDEN_N; i++) {
 
 ---
 
+## 上板占用：模型多大、flash / RAM 各吃多少
+
+两份模型**已经导出成 C 提交在 `core/models/` 里**（权重写死在数组里，跟代码一起编进
+固件，没有单独的 bin 要烧）。下面的数是 `arm-none-eabi-gcc -Os`、Cortex-M4F、
+按真实窗口长度（16 点）编出来实测的：
+
+| | edge_rf_d10 | edge_cnn_i8 |
+|---|---|---|
+| 模型本身 flash | **109.9 KB** | **79.0 KB** |
+| 加上运行时（特征/推理/后处理） | 117.6 KB | 86.6 KB |
+| 运行内存 RAM | 2.5 KB | 2.5 KB |
+| 连 BLE 协议栈 + 应用（基线 104 KB / 22 KB） | 约 222 KB / 25 KB | 约 191 KB / 25 KB |
+
+GR5513 是 512 KB flash、应用可用 112 KB RAM，两份都留得下 OTA 的余量。
+
+自己复核一遍（不需要 SDK，只要交叉编译器）：
+
+```bash
+./board.sh size rf     # 或 cnn
+```
+
+### 三个容易搞错的地方
+
+**模型不占运行内存。** 权重是 `const`，链接后落在 flash 里，而 GR5513 的 flash 是
+内存映射的（从 `0x01002000` 起），CPU 直接读、不用先搬进 RAM。所以 **110 KB 的模型
+占 0 字节 RAM**，RAM 用量跟模型大小无关。细节见 [docs/ram_and_cache.md](docs/ram_and_cache.md)。
+
+**那 2.5 KB 要靠编译时给对窗口长度。** `tm_features.c` 的临时缓冲按 `TM_FEAT_MAX_T`
+开，不给的话按默认上限 64 编，bss 是 4.5 KB——**白占四分之三**。固件里按实际窗口
+（16）给这个宏。`./board.sh size` 已经从 `meta.json` 里读窗口长度自动带上。
+
+**仓库里那两个 `.c` 文件是 336 KB 和 425 KB，那是源码文本**（每个数字带逗号空格），
+不是烧进去的大小。编译后才是上面那两个数。
+
+### 为什么 CNN 更宽裕
+
+RF 比 CNN 大 40%，而且树遍历是**随机访存**——每个节点往哪走取决于上一个节点的
+比较结果，硬件预取帮不上忙，而 GR5513 只有 8 KB cache。CNN 的权重是流式读的，
+cache 和预取都用得上。两者的取舍见 [docs/dl_edge.md](docs/dl_edge.md) 和
+[docs/rf_size.md](docs/rf_size.md)。
+
+---
+
 ## 现在还没有的
 
 说清楚边界，免得看目录以为已经齐了：
 
-- **没有真实模型。** 测试跑的是随机权重——工具链是验过的，模型还没训。要
-  `imu_train` 那边先定下端侧用哪几类、窗口多长。
+- ~~没有真实模型~~ **有了**：`core/models/edge_rf_d10`（随机森林，5 分类 16Hz）和
+  `core/models/edge_cnn_i8`（int8 CNN）都已导出提交，体积见上一节。测试里仍然跑
+  随机权重——那是为了让工具链不依赖某一份模型，两回事。
 - ~~没有真正链出 .bin~~ **链得出来，实测过**：用 `arm-none-eabi-gcc 13.2` 对着真
   SDK 链出了 `tinyml_app.bin`。基线（BLE 协议栈+最小应用）104KB flash / 22KB RAM，
   加上整条 tinyml 是 136KB / 25KB。细节和坑见
@@ -293,7 +339,7 @@ for (int i = 0; i < TM_GOLDEN_N; i++) {
 
 | | int8 CNN | 随机森林 |
 |---|---|---|
-| 模型体积 | ~1KB | 要量（`rf_footprint.py` / `export_rf.py` 都会打印） |
+| 模型体积（实测，见上面「上板占用」） | **79.0 KB** | **109.9 KB** |
 | 前处理 | 只要窗口 + 量化 | 193 维手工特征（含 FFT/Welch），已实现 |
 | 算术 | 定点，板上跟 PC **逐位相同** | float32，逐位相同要靠 `-ffp-contract=off`，已验证 |
 | 跟平台一致 | 两个模型、两套表现 | **同一个模型、同一套结论** |
