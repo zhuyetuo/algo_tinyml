@@ -137,14 +137,25 @@ def load_postprocess():
     return _LS["mods"]
 
 
+def _mtime(p):
+    try:
+        return os.path.getmtime(p)
+    except OSError:
+        return None
+
+
 class EdgeRunner:
     """一个端侧模型 + 一套推理参数。"""
 
-    def __init__(self, tag, engine, meta, imu_train, resample="poly", kind="cnn"):
+    def __init__(self, tag, engine, meta, imu_train, resample="poly", kind="cnn",
+                 gen=None, meta_path=None):
         self.tag = tag
         self.engine = engine
         self.meta = meta
         self.kind = kind
+        # reload 时判断"这个模型有没有变"：导出目录同一个、meta 文件没改过就不重编
+        self.gen = gen
+        self.meta_mtime = _mtime(meta_path) if meta_path else None
         # 两条路线的包装不同，但对 infer_file 来说都是一个有 predict_proba
         # 的对象——这正是复用整条预处理链的前提
         if kind == "sk":
@@ -165,6 +176,15 @@ class EdgeRunner:
         self.stride = int(meta.get("stride") or max(self.window_size // 2, 1))
         self.gravity_aligned = bool(meta.get("gravity_aligned", True))
         self.label_mode = str(meta.get("label_mode") or "majority")
+        # 喂几个通道给预处理链。**不能让 infer_file 用它默认的 8**：3 轴模型是
+        # 5 通道（acc3 + pitch/roll），按 8 切出来的窗口进 C 会被形状检查拦住——
+        # 那还算好的；对 sklearn 那条是直接算出另一套特征。
+        # meta 里有 n_channels 就听 meta 的，没有就问 C（tm_feat_cfg 里编死了）
+        self.n_channels = int(meta.get("n_channels") or getattr(engine, "n_ch", 0) or 8)
+        # 训练记录里导出来的模型带这个（任务号、数据集、轴数、端侧 F1），
+        # 平台拿它对回「训练记录 #N」
+        self.train = meta.get("train")
+        self.edge_metrics = meta.get("edge")
         self.resample = resample
         # infer_file 里有全局状态（打印、递归），而且我们这边 C 有静态缓冲，
         # 并发进来会互相踩。端上本来就是单线程，这里串行没有损失
@@ -199,6 +219,7 @@ class EdgeRunner:
                         keep_isolated=(min_windows <= 1),
                         label_mode=self.label_mode, resample_method=self.resample,
                         target_labels=targets, is_dl=self.is_dl,
+                        n_channels=self.n_channels,
                     )
             except Exception:
                 sys.stdout.write(noise.getvalue())
@@ -339,6 +360,40 @@ class Handler(BaseHTTPRequestHandler):
             raise FileNotFoundError(f"找不到 {p}（NAS 根 ={root}）")
         return p
 
+    # 起服务时的参数，reload 要用（clsattr：BaseHTTPRequestHandler 每个请求
+    # 都是新实例，状态只能挂在类上）
+    boot = {}
+    reload_lock = threading.Lock()
+
+    @classmethod
+    def reload(cls):
+        b = cls.boot
+        if not b.get("models"):
+            return {"ok": False, "error": "服务不是用 --models 起的，没有清单可重读"}
+        with cls.reload_lock:
+            specs = load_models_config(b["models"], local=b.get("local"))
+            runners, errors = {}, []
+            for spec in specs:
+                tag = spec["tag"]
+                if tag in cls.runners and cls.runners[tag].gen == spec["gen"] \
+                        and cls.runners[tag].meta_mtime == _mtime(spec["meta"]):
+                    runners[tag] = cls.runners[tag]     # 没变的不重编
+                    continue
+                try:
+                    runners[tag] = build_runner(spec, b["imu_train"], b["resample"],
+                                                quiet=True)
+                except SystemExit as e:
+                    errors.append(f"{tag}: {e}")
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"{tag}: {type(e).__name__}: {e}")
+            if not runners:
+                return {"ok": False, "error": "一个模型都挂不上", "errors": errors}
+            cls.runners = runners
+            cls.default_tag = specs[0]["tag"] if specs[0]["tag"] in runners else next(iter(runners))
+            print(f"[reload] 模型：{', '.join(runners)}" + (f"；失败：{errors}" if errors else ""))
+            return {"ok": True, "models": list(runners), "default": cls.default_tag,
+                    "errors": errors}
+
     def _runner(self, tag):
         tag = tag or self.default_tag
         if tag not in self.runners:
@@ -351,7 +406,10 @@ class Handler(BaseHTTPRequestHandler):
         if u.path in ("/health", "/api/v1/label/health"):
             return self._send({"ok": True, "models": [
                 {"tag": t, "classes": r.classes, "window": r.window_size,
-                 "hz": r.model_hz, "stride": r.stride}
+                 "hz": r.model_hz, "stride": r.stride,
+                 "n_channels": r.n_channels, "kind": r.kind,
+                 # 训练记录导出来的才有；平台靠它把 edge:train6 对回「训练记录 #N」
+                 "train": r.train, "edge": r.edge_metrics}
                 for t, r in self.runners.items()]})
         self._send({"error": "no such path"}, 404)
 
@@ -363,6 +421,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             return self._send({"error": f"请求体不是合法 JSON：{e}"}, 400)
 
+        if u.path == "/api/v1/label/reload":
+            # 重新读模型清单（edge_models.json + edge_models.local.json），把新导出的
+            # 模型挂上、删掉的撤下。**不用重启服务**：平台上「导出到端侧」之后
+            # 要立刻能选到。编不过/自检不过的那一个跳过并报出来，别的照常
+            return self._send(self.reload())
         if u.path == "/api/v1/label/infer":
             return self._send(self._one(body))
         if u.path == "/api/v1/label/infer_batch":
@@ -442,7 +505,10 @@ def _pick_one(pattern, what):
     return hits[0]
 
 
-def load_models_config(path):
+LOCAL_MODELS_NAME = "edge_models.local.json"
+
+
+def load_models_config(path, local=None):
     """从配置文件读要挂哪些模型。
 
     **为什么要有这个文件**：后处理这套（稳定版 v2）是跟模型无关的模板——
@@ -470,6 +536,22 @@ def load_models_config(path):
     if not isinstance(items, list) or not items:
         sys.exit(f"{path} 里没有 models 列表")
     base = os.path.dirname(path)
+    # 训练记录里「导出到端侧」的模型登记在旁边的 edge_models.local.json
+    # （export_train.py 写的，不进仓库——serve.sh 起服务前会 git pull，
+    # 改了仓库里那份 edge_models.json 的话 --ff-only 会拉不动）。
+    # 那里面的条目**一律当 optional**：删了训练记录、目录没了，服务照起
+    local = local or os.path.join(base, LOCAL_MODELS_NAME)
+    if os.path.exists(local):
+        try:
+            with open(local, encoding="utf-8") as f:
+                extra = (json.load(f) or {}).get("models") or []
+        except (OSError, ValueError) as e:
+            print(f"⚠ {local} 读不了（{e}），跳过", file=sys.stderr)
+            extra = []
+        for m in extra:
+            if isinstance(m, dict):
+                # 训练记录导出的都是 RF；没写 kind 别按 tag 猜（train6 猜不出）
+                items = items + [{"kind": "rf", **m, "optional": True}]
 
     def resolve(v, what, optional=False):
         """v 可以是一个路径，也可以是**一串候选**（按顺序取第一个找得到的）。
@@ -538,6 +620,74 @@ def load_models_config(path):
     return out
 
 
+def build_runner(spec, imu_train, resample, quiet=False):
+    """按清单里的一条把模型编出来、过自检、包成 EdgeRunner。
+
+    自检没过用 SystemExit 抛出来（起服务时直接退出；reload 时接住、只跳过这一个）。
+    """
+    say = (lambda *a, **k: None) if quiet else print   # reload 时不往 stdout 刷一屏自检
+    tag, kind = spec["tag"], spec["kind"]
+    # 两条路线的元数据字段不同：CNN 要 ch_mean/ch_std（tm_prep 用），
+    # RF 不做归一化所以没有那两项。按路线读，别用同一套必填项
+    # sk 的 meta 就是 imu_train 的 ml_*.json，跟 C 那条 rf 路线同一份格式
+    meta = load_meta(spec["meta"], kind="rf" if kind == "sk" else kind)
+    if kind == "sk":
+        from tinyml import sk_model
+        # feature_select 是训练时存进 ml_*.json 的（acc3 那条路会存）。
+        # 没有就是老的 8 通道模型，整 193 维全用
+        eng = sk_model.load(spec["gen"], meta["classes"],
+                            feature_select=meta.get("feature_select"))
+        n_feat = eng.n_features
+        ch = meta.get("n_channels")
+        sel = f"（从 {eng.select_from} 维里取 {len(eng.select)} 列）" if eng.select is not None else ""
+        say(f"  {tag:<16} [sklearn] {len(meta['classes'])} 类，"
+              f"{n_feat if n_feat is not None else '?'} 维特征{sel}"
+              f"{f'，{ch} 通道' if ch else ''}"
+              f"（在 Python 里算，**不是板上那份 C**）")
+        # 这条路线**没有 golden vector 可验**，而前面两条都有。
+        # 不说的话，启动日志里它跟验过的模型长得一样
+        say(f"    {'逐位自检':<18} — 这条跑的是服务器上的 sklearn，"
+              "没有 C 可对，导出成 C 之后才谈得上逐位一致")
+    elif kind == "rf":
+        eng = serve.RfEngine(serve.build_rf(spec["gen"]))
+        say(f"  {tag:<16} [RF] {eng.n_ch}×{eng.n_t}，{eng.n_classes} 类，"
+              f"{eng.n_features} 维特征（在 C 里算）")
+        fatal = False
+        for name, n, bad in eng.selftest():
+            if bad == -2:
+                # **没有 golden 不算通过。** 导出时忘了给 --features/--windows
+                # 就是这个结果，而"0 条全部通过"是这类自检最经典的失效方式
+                say(f"    {name:<18} ⚠ 没导 golden vector，验不了。"
+                      f"重新 export_rf.py 时带上 --features / --windows")
+            elif bad == -1:
+                say(f"    {name:<18} ✗ 推理直接失败了")
+                fatal = True
+            elif bad == 0:
+                say(f"    {name:<18} ✓ {n} 条逐位一致")
+            else:
+                say(f"    {name:<18} ✗ {bad} 个值对不上（共 {n} 条）")
+                fatal = True
+        if fatal:
+            sys.exit(
+                "RF 的 golden vector 自检没过。**先别怀疑模型**，按这个顺序查：\n"
+                "  ①编译选项漏了 -ffp-contract=off，或者别处塞了 -ffast-math；\n"
+                "  ②导出的 tm_forest_model.c 跟验过的不是同一份；\n"
+                "  ③导出时的窗口长度/通道数跟训练时不一致。")
+    else:
+        eng = serve.Engine(serve.build(spec["gen"]))
+        bad = eng.selftest()
+        flag = "✓ 逐位一致" if bad == 0 else f"✗ {bad} 字节对不上"
+        say(f"  {tag:<16} [CNN] {eng.n_ch}×{eng.n_t}，{eng.n_classes} 类，"
+              f"golden {eng.golden_n} 条 {flag}")
+        if bad:
+            sys.exit("golden vector 自检没过，导出和运行时不配套，"
+                     "不要用这个服务的结果。")
+    return EdgeRunner(tag, eng, meta, imu_train, resample, kind=kind,
+                      gen=spec["gen"], meta_path=spec["meta"])
+
+
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", metavar="JSON",
@@ -593,69 +743,14 @@ def main():
                  for t in sorted(gens)]
 
     for spec in specs:
-        tag, kind = spec["tag"], spec["kind"]
-        # 两条路线的元数据字段不同：CNN 要 ch_mean/ch_std（tm_prep 用），
-        # RF 不做归一化所以没有那两项。按路线读，别用同一套必填项
-        # sk 的 meta 就是 imu_train 的 ml_*.json，跟 C 那条 rf 路线同一份格式
-        meta = load_meta(spec["meta"], kind="rf" if kind == "sk" else kind)
-        if kind == "sk":
-            from tinyml import sk_model
-            # feature_select 是训练时存进 ml_*.json 的（acc3 那条路会存）。
-            # 没有就是老的 8 通道模型，整 193 维全用
-            eng = sk_model.load(spec["gen"], meta["classes"],
-                                feature_select=meta.get("feature_select"))
-            n_feat = eng.n_features
-            ch = meta.get("n_channels")
-            sel = f"（从 {eng.select_from} 维里取 {len(eng.select)} 列）" if eng.select is not None else ""
-            print(f"  {tag:<16} [sklearn] {len(meta['classes'])} 类，"
-                  f"{n_feat if n_feat is not None else '?'} 维特征{sel}"
-                  f"{f'，{ch} 通道' if ch else ''}"
-                  f"（在 Python 里算，**不是板上那份 C**）")
-            # 这条路线**没有 golden vector 可验**，而前面两条都有。
-            # 不说的话，启动日志里它跟验过的模型长得一样
-            print(f"    {'逐位自检':<18} — 这条跑的是服务器上的 sklearn，"
-                  "没有 C 可对，导出成 C 之后才谈得上逐位一致")
-        elif kind == "rf":
-            eng = serve.RfEngine(serve.build_rf(spec["gen"]))
-            print(f"  {tag:<16} [RF] {eng.n_ch}×{eng.n_t}，{eng.n_classes} 类，"
-                  f"{eng.n_features} 维特征（在 C 里算）")
-            fatal = False
-            for name, n, bad in eng.selftest():
-                if bad == -2:
-                    # **没有 golden 不算通过。** 导出时忘了给 --features/--windows
-                    # 就是这个结果，而"0 条全部通过"是这类自检最经典的失效方式
-                    print(f"    {name:<18} ⚠ 没导 golden vector，验不了。"
-                          f"重新 export_rf.py 时带上 --features / --windows")
-                elif bad == -1:
-                    print(f"    {name:<18} ✗ 推理直接失败了")
-                    fatal = True
-                elif bad == 0:
-                    print(f"    {name:<18} ✓ {n} 条逐位一致")
-                else:
-                    print(f"    {name:<18} ✗ {bad} 个值对不上（共 {n} 条）")
-                    fatal = True
-            if fatal:
-                sys.exit(
-                    "RF 的 golden vector 自检没过。**先别怀疑模型**，按这个顺序查：\n"
-                    "  ①编译选项漏了 -ffp-contract=off，或者别处塞了 -ffast-math；\n"
-                    "  ②导出的 tm_forest_model.c 跟验过的不是同一份；\n"
-                    "  ③导出时的窗口长度/通道数跟训练时不一致。")
-        else:
-            eng = serve.Engine(serve.build(spec["gen"]))
-            bad = eng.selftest()
-            flag = "✓ 逐位一致" if bad == 0 else f"✗ {bad} 字节对不上"
-            print(f"  {tag:<16} [CNN] {eng.n_ch}×{eng.n_t}，{eng.n_classes} 类，"
-                  f"golden {eng.golden_n} 条 {flag}")
-            if bad:
-                sys.exit("golden vector 自检没过，导出和运行时不配套，"
-                         "不要用这个服务的结果。")
-        Handler.runners[tag] = EdgeRunner(tag, eng, meta, args.imu_train,
-                                          args.resample, kind=kind)
+        Handler.runners[spec["tag"]] = build_runner(spec, args.imu_train, args.resample)
 
     # 默认模型 = 清单里的第一个。配置文件里顺序是人写的，尊重它；
     # --gen 那条路是排序后的第一个（保持老行为不变）
     Handler.default_tag = specs[0]["tag"]
     Handler.nas_root = os.path.abspath(os.path.expanduser(args.nas_root))
+    Handler.boot = {"models": args.models, "imu_train": args.imu_train,
+                    "resample": args.resample}
 
     srv = serve.listen(args.host, args.port, Handler,
                        tries=1 if args.strict_port else 20)

@@ -271,11 +271,26 @@ def _corr(xi, xj):
     return F32(cov / F32(si * sj))
 
 
+def n_sensor(n_ch):
+    """总通道里有几个是**传感器**通道（其余两个是追加的姿态角 pitch/roll）。
+
+    传感器通道按三个一组：acc3 / acc3+gyro3。余 2 就是后面追加了 pitch/roll：
+    5 → 3（3 轴），8 → 6（6 轴）。6（老的纯 6 轴）→ 6。
+    跟 imu_train `features.n_sensor_channels` 必须一致——频域特征只对传感器
+    通道提，姿态角是慢变量，对它做 FFT 没意义。写死 min(6, n_ch) 的话，3 轴
+    的 5 通道会把 pitch/roll 也当振荡信号算了，维度跟训练那边对不上。
+    """
+    n = int(n_ch)
+    return n - 2 if n % 3 == 2 else n
+
+
 def extract_one(window, hz, nperseg=32):
     """window: [T, C] float32 → 特征向量 float32 [n_features]。
 
     拼接顺序必须跟 imu_train 的 `_extract_one` 一模一样：
-    时域(全部通道) → 频域(前 6 通道) → 全局 → acc/gyro 模长(时域+频域) → jerk 模长(时域)。
+    时域(全部通道) → 频域(传感器通道) → 全局 → acc/gyro 模长(时域+频域) → jerk 模长(时域)。
+    后三组只有 6 通道以上（有陀螺仪）才有；3 轴（5 通道 = acc3 + pitch/roll）
+    只有前两组，共 79 维。
     顺序错了不会报错，只会让每一维都对到别的特征上，而模型照样给得出结果。
     """
     w = np.asarray(window, F32)
@@ -287,7 +302,7 @@ def extract_one(window, hz, nperseg=32):
     feats = []
     for c in range(n_ch):
         feats.extend(time_stats(w[:, c]))
-    for c in range(min(6, n_ch)):
+    for c in range(min(n_sensor(n_ch), n_ch)):
         feats.extend(freq_stats(w[:, c], hz, nps, win, cos_t, sin_t))
 
     if n_ch >= 6:
@@ -310,8 +325,8 @@ def extract_one(window, hz, nperseg=32):
 
 
 def n_features(n_ch):
-    """维度。6 通道 171 维，8 通道 193 维。"""
-    n = N_TIME_FEATS * n_ch + N_FREQ_FEATS * min(6, n_ch)
+    """维度。5 通道（3 轴）79 维，6 通道 171 维，8 通道 193 维。"""
+    n = N_TIME_FEATS * n_ch + N_FREQ_FEATS * min(n_sensor(n_ch), n_ch)
     if n_ch >= 6:
         n += 8 + 2 * (N_TIME_FEATS + N_FREQ_FEATS) + N_TIME_FEATS
     return n
@@ -335,13 +350,17 @@ def feature_groups(n_ch=8):
     是为了改通道数时它自己跟着变——写死的表迟早跟代码分家，而分家之后
     "砍掉第 100 维"会砍到完全不相干的东西上。
     """
-    names = ["acc_x", "acc_y", "acc_z", "gyr_x", "gyr_y", "gyr_z", "pitch", "roll"]
+    ns = n_sensor(n_ch)
+    sensor_names = ["acc_x", "acc_y", "acc_z", "gyr_x", "gyr_y", "gyr_z"]
+    # 最后两个（如果有）永远是 pitch/roll：3 轴时按下标查表会把它们叫成 gyr_x/gyr_y
+    names = [sensor_names[c] if c < len(sensor_names) else f"ch{c}" for c in range(ns)]
+    names += ["pitch", "roll"][: max(0, n_ch - ns)]
     g, p = [], 0
     for c in range(n_ch):
         nm = names[c] if c < len(names) else f"ch{c}"
         g.append((f"{nm} 时域", p, p + N_TIME_FEATS, "time"))
         p += N_TIME_FEATS
-    for c in range(min(6, n_ch)):
+    for c in range(min(ns, n_ch)):
         nm = names[c] if c < len(names) else f"ch{c}"
         g.append((f"{nm} 频域", p, p + N_FREQ_FEATS, "freq"))
         p += N_FREQ_FEATS

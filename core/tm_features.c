@@ -298,9 +298,17 @@ void tm_bench_freq_stats(const tm_feat_cfg_t *c, const float *x, int n, float *o
 }
 #endif
 
+/* 传感器通道数：按三个一组（acc3 / acc3+gyro3），余 2 就是后面追加了
+ * pitch/roll。5 → 3（3 轴），8 → 6，6 → 6。频域特征只对传感器通道算——
+ * 姿态角是慢变量，跟 python/tinyml/features.py 的 n_sensor 一致。 */
+static int n_sensor_ch(int n_ch)
+{
+    return (n_ch % 3 == 2) ? n_ch - 2 : n_ch;
+}
+
 int tm_feat_dim(const tm_feat_cfg_t *cfg)
 {
-    int n = 11 * cfg->n_ch + 8 * (cfg->n_ch < 6 ? cfg->n_ch : 6);
+    int n = 11 * cfg->n_ch + 8 * n_sensor_ch(cfg->n_ch);
     if (cfg->n_ch >= 6) n += 8 + 2 * (11 + 8) + 11;
     return n;
 }
@@ -317,7 +325,7 @@ int tm_features(const tm_feat_cfg_t *cfg, const float *x, float *out)
         time_stats(x + (size_t)c * n_t, n_t, out + p);
         p += 11;
     }
-    const int n_freq_ch = cfg->n_ch < 6 ? cfg->n_ch : 6;
+    const int n_freq_ch = n_sensor_ch(cfg->n_ch);
     for (int c = 0; c < n_freq_ch; c++) {
         freq_stats(cfg, x + (size_t)c * n_t, n_t, out + p);
         p += 8;

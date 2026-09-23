@@ -28,3 +28,6 @@ firmware/generated*/
 # serve_edge.sh 的运行时文件
 .edge_service.pid
 logs/
+
+# 训练记录「导出到端侧」的模型清单，export_train.py 自动维护（导出目录在 core/models/generated_*，已忽略）
+edge_models.local.json

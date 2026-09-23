@@ -1,4 +1,4 @@
-/* 193 维手工特征的端侧实现，喂给 tm_forest。
+/* 手工特征的端侧实现（8 通道 193 维 / 3 轴 5 通道 79 维），喂给 tm_forest。
  *
  * 跟 python/tinyml/features.py **逐位一致**（tests/test_features_c.py 现场编译对答案）。
  * 跟 imu_train 的 scipy 版**不是**逐位一致，也做不到（scipy 是 float64、FFT 算法不同）。
@@ -29,7 +29,7 @@ extern "C" {
 
 typedef struct {
     int16_t n_t;        /* 窗口点数 */
-    int16_t n_ch;       /* 通道数，6（acc+gyr）或 8（+pitch/roll） */
+    int16_t n_ch;       /* 通道数：5（acc + pitch/roll，3 轴）、6（acc+gyr）或 8（+pitch/roll） */
     int16_t nperseg;    /* Welch 的段长，必须是 2 的幂且 <= n_t */
     float fs;           /* 采样率 */
     const float *win;      /* [nperseg] 周期 Hann */
@@ -43,7 +43,7 @@ typedef struct {
  * 返回 0 成功；-1 表示 n_t / nperseg 超出编译期上限。 */
 int tm_features(const tm_feat_cfg_t *cfg, const float *x, float *out);
 
-/* 特征维度：6 通道 171，8 通道 193。 */
+/* 特征维度：5 通道 79，6 通道 171，8 通道 193。 */
 int tm_feat_dim(const tm_feat_cfg_t *cfg);
 
 #ifdef __cplusplus

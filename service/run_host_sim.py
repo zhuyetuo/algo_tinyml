@@ -71,12 +71,31 @@ def load_stream(path, n_ch):
             sys.exit(f"数据只有 {X.shape[2]} 通道，模型要 {n_ch} 通道")
         # 把窗口首尾相接成一条流。**注意这不是原始连续信号**——窗口之间本来可能有
         # 重叠或跳跃，接起来之后接缝处的那几个窗口是假的。报告里会把它们标出来。
-        return X[:, :, :n_ch].reshape(-1, n_ch), y, X.shape[1]
+        return pick_channels(X, n_ch).reshape(-1, n_ch), y, X.shape[1]
     arr = np.loadtxt(path, delimiter="," if path.endswith(".csv") else None,
                      dtype=np.float32)
     if arr.ndim != 2 or arr.shape[1] < n_ch:
         sys.exit(f"{path} 是 {arr.shape}，预期 [N, >={n_ch}]")
-    return arr[:, :n_ch], None, None
+    return pick_channels(arr, n_ch), None, None
+
+
+def pick_channels(X, n_ch):
+    """从数据里挑出模型要的那几路。最后一维是通道。
+
+    **不能直接切前 n_ch 列**：3 轴模型要 5 通道（acc3 + pitch/roll），而 8 通道
+    的数据是 acc3 + gyro3 + pitch/roll——前 5 列是 acc3 + gyro 的两路，
+    进去之后每一维特征都对到别的东西上，模型照样给得出结果。
+    """
+    have = X.shape[-1]
+    if have == n_ch:
+        return X
+    if n_ch == 5 and have == 8:
+        return X[..., [0, 1, 2, 6, 7]]
+    if n_ch == 6 and have == 8:
+        return X[..., :6]
+    if n_ch == 3 and have in (5, 6, 8):
+        return X[..., :3]
+    sys.exit(f"数据是 {have} 通道，模型要 {n_ch} 通道，不知道该挑哪几路")
 
 
 def macro_f1(y, p, n):
