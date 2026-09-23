@@ -11,7 +11,8 @@
 两个入口：
 
 ```bash
-./serve.sh -d        # 起服务给平台测（PC）
+./serve.sh -d        # 本机调试起服务。**正式部署不用它**：端侧服务由 imu_train 的
+                     # docker compose 起（cd ~/imu_train && ./up.sh deploy），这个仓库只是代码库
 ./board.sh build     # 交叉编译上板（要 SDK_ROOT）
 ./board.sh size      # 只看占多少，不用 SDK
 ```

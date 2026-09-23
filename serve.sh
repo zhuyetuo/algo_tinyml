@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # 起端侧推理服务（给标注平台调）——**PC 那一侧的入口**。
 #
+# **正式部署不用这个脚本**：端侧服务由 imu_train 的 docker compose 起
+# （label_service/docker-compose.yml 里的 edge-service，`cd ~/imu_train && ./up.sh deploy`
+# 一起起停），这个仓库只是代码库。这里留着是给本机调试用的。
+#
 # 跟 ./board.sh 的关系：两边编的是同一份 core/ 里的 C。这边编成 .so 给
 # Python 调，那边编进固件。各留一份的话迟早分家，而分家的表现是
 # "平台上看着对、板上不对"——查不到。
