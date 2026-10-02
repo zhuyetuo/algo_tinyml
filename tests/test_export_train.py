@@ -74,3 +74,19 @@ def test_reload_without_models_arg():
     es.Handler.boot = {}
     r = es.Handler.reload()
     assert r["ok"] is False
+
+
+def test_cnn_flash_formula():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
+    from size_curve import cnn_flash_bytes
+    # 跟 docs/dl_edge.md 那张表：8 通道 16 点 5 类，[64,128,256] 权重 126,976；减半 32,768
+    assert cnn_flash_bytes(8, 16, 5, [64, 128, 256])["weights"] == 126976
+    assert cnn_flash_bytes(8, 16, 5, [32, 64, 128])["weights"] == 32768
+    # 第三层一家独大
+    assert cnn_flash_bytes(8, 16, 5, [64, 128, 256])["macs"] == 616960
+
+
+def test_register_local_kind(tmp_path):
+    lj = str(tmp_path / "l.json")
+    et.register_local("train6", "/g", "/g/meta.json", lj, kind="cnn")
+    assert json.load(open(lj))["models"][0]["kind"] == "cnn"
