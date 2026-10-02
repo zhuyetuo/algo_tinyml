@@ -115,3 +115,18 @@ def test_quantize_percentile_range():
     assert _range(a, 100.0) == (-100.0, 100.0)
     lo, hi = _range(a, 99.0)
     assert lo == 0.0 and hi == 0.0 or abs(hi) < 1
+
+
+def test_bundle_has_static_lib():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
+    import shutil, tempfile, zipfile, json
+    from footprint import measure, write_bundle, bundle_readme
+    if not shutil.which("arm-none-eabi-gcc"):
+        return
+    gen = os.path.join(os.path.dirname(__file__), "..", "core", "models", "edge_rf_d10")
+    meta = json.load(open(os.path.join(gen, "meta.json")))
+    fp = measure(gen, "rf", 16, 8, 5, {})
+    z = tempfile.mktemp(suffix=".zip")
+    write_bundle(gen, "rf", z, bundle_readme("rf", meta, fp), window=16, n_classes=5)
+    names = zipfile.ZipFile(z).namelist()
+    assert "lib/libtinyml.a" in names and "include/tm_features.h" in names and "lib/BUILD_FLAGS.txt" in names

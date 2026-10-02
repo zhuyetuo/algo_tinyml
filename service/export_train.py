@@ -431,7 +431,8 @@ def main():
         if not fp:
             from footprint import measure
             fp = measure(gen, kind, int(meta["window_size"]), int(meta.get("n_channels") or 8), len(meta["classes"]))
-        n = write_bundle(gen, kind, os.path.expanduser(args.bundle), bundle_readme(kind, meta, fp))
+        n = write_bundle(gen, kind, os.path.expanduser(args.bundle), bundle_readme(kind, meta, fp),
+                         window=int(meta["window_size"]), n_classes=len(meta["classes"]))
         r = {"tag": args.tag, "zip": os.path.abspath(os.path.expanduser(args.bundle)), "bytes": n}
     elif args.remove:
         r = remove(args.tag, args.local)

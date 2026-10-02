@@ -30,7 +30,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CORE = os.path.join(ROOT, "core")
 
-ARM_FLAGS = ["-Os", "-std=c99", "-mcpu=cortex-m4", "-mthumb", "-mfpu=fpv4-sp-d16", "-mfloat-abi=hard",
+# 浮点 ABI 跟 GR551x SDK 一致（softfp）：预编的 .a 要能直接链进 SDK 工程，ABI 不同链接器会拒绝
+ARM_FLAGS = ["-Os", "-std=c99", "-mcpu=cortex-m4", "-mthumb", "-mfpu=fpv4-sp-d16", "-mfloat-abi=softfp",
              "-ffp-contract=off", "-fno-math-errno", "-ffunction-sections", "-fdata-sections"]
 HOST_FLAGS = ["-Os", "-std=c99", "-ffp-contract=off", "-fno-math-errno", "-ffunction-sections", "-fdata-sections"]
 
@@ -193,15 +194,62 @@ def bench_host(infer_fn, windows, repeat: int = 3) -> float:
     return round(best or 0.0, 1)
 
 
-def write_bundle(gen_dir: str, kind: str, out_zip: str, readme: str) -> int:
-    """交给嵌入式的源码包：core/ 用得到的 .c/.h + 导出目录 + README。返回字节数。"""
+def build_static_lib(gen_dir: str, kind: str, window: int, n_classes: int, out_dir: str) -> dict | None:
+    """把运行时 + 模型预编成 libtinyml.a（Cortex-M4F，softfp，跟 GR551x SDK 一致）。
+    没有交叉编译器就返回 None——x86 的 .a 对板子没用，宁可不给。"""
+    cc, _, arm = toolchain()
+    if not arm:
+        return None
+    ar = shutil.which("arm-none-eabi-ar")
+    if not ar:
+        return None
+    srcs = [os.path.join(CORE, f) for f in RUNTIME[kind]] + \
+           [os.path.join(gen_dir, f) for f in MODEL_FILES[kind] + TABLE_FILES[kind] if os.path.exists(os.path.join(gen_dir, f))]
+    defines = {"TM_FEAT_MAX_T": max(int(window), 16), "TM_FEAT_MAX_NPERSEG": max(int(window), 16),
+               "TM_POST_MAX_CLASSES": max(int(n_classes), 2)}
+    os.makedirs(out_dir, exist_ok=True)
+    objs = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for f in srcs:
+            obj = os.path.join(tmp, os.path.basename(f) + ".o")
+            r = subprocess.run([cc, "-c", *ARM_FLAGS, *[f"-D{k}={v}" for k, v in defines.items()],
+                                f"-I{CORE}", f"-I{gen_dir}", f, "-o", obj], capture_output=True, text=True)
+            if r.returncode != 0:
+                return {"error": r.stderr.strip()[-400:]}
+            objs.append(obj)
+        lib = os.path.join(out_dir, "libtinyml.a")
+        if os.path.exists(lib):
+            os.remove(lib)
+        subprocess.run([ar, "rcs", lib, *objs], check=True)
+    return {"path": lib, "bytes": os.path.getsize(lib), "flags": " ".join(ARM_FLAGS),
+            "defines": " ".join(f"-D{k}={v}" for k, v in defines.items())}
+
+
+def write_bundle(gen_dir: str, kind: str, out_zip: str, readme: str,
+                 window: int | None = None, n_classes: int | None = None) -> int:
+    """交给嵌入式的包：源码（core/ + 导出目录）+ 预编的 lib/libtinyml.a + include/ + README。返回字节数。"""
     import zipfile
 
     files = source_bundle_bytes(gen_dir, kind)["files"]
+    lib = None
+    if window and n_classes:
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = build_static_lib(gen_dir, kind, window, n_classes, tmp)
+            lib_bytes = open(lib["path"], "rb").read() if lib and "path" in lib else None
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
         for rel in files:
             src = os.path.join(CORE, rel[5:]) if rel.startswith("core/") else os.path.join(gen_dir, rel[6:])
             z.write(src, rel)
+        if lib and "path" in lib:
+            z.writestr("lib/libtinyml.a", lib_bytes)
+            # 只链 .a 的话头文件单独放一份，不用在 core/ 和 model/ 里翻
+            for rel in files:
+                if rel.endswith(".h") and not rel.endswith("golden.h"):
+                    z.write(os.path.join(CORE, rel[5:]) if rel.startswith("core/") else os.path.join(gen_dir, rel[6:]),
+                            "include/" + os.path.basename(rel))
+            z.writestr("lib/BUILD_FLAGS.txt",
+                       f"arm-none-eabi-gcc {lib['flags']} {lib['defines']}\n"
+                       "浮点 ABI 是 softfp，跟 GR551x SDK 的 libble_sdk.a 一致；工程用 hard 的话别用这个 .a，拿源码重编。\n")
         for extra in ("board/README.md", "docs/ram_and_cache.md"):
             p = os.path.join(ROOT, extra)
             if os.path.exists(p):
@@ -226,7 +274,11 @@ def bundle_readme(kind: str, meta: dict, fp: dict) -> str:
         "  tm_post_on_window(...)                  可选：板上后处理\n"
     )
     return (
-        f"端侧模型源码包  {meta.get('train', {}).get('tag', '')}\n"
+        f"端侧模型源码包  {meta.get('train', {}).get('tag', '')}\n\n"
+        "两种接法，二选一：\n"
+        "  A. 源码：把 core/*.c 和 model/*.c 加进工程一起编（推荐，编译选项跟自己的 SDK 一定一致）\n"
+        "  B. 静态库：链 lib/libtinyml.a，include/ 里是头文件。预编选项见 lib/BUILD_FLAGS.txt，\n"
+        "     Cortex-M4F + softfp（跟 GR551x SDK 一致）；工程是 hard ABI 的话链不上，用 A\n\n"
         f"模型：{kind}，{meta.get('n_channels')} 通道 × {meta.get('window_size')} 点 @{meta.get('hz')}Hz，"
         f"类别 {','.join(meta.get('classes') or [])}\n\n"
         f"编译：务必带 -ffp-contract=off（否则浮点末位跟 PC 对不上，golden 自检会红）；\n"
