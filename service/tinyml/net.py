@@ -237,7 +237,20 @@ def _affine(lo, hi):
     return scale, int(np.clip(zp, -128, 127))
 
 
-def quantize(net: FloatNet, calib_x, class_names=None):
+def _range(a, pct):
+    """量程取分位数而不是 min/max：抓挠的尖峰会把 min/max 拉得很宽，睡觉那种小信号
+    就只剩几个 int8 格子的分辨率——2026-10-03 一版 CNN float 0.88、int8 0.76，掉的全是
+    小幅度类别（睡觉 0.995→0.85）。截掉两头各 (100-pct)/2 % 的极值，被截的那点饱和到
+    ±127，代价远小于整个量程被撑大。pct=100 就是原来的 min/max。"""
+    a = np.asarray(a, np.float32).ravel()
+    if pct >= 100.0 or a.size == 0:
+        return float(a.min()), float(a.max())
+    tail = (100.0 - pct) / 2.0
+    lo, hi = np.percentile(a, [tail, 100.0 - tail])
+    return float(lo), float(hi)
+
+
+def quantize(net: FloatNet, calib_x, class_names=None, percentile: float = 100.0):
     """训练后量化（PTQ）。calib_x: [N, C, T] 的 float 样本，用来定每层激活的范围。
 
     校准集必须是**真实数据**，而且要覆盖到剧烈动作——只拿睡觉的片段校准，
@@ -247,7 +260,7 @@ def quantize(net: FloatNet, calib_x, class_names=None):
     calib_x = np.asarray(calib_x, np.float32)
     assert calib_x.ndim == 3, "calib_x 应该是 [N, C, T]"
 
-    in_scale, in_zp = _affine(calib_x.min(), calib_x.max())
+    in_scale, in_zp = _affine(*_range(calib_x, percentile))
 
     # 逐层跑一遍 float，收集每层输出的实际范围
     acts = [calib_x]
@@ -263,7 +276,7 @@ def quantize(net: FloatNet, calib_x, class_names=None):
             qlayers.append(QPool(lyr.pool))
             continue
 
-        out_scale, out_zp = _affine(out.min(), out.max())
+        out_scale, out_zp = _affine(*_range(out, percentile))
         w = lyr.w
         n_out = w.shape[0]
         flat = w.reshape(n_out, -1)

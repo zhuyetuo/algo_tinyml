@@ -169,7 +169,7 @@ def export_cnn(model_pt: str, tag: str, processed_dir: str, remap: str | None,
     """1D-CNN：float 权重 → 训练后量化 int8 → 导 C（tm_model.c）→ 用编出来的 C 在留出集上算端侧 F1。
     量化校准集从留出集里按类别分层抽（只拿睡觉校准的话抓挠那段会饱和，见 export_cnn.py）。"""
     import serve
-    from tinyml import export as export_net, quantize
+    from tinyml import export as export_net, forward_int_batch, quantize
     from tinyml.export_c import _arena_bytes
     from tinyml.torch_import import load_cnn, normalize
 
@@ -201,7 +201,21 @@ def export_cnn(model_pt: str, tag: str, processed_dir: str, remap: str | None,
     per = max(1, 256 // len(classes))
     idx = [rng.choice(np.flatnonzero(y == c), size=min(per, int(np.sum(y == c))), replace=False)
            for c in range(len(classes)) if np.any(y == c)]
-    qnet = quantize(net, Xn[np.concatenate(idx)], class_names=classes)
+    calib = Xn[np.concatenate(idx)]
+    # 量程按 min/max 定的话抓挠尖峰会把小信号压没，int8 比 float 掉十几个点。
+    # 几档分位数都试一遍，用留出集（Python 参考实现，跟 C 逐位一致）挑掉点最少的
+    f_pred = np.fromiter((int(np.argmax(net.forward(x))) for x in Xn), dtype=np.int64, count=len(Xn))
+    best = None
+    for pct in (100.0, 99.9, 99.5, 99.0):
+        q = quantize(net, calib, class_names=classes, percentile=pct)
+        pq = np.concatenate([np.argmax(forward_int_batch(q, np.stack([q.quantize_input(x) for x in Xn[s:s + 512]])), axis=1)
+                             for s in range(0, len(Xn), 512)])
+        f1 = per_class_report(y, pq, classes)["macro_f1"]
+        print(f"  量程分位数 {pct}：int8 macro-F1 {f1:.4f}（跟 float 一致 {np.mean(pq == f_pred):.1%}）")
+        if best is None or f1 > best[1]:
+            best = (pct, f1, q)
+    pct, _, qnet = best
+    print(f"  → 用 {pct} 百分位")
     n_w = sum(int(l.w.size) for l in qnet.layers if hasattr(l, "w"))
     n_b = sum(int(l.bias.size) for l in qnet.layers if hasattr(l, "bias"))
     flash = n_w + n_b * 12
@@ -227,8 +241,8 @@ def export_cnn(model_pt: str, tag: str, processed_dir: str, remap: str | None,
         pred[i:i + step] = cls_i
     edge = per_class_report(y, pred, classes)
     edge.update({"flash_bytes": flash, "ram_bytes": arena, "split": split})
-    f_pred = np.fromiter((int(np.argmax(net.forward(x))) for x in Xn), dtype=np.int64, count=len(Xn))
     edge["agree_with_float"] = round(float(np.mean(f_pred == pred)), 4)
+    edge["quant_percentile"] = pct
     print(f"端侧 F1（板上那份 C，int8）：macro {edge['macro_f1']}，准确率 {edge['accuracy']}，"
           f"跟 float 判决一致 {edge['agree_with_float']:.1%}")
     for c, m in edge["per_class"].items():

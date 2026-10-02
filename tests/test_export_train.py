@@ -106,3 +106,12 @@ def test_footprint_measures_committed_rf():
     write_bundle(gen, "rf", z, bundle_readme("rf", meta, fp))
     names = zipfile.ZipFile(z).namelist()
     assert "core/tm_features.c" in names and "model/tm_forest_c_model.c" in names and "README.txt" in names
+
+
+def test_quantize_percentile_range():
+    import numpy as np
+    from tinyml.net import _range
+    a = np.concatenate([np.zeros(1000), [100.0, -100.0]])
+    assert _range(a, 100.0) == (-100.0, 100.0)
+    lo, hi = _range(a, 99.0)
+    assert lo == 0.0 and hi == 0.0 or abs(hi) < 1
