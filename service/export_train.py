@@ -234,6 +234,17 @@ def export_cnn(model_pt: str, tag: str, processed_dir: str, remap: str | None,
     for c, m in edge["per_class"].items():
         print(f"  {c:<12} P {m['precision']:.2f}  R {m['recall']:.2f}  F1 {m['f1-score']:.2f}  (n={m['support']})")
 
+    from footprint import bench_host, measure
+    from size_curve import cnn_flash_bytes
+    cfg = meta.get("model_cfg") or {}
+    macs = cnn_flash_bytes(n_ch, window, len(classes), [int(x) for x in cfg.get("filters", [64, 128, 256])],
+                           int(cfg.get("kernel_size", 3)))["macs"]
+    edge["footprint"] = measure(out, "cnn", window, n_ch, len(classes), {
+        "macs": macs, "arena_bytes": arena,
+        "host_us_per_window": bench_host(lambda w: eng.infer(w), Xc[:256])})
+    fp = edge["footprint"]
+    print(f"板上占用（{fp['toolchain']}）：flash {fp['flash']['total_without_golden'] / 1024:.1f} KB"
+          f"（模型 {fp['flash']['model'] / 1024:.1f} + 代码 {fp['flash']['runtime'] / 1024:.1f}），RAM {fp['ram']['total_without_post'] / 1024:.1f} KB")
     meta_out = _job_meta(tag, model_pt, {**meta, "macro_f1": metrics.get("macro_f1"),
                                          "per_class": metrics.get("per_class")}, n_ch, {"kind": "cnn"})
     meta_out["edge"] = edge
@@ -353,6 +364,13 @@ def export(model_pkl: str, tag: str, processed_dir: str, remap: str | None,
     for c, m in edge["per_class"].items():
         print(f"  {c:<12} P {m['precision']:.2f}  R {m['recall']:.2f}  F1 {m['f1-score']:.2f}  (n={m['support']})")
 
+    from footprint import bench_host, measure
+    edge["footprint"] = measure(out, "rf", window, n_ch, len(classes), {
+        "trees": cf.n_trees, "depth": int(max(e.tree_.max_depth for e in model.estimators_)), "nodes": int(cf.n_nodes),
+        "host_us_per_window": bench_host(lambda w: eng.infer(w), np.ascontiguousarray(X[:256].transpose(0, 2, 1)))})
+    fp = edge["footprint"]
+    print(f"板上占用（{fp['toolchain']}）：flash {fp['flash']['total_without_golden'] / 1024:.1f} KB"
+          f"（模型 {fp['flash']['model'] / 1024:.1f} + 代码 {fp['flash']['runtime'] / 1024:.1f}），RAM {fp['ram']['total_without_post'] / 1024:.1f} KB")
     meta_out = _job_meta(tag, model_pkl, meta, n_ch, {"kind": "rf"})
     meta_out["edge"] = edge
     meta_path = os.path.join(out, "meta.json")
@@ -386,9 +404,22 @@ def main():
     ap.add_argument("--out", default="", help="导出目录，默认 core/models/generated_<tag>")
     ap.add_argument("--local", default=LOCAL_JSON, help="登记到哪份清单")
     ap.add_argument("--remove", action="store_true", help="撤掉这个标签（清单 + 导出目录）")
+    ap.add_argument("--bundle", default="", help="把这个标签的源码包（core/ + 导出目录 + README）打成这个 zip")
     args = ap.parse_args()
 
-    if args.remove:
+    if args.bundle:
+        from footprint import bundle_readme, write_bundle
+        gen = gen_dir_for(args.tag)
+        with open(os.path.join(gen, "meta.json"), encoding="utf-8") as f:
+            meta = json.load(f)
+        kind = (meta.get("train") or {}).get("kind") or "rf"
+        fp = (meta.get("edge") or {}).get("footprint")
+        if not fp:
+            from footprint import measure
+            fp = measure(gen, kind, int(meta["window_size"]), int(meta.get("n_channels") or 8), len(meta["classes"]))
+        n = write_bundle(gen, kind, os.path.expanduser(args.bundle), bundle_readme(kind, meta, fp))
+        r = {"tag": args.tag, "zip": os.path.abspath(os.path.expanduser(args.bundle)), "bytes": n}
+    elif args.remove:
         r = remove(args.tag, args.local)
     else:
         if not args.model or not args.processed_dir:

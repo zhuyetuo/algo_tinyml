@@ -90,3 +90,19 @@ def test_register_local_kind(tmp_path):
     lj = str(tmp_path / "l.json")
     et.register_local("train6", "/g", "/g/meta.json", lj, kind="cnn")
     assert json.load(open(lj))["models"][0]["kind"] == "cnn"
+
+
+def test_footprint_measures_committed_rf():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "service"))
+    from footprint import measure, write_bundle, bundle_readme
+    gen = os.path.join(os.path.dirname(__file__), "..", "core", "models", "edge_rf_d10")
+    fp = measure(gen, "rf", 16, 8, 5, {"trees": 20, "depth": 10, "nodes": 11810})
+    assert fp["flash"]["model"] > 100_000 and fp["flash"]["runtime"] > 2000
+    assert fp["ram"]["window_buffer"] == 16 * 8 * 4 and fp["ram"]["post_state"] > 0
+    assert fp["flash"]["golden"] > 0 and fp["inference"]["tree_compares_max"] == 200
+    import tempfile, zipfile, json
+    meta = json.load(open(os.path.join(gen, "meta.json")))
+    z = tempfile.mktemp(suffix=".zip")
+    write_bundle(gen, "rf", z, bundle_readme("rf", meta, fp))
+    names = zipfile.ZipFile(z).namelist()
+    assert "core/tm_features.c" in names and "model/tm_forest_c_model.c" in names and "README.txt" in names
