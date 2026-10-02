@@ -83,11 +83,11 @@ def per_class_report(y, p, classes) -> dict:
             "n_windows": int(len(y))}
 
 
-def register_local(tag: str, gen: str, meta_path: str, local_json: str = LOCAL_JSON) -> dict:
+def register_local(tag: str, gen: str, meta_path: str, local_json: str = LOCAL_JSON, kind: str = "rf") -> dict:
     """登记/更新 edge_models.local.json 里的一条。同 tag 覆盖。"""
     cfg = _read_local(local_json)
     models = [m for m in cfg.get("models", []) if m.get("tag") != tag]
-    models.append({"tag": tag, "kind": "rf", "gen": gen, "meta": meta_path})
+    models.append({"tag": tag, "kind": kind, "gen": gen, "meta": meta_path})
     cfg["models"] = models
     _write_local(cfg, local_json)
     return cfg
@@ -154,8 +154,102 @@ def _load_holdout(imu_train: str, processed_dir: str, hz: int, remap: str | None
     raise SystemExit(f"{processed_dir} 里一个窗口都没有")
 
 
+def _job_meta(tag: str, model_path: str, meta: dict, n_ch: int, extra: dict) -> dict:
+    job_id = int(tag[5:]) if tag.startswith("train") and tag[5:].isdigit() else None
+    out = dict(meta)
+    out["n_channels"] = n_ch
+    out["train"] = {"job_id": job_id, "tag": tag, "axes": max(3, n_ch - 2),
+                    "sk_macro_f1": meta.get("macro_f1"), "model_path": model_path,
+                    "exported_at": int(time.time()), **extra}
+    return out
+
+
+def export_cnn(model_pt: str, tag: str, processed_dir: str, remap: str | None,
+               imu_train: str, out: str | None = None, local_json: str = LOCAL_JSON) -> dict:
+    """1D-CNN：float 权重 → 训练后量化 int8 → 导 C（tm_model.c）→ 用编出来的 C 在留出集上算端侧 F1。
+    量化校准集从留出集里按类别分层抽（只拿睡觉校准的话抓挠那段会饱和，见 export_cnn.py）。"""
+    import serve
+    from tinyml import export as export_net, quantize
+    from tinyml.export_c import _arena_bytes
+    from tinyml.torch_import import load_cnn, normalize
+
+    model_pt = os.path.abspath(os.path.expanduser(model_pt))
+    net, meta = load_cnn(model_pt)
+    classes = list(meta["classes"])
+    window, hz, n_ch = int(meta["window_size"]), int(meta["hz"]), int(meta["n_channels"])
+    stem = model_pt.replace("_best.pt", "")
+    metrics = {}
+    if os.path.exists(f"{stem}.json"):
+        with open(f"{stem}.json", encoding="utf-8") as f:
+            metrics = json.load(f)
+
+    X, y, hold_classes, split = _load_holdout(imu_train, processed_dir, hz, remap)
+    if X.shape[1] != window and X.shape[2] == window:
+        X = X.transpose(0, 2, 1)
+    if X.shape[1:] != (window, n_ch):
+        raise SystemExit(f"留出集窗口是 {X.shape[1:]}，模型要 ({window}, {n_ch})")
+    if hold_classes != classes:
+        if set(hold_classes) != set(classes):
+            raise SystemExit(f"留出集类别 {hold_classes} 跟模型类别 {classes} 对不上")
+        y = np.array([classes.index(c) for c in hold_classes])[y]
+    Xc = np.ascontiguousarray(X.transpose(0, 2, 1))        # [N, C, T]，C 那边通道在前
+    Xn = normalize(Xc, meta)
+    print(f"模型 {os.path.relpath(model_pt, os.path.expanduser('~'))}：{n_ch} 通道 × {window} 点 @{hz}Hz，"
+          f"{len(classes)} 类，filters {(meta.get('model_cfg') or {}).get('filters')}；留出集 {len(y)} 窗（{split}）")
+
+    rng = np.random.default_rng(0)
+    per = max(1, 256 // len(classes))
+    idx = [rng.choice(np.flatnonzero(y == c), size=min(per, int(np.sum(y == c))), replace=False)
+           for c in range(len(classes)) if np.any(y == c)]
+    qnet = quantize(net, Xn[np.concatenate(idx)], class_names=classes)
+    n_w = sum(int(l.w.size) for l in qnet.layers if hasattr(l, "w"))
+    n_b = sum(int(l.bias.size) for l in qnet.layers if hasattr(l, "bias"))
+    flash = n_w + n_b * 12
+    arena = _arena_bytes(qnet) * 2
+    print(f"int8 {flash:,} B（{flash / 1024:.1f} KB），推理 RAM {arena:,} B" + ("" if flash <= 131072 else "  ⚠ 超过 128KB"))
+
+    picked = [qnet.quantize_input(Xn[i]) for i in rng.choice(len(Xn), size=min(16, len(Xn)), replace=False)]
+    files = export_net(qnet, golden_x_i8=np.stack(picked), prep=meta)
+    out = os.path.abspath(out or gen_dir_for(tag))
+    os.makedirs(out, exist_ok=True)
+    for name, content in files.items():
+        with open(os.path.join(out, name), "w", encoding="utf-8") as f:
+            f.write(content)
+
+    eng = serve.Engine(serve.build(out))
+    bad = eng.selftest()
+    if bad:
+        raise SystemExit(f"导出后的 golden 自检没过：{bad} 字节对不上")
+    pred = np.empty(len(X), np.int64)
+    step = 512
+    for i in range(0, len(X), step):
+        cls_i, _ = eng.infer(Xc[i:i + step])
+        pred[i:i + step] = cls_i
+    edge = per_class_report(y, pred, classes)
+    edge.update({"flash_bytes": flash, "ram_bytes": arena, "split": split})
+    f_pred = np.fromiter((int(np.argmax(net.forward(x))) for x in Xn), dtype=np.int64, count=len(Xn))
+    edge["agree_with_float"] = round(float(np.mean(f_pred == pred)), 4)
+    print(f"端侧 F1（板上那份 C，int8）：macro {edge['macro_f1']}，准确率 {edge['accuracy']}，"
+          f"跟 float 判决一致 {edge['agree_with_float']:.1%}")
+    for c, m in edge["per_class"].items():
+        print(f"  {c:<12} P {m['precision']:.2f}  R {m['recall']:.2f}  F1 {m['f1-score']:.2f}  (n={m['support']})")
+
+    meta_out = _job_meta(tag, model_pt, {**meta, "macro_f1": metrics.get("macro_f1"),
+                                         "per_class": metrics.get("per_class")}, n_ch, {"kind": "cnn"})
+    meta_out["edge"] = edge
+    meta_path = os.path.join(out, "meta.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta_out, f, ensure_ascii=False, indent=2)
+    register_local(tag, out, meta_path, local_json, kind="cnn")
+    print(f"已登记到 {local_json}（cnn）；端侧服务 reload 之后平台上就能选「edge:{tag}」")
+    return {"tag": tag, "spec": f"edge:{tag}", "gen": out, "meta": meta_path, "kind": "cnn",
+            "n_channels": n_ch, "window": window, "hz": hz, "classes": classes, "edge": edge}
+
+
 def export(model_pkl: str, tag: str, processed_dir: str, remap: str | None,
            imu_train: str, out: str | None = None, local_json: str = LOCAL_JSON) -> dict:
+    if model_pkl.endswith(".pt"):
+        return export_cnn(model_pkl, tag, processed_dir, remap, imu_train, out, local_json)
     try:
         import joblib
     except ImportError:
@@ -259,20 +353,13 @@ def export(model_pkl: str, tag: str, processed_dir: str, remap: str | None,
     for c, m in edge["per_class"].items():
         print(f"  {c:<12} P {m['precision']:.2f}  R {m['recall']:.2f}  F1 {m['f1-score']:.2f}  (n={m['support']})")
 
-    job_id = None
-    if tag.startswith("train") and tag[5:].isdigit():
-        job_id = int(tag[5:])
-    meta_out = dict(meta)
-    meta_out["n_channels"] = n_ch
-    meta_out["train"] = {"job_id": job_id, "tag": tag, "axes": max(3, n_ch - 2),
-                         "sk_macro_f1": meta.get("macro_f1"), "model_path": model_pkl,
-                         "exported_at": int(time.time())}
+    meta_out = _job_meta(tag, model_pkl, meta, n_ch, {"kind": "rf"})
     meta_out["edge"] = edge
     meta_path = os.path.join(out, "meta.json")
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta_out, f, ensure_ascii=False, indent=2)
     register_local(tag, out, meta_path, local_json)
-    result = {"tag": tag, "spec": f"edge:{tag}", "gen": out, "meta": meta_path,
+    result = {"tag": tag, "spec": f"edge:{tag}", "gen": out, "meta": meta_path, "kind": "rf",
               "n_channels": n_ch, "window": window, "hz": hz, "classes": classes,
               "edge": edge}
     print(f"已登记到 {local_json}；端侧服务 reload 之后平台上就能选「edge:{tag}」")
@@ -292,7 +379,7 @@ def remove(tag: str, local_json: str = LOCAL_JSON) -> dict:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True, help="端侧模型标签，训练记录用 train<任务号>")
-    ap.add_argument("--model", help="imu_train 训出来的 ml_rf.pkl（旁边要有 ml_rf.json）")
+    ap.add_argument("--model", help="imu_train 训出来的 ml_rf.pkl（旁边要有 ml_rf.json），或 dl_cnn_best.pt")
     ap.add_argument("--processed-dir", help="这次训练的预处理目录（留出集在里面）")
     ap.add_argument("--remap", default="", help="训练时用的 remap yaml，没有就不传")
     ap.add_argument("--imu-train", default=os.path.expanduser("~/imu_train"))
