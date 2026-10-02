@@ -45,8 +45,20 @@ def export(qnet: QNet, golden_x_i8=None, model_name="tm_model", prep=None) -> di
     lines.append("\n")
     layer_entries = []
 
+    # CMSIS-NN 那条路要 NHWC：卷积权重 [out][k][in]，全连接按"k = T 的卷积"排成 [out][t][c]。
+    # 两种排法都导出、用 #if TM_CMSIS_NN 二选一——编译期只留一份，flash 不翻倍。
+    # 这里跟着层走当前的 (ch, t)，全连接那一层要靠它把 [out][c*t+t'] 拆回 [out][t'][c]。
+    ch, t = qnet.n_ch, qnet.n_t
+    scratch = 0  # CMSIS 卷积的 im2col 缓冲，取各层最大；公式照抄 arm_convolve_s8_get_buffer_size
+
+    def cmsis_scratch(in_ch, k):
+        cols = in_ch * k
+        cols += (4 - cols % 4) % 4   # 列数补到 4 的倍数
+        return 2 * cols * 2          # 两行 int16
+
     for i, lyr in enumerate(qnet.layers):
         if isinstance(lyr, QPool):
+            t = t // lyr.pool
             # **指定初始化器，不是位置初始化器。** 原来是一串 0 按位置对齐到
             # tm_layer_t 的字段上——往结构体中间加一个字段（比如 pad），
             # 后面每个值都会悄悄挪到相邻字段去，编译器一声不吭，
@@ -56,14 +68,29 @@ def export(qnet: QNet, golden_x_i8=None, model_name="tm_model", prep=None) -> di
             )
             continue
         p = f"L{i}"
+        if isinstance(lyr, QDense):
+            out_n, in_n = lyr.w.shape
+            if in_n != ch * t:
+                raise ValueError(f"全连接层 {i} 输入 {in_n} 维，但前面算到 ch={ch} × t={t}")
+            w_cmsis = np.asarray(lyr.w).reshape(out_n, ch, t).transpose(0, 2, 1)
+            scratch = max(scratch, cmsis_scratch(ch, t))
+        else:
+            w_cmsis = np.asarray(lyr.w).transpose(0, 2, 1)  # [out][in][k] → [out][k][in]
+            scratch = max(scratch, cmsis_scratch(lyr.w.shape[1], lyr.w.shape[2]))
+        lines.append("#if TM_CMSIS_NN\n")
+        lines.append(_c_array(f"{p}_w", w_cmsis, "int8_t"))
+        lines.append("#else\n")
         lines.append(_c_array(f"{p}_w", lyr.w, "int8_t"))
+        lines.append("#endif\n")
         lines.append(_c_array(f"{p}_b", lyr.bias, "int32_t"))
         lines.append(_c_array(f"{p}_m", lyr.mult, "int32_t"))
         lines.append(_c_array(f"{p}_s", lyr.shift, "int32_t"))
         if isinstance(lyr, QDense):
             op, out_ch, in_ch, k = "TM_DENSE", lyr.w.shape[0], lyr.w.shape[1], 0
+            ch, t = out_ch, 1
         else:
             op, (out_ch, in_ch, k) = "TM_CONV1D", lyr.w.shape
+            ch, t = out_ch, t + 2 * getattr(lyr, "pad", 0) - k + 1
         layer_entries.append(
             f"    {{ .op = {op}, .w = {p}_w, .bias = {p}_b, .mult = {p}_m, "
             f".shift = {p}_s, .out_ch = {out_ch}, .in_ch = {in_ch}, .k = {k}, "
@@ -105,7 +132,12 @@ def export(qnet: QNet, golden_x_i8=None, model_name="tm_model", prep=None) -> di
         "#ifndef TM_MODEL_H\n#define TM_MODEL_H\n\n",
         '#include "tm_runtime.h"\n',
         '#include "tm_prep.h"\n\n' if prep is not None else "\n",
+        "/* 乒乓两块；CMSIS-NN 那条路前面还要一段 int16 的 im2col 缓冲 + 最多 3 字节对齐余量 */\n",
+        "#if TM_CMSIS_NN\n",
+        f"#define TM_ARENA_BYTES {2 * arena + ((scratch + 3) & ~3) + 4}\n",
+        "#else\n",
         f"#define TM_ARENA_BYTES {2 * arena}\n",
+        "#endif\n",
         f"#define TM_N_CH {qnet.n_ch}\n",
         f"#define TM_N_T {qnet.n_t}\n",
         f"#define TM_N_CLASSES {qnet.n_classes}\n\n",

@@ -30,6 +30,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CORE = os.path.join(ROOT, "core")
 
+import sys  # noqa: E402
+
+sys.path.insert(0, HERE)
+from tinyml import cmsis  # noqa: E402
+
 # 浮点 ABI 跟 GR551x SDK 一致（softfp）：预编的 .a 要能直接链进 SDK 工程，ABI 不同链接器会拒绝
 ARM_FLAGS = ["-Os", "-std=c99", "-mcpu=cortex-m4", "-mthumb", "-mfpu=fpv4-sp-d16", "-mfloat-abi=softfp",
              "-ffp-contract=off", "-fno-math-errno", "-ffunction-sections", "-fdata-sections"]
@@ -74,6 +79,37 @@ def _compile_all(files: list[str], include: list[str], defines: dict, arm: bool,
                 continue
             out[os.path.basename(f)] = _size_of(size_bin, obj)
     return out
+
+
+ROOTS = {
+    "rf": ["tm_features", "tm_forest_c_predict", "tm_window_push", "tm_post_on_window"],
+    "cnn": ["tm_prep", "tm_invoke", "tm_window_push", "tm_post_on_window"],
+}
+
+
+def _linked_flash(files: list[str], include: list[str], defines: dict, arm: bool, cc: str, size_bin: str,
+                  roots: list[str]) -> int | None:
+    """把这些 .c 真的链一次（--gc-sections，以对外接口为根），读 text+data。
+    跟逐文件 size 的区别：链接器会把没引用到的函数和表扔掉——CMSIS 的表文件里 5 档只用 1 档，
+    逐文件算会多报 5 KB。链不过（缺 libm 符号之类）就返回 None，调用方退回逐文件的数。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        objs = []
+        for f in files:
+            obj = os.path.join(tmp, os.path.basename(f) + ".o")
+            r = subprocess.run([cc, "-c", *(ARM_FLAGS if arm else HOST_FLAGS),
+                                *[f"-D{k}={v}" for k, v in defines.items()], *[f"-I{i}" for i in include], f, "-o", obj],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                return None
+            objs.append(obj)
+        elf = os.path.join(tmp, "linked.elf")
+        r = subprocess.run([cc, *(ARM_FLAGS if arm else HOST_FLAGS), "-nostdlib", "-nostartfiles",
+                            "-Wl,--gc-sections", "-Wl,--unresolved-symbols=ignore-all", f"-Wl,-e,{roots[0]}",
+                            *[f"-Wl,--undefined={r_}" for r_ in roots], *objs, "-o", elf], capture_output=True, text=True)
+        if r.returncode != 0:
+            return None
+        sz = _size_of(size_bin, elf)
+        return sz["text"] + sz["data"]
 
 
 def golden_bytes(gen_dir: str, kind: str) -> int:
@@ -140,6 +176,47 @@ def measure(gen_dir: str, kind: str, window: int, n_ch: int, n_classes: int,
     gold = golden_bytes(gen_dir, kind)
     bundle = source_bundle_bytes(gen_dir, kind)
 
+    # 可选加速路线（-DTM_USE_CMSIS）：同一套运行时换成 CMSIS 内核再编一遍，看 flash/RAM 差多少。
+    # 模型和常量表那两块不变，只有工程代码会变，外加 CMSIS 自己那几个 .c。
+    accel = None
+    model_srcs = [os.path.join(gen_dir, f) for f in MODEL_FILES[kind] + TABLE_FILES[kind] if os.path.exists(os.path.join(gen_dir, f))]
+    if cmsis.available() and _export_supports_cmsis(gen_dir, kind):
+        inc = [CORE, gen_dir, *cmsis.include_dirs(kind, host=not arm)]
+        dfs = {**defines, **cmsis.defines(kind, host=not arm)}
+        rt_c = _compile_all([os.path.join(CORE, f) for f in RUNTIME[kind]], inc, dfs, arm, cc, size_bin)
+        lib_c = _compile_all(cmsis.sources(kind), inc, dfs, arm, cc, size_bin)
+        rt_err = [k for k, v in rt_c.items() if "error" in v] + [k for k, v in lib_c.items() if "error" in v]
+        # 真链一次算差值：逐文件 size 会把 CMSIS 表文件里没用到的几档也算进去
+        rt_files = [os.path.join(CORE, f) for f in RUNTIME[kind]]
+        linked_plain = _linked_flash(rt_files + model_srcs, [CORE, gen_dir], defines, arm, cc, size_bin, ROOTS[kind])
+        linked_cmsis = _linked_flash(rt_files + model_srcs + cmsis.sources(kind), inc, dfs, arm, cc, size_bin, ROOTS[kind])
+        linked = linked_plain is not None and linked_cmsis is not None
+        # CMSIS-NN 的 im2col 缓冲：导出脚本按层算好写在 tm_model.h 里（TM_ARENA_BYTES 的差）
+        scratch = 0
+        if kind == "cnn":
+            scratch = _cmsis_arena_delta(os.path.join(gen_dir, "tm_model.h"))
+        accel = {
+            "name": "CMSIS-DSP" if kind == "rf" else "CMSIS-NN",
+            "define": "-DTM_CMSIS_DSP=1" if kind == "rf" else "-DTM_CMSIS_NN=1",
+            "bit_exact": False,
+            "flash": {"runtime": flash(rt_c), "cmsis": flash(lib_c), "linked": linked,
+                      "total_without_golden": (flash(model) + flash(tables) + flash(runtime) + (linked_cmsis - linked_plain))
+                      if linked else flash(model) + flash(tables) + flash(rt_c) + flash(lib_c)},
+            "ram": {"runtime_bss": ram(rt_c) + ram(lib_c) + ram(tables), "scratch": scratch,
+                    "total_without_post": ram(rt_c) + ram(lib_c) + ram(tables) + window_buf + arena + scratch},
+            "per_file": {"runtime": rt_c, "cmsis": lib_c},
+            "errors": rt_err,
+            "note": ("FFT 换 arm_cfft_f32、均值/功率/极值/点积换 CMSIS 向量函数；特征不再逐位一致"
+                     "（相对误差 1e-6 这一级），森林判决极少数窗口会翻"
+                     if kind == "rf" else
+                     "卷积/池化/全连接换 arm_convolve_s8 / arm_max_pool_s8；整数累加一样，"
+                     "只有重量化平局的舍入方向不同，个别输出差 1 LSB、类别不变；arena 多一段 int16 的 im2col 缓冲"),
+        }
+        if "host_us_per_window_cmsis" in (extra or {}):
+            accel["host_us_per_window"] = extra["host_us_per_window_cmsis"]
+        if "cmsis_agree" in (extra or {}):
+            accel["agree_with_plain"] = extra["cmsis_agree"]
+
     infer: dict = {}
     if kind == "rf":
         n_sensor = n_ch - 2 if n_ch % 3 == 2 else n_ch
@@ -158,6 +235,9 @@ def measure(gen_dir: str, kind: str, window: int, n_ch: int, n_classes: int,
                          "上 CMSIS-NN 还能快 4 倍左右（见 docs/frameworks.md）"}
     if extra.get("host_us_per_window") is not None:
         infer["host_us_per_window"] = extra["host_us_per_window"]
+    if accel is not None:
+        accel["flash"]["delta"] = accel["flash"]["total_without_golden"] - (flash(model) + flash(tables) + flash(runtime))
+        accel["ram"]["delta"] = accel["ram"]["total_without_post"] - (ram_total - post_state)
 
     return {
         "toolchain": "arm-none-eabi-gcc（Cortex-M4F, -Os）" if arm else f"{cc}（x86 估算，代码体积偏大三到五成）",
@@ -174,6 +254,7 @@ def measure(gen_dir: str, kind: str, window: int, n_ch: int, n_classes: int,
             "note": "模型是 const，落在 flash 里 CPU 直接读，不占 RAM（GR5513 的 flash 是内存映射的）",
         },
         "inference": infer,
+        "accel": accel,
         "source_bundle": bundle,
         "per_file": {"runtime": runtime, "model": model, "tables": tables},
         "chip": {"name": "GR5513", "flash_total": 512 * 1024, "ram_available": 112 * 1024,
@@ -181,6 +262,25 @@ def measure(gen_dir: str, kind: str, window: int, n_ch: int, n_classes: int,
                  "note": "基线 = BLE 协议栈 + 最小应用（实测 104 KB / 22 KB）；给模型留的预算约 128 KB"},
         "measured_at": int(time.time()),
     }
+
+
+def _export_supports_cmsis(gen_dir: str, kind: str) -> bool:
+    """cnn 的 CMSIS 路要导出脚本给的第二套权重排法（tm_model.c 里有 #if TM_CMSIS_NN）；
+    老导出没有，开了开关会算错——那就不报这条，让人重导。rf 不需要导出配合。"""
+    if kind != "cnn":
+        return True
+    p = os.path.join(gen_dir, "tm_model.c")
+    return os.path.exists(p) and "TM_CMSIS_NN" in open(p, encoding="utf-8").read()
+
+
+def _cmsis_arena_delta(model_h: str) -> int:
+    """tm_model.h 里 #if TM_CMSIS_NN 的 TM_ARENA_BYTES 减普通的那个 = im2col 缓冲。"""
+    if not os.path.exists(model_h):
+        return 0
+    vals = re.findall(r"#define\s+TM_ARENA_BYTES\s+(\d+)", open(model_h, encoding="utf-8").read())
+    if len(vals) >= 2:
+        return max(0, int(vals[0]) - int(vals[1]))
+    return 0
 
 
 def bench_host(infer_fn, windows, repeat: int = 3) -> float:
@@ -194,8 +294,10 @@ def bench_host(infer_fn, windows, repeat: int = 3) -> float:
     return round(best or 0.0, 1)
 
 
-def build_static_lib(gen_dir: str, kind: str, window: int, n_classes: int, out_dir: str) -> dict | None:
+def build_static_lib(gen_dir: str, kind: str, window: int, n_classes: int, out_dir: str,
+                     use_cmsis: bool = False) -> dict | None:
     """把运行时 + 模型预编成 libtinyml.a（Cortex-M4F，softfp，跟 GR551x SDK 一致）。
+    use_cmsis=True 编的是 CMSIS 加速那条（libtinyml_cmsis.a，CMSIS 的 .o 一起打进去）。
     没有交叉编译器就返回 None——x86 的 .a 对板子没用，宁可不给。"""
     cc, _, arm = toolchain()
     if not arm:
@@ -203,21 +305,28 @@ def build_static_lib(gen_dir: str, kind: str, window: int, n_classes: int, out_d
     ar = shutil.which("arm-none-eabi-ar")
     if not ar:
         return None
+    if use_cmsis and not cmsis.available():
+        return None
     srcs = [os.path.join(CORE, f) for f in RUNTIME[kind]] + \
            [os.path.join(gen_dir, f) for f in MODEL_FILES[kind] + TABLE_FILES[kind] if os.path.exists(os.path.join(gen_dir, f))]
     defines = {"TM_FEAT_MAX_T": max(int(window), 16), "TM_FEAT_MAX_NPERSEG": max(int(window), 16),
                "TM_POST_MAX_CLASSES": max(int(n_classes), 2)}
+    inc = [CORE, gen_dir]
+    if use_cmsis:
+        srcs += cmsis.sources(kind)
+        defines.update(cmsis.defines(kind, host=False))
+        inc += cmsis.include_dirs(kind, host=False)
     os.makedirs(out_dir, exist_ok=True)
     objs = []
     with tempfile.TemporaryDirectory() as tmp:
         for f in srcs:
             obj = os.path.join(tmp, os.path.basename(f) + ".o")
             r = subprocess.run([cc, "-c", *ARM_FLAGS, *[f"-D{k}={v}" for k, v in defines.items()],
-                                f"-I{CORE}", f"-I{gen_dir}", f, "-o", obj], capture_output=True, text=True)
+                                *[f"-I{i}" for i in inc], f, "-o", obj], capture_output=True, text=True)
             if r.returncode != 0:
                 return {"error": r.stderr.strip()[-400:]}
             objs.append(obj)
-        lib = os.path.join(out_dir, "libtinyml.a")
+        lib = os.path.join(out_dir, "libtinyml_cmsis.a" if use_cmsis else "libtinyml.a")
         if os.path.exists(lib):
             os.remove(lib)
         subprocess.run([ar, "rcs", lib, *objs], check=True)
@@ -231,15 +340,24 @@ def write_bundle(gen_dir: str, kind: str, out_zip: str, readme: str,
     import zipfile
 
     files = source_bundle_bytes(gen_dir, kind)["files"]
-    lib = None
+    lib = lib_cmsis = None
+    lib_bytes = lib_cmsis_bytes = None
     if window and n_classes:
         with tempfile.TemporaryDirectory() as tmp:
             lib = build_static_lib(gen_dir, kind, window, n_classes, tmp)
             lib_bytes = open(lib["path"], "rb").read() if lib and "path" in lib else None
+            lib_cmsis = build_static_lib(gen_dir, kind, window, n_classes, tmp, use_cmsis=True)
+            lib_cmsis_bytes = open(lib_cmsis["path"], "rb").read() if lib_cmsis and "path" in lib_cmsis else None
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
         for rel in files:
             src = os.path.join(CORE, rel[5:]) if rel.startswith("core/") else os.path.join(gen_dir, rel[6:])
             z.write(src, rel)
+        # 可选加速路线要的 CMSIS 子集（源码接法 A 想开 -DTM_USE_CMSIS 时用；不开就不用管这个目录）
+        if cmsis.available():
+            for rel, src in cmsis.bundle_files(kind).items():
+                z.write(src, rel)
+        if lib_cmsis and "path" in lib_cmsis:
+            z.writestr("lib/libtinyml_cmsis.a", lib_cmsis_bytes)
         if lib and "path" in lib:
             z.writestr("lib/libtinyml.a", lib_bytes)
             # 只链 .a 的话头文件单独放一份，不用在 core/ 和 model/ 里翻
@@ -248,14 +366,42 @@ def write_bundle(gen_dir: str, kind: str, out_zip: str, readme: str,
                     z.write(os.path.join(CORE, rel[5:]) if rel.startswith("core/") else os.path.join(gen_dir, rel[6:]),
                             "include/" + os.path.basename(rel))
             z.writestr("lib/BUILD_FLAGS.txt",
-                       f"arm-none-eabi-gcc {lib['flags']} {lib['defines']}\n"
-                       "浮点 ABI 是 softfp，跟 GR551x SDK 的 libble_sdk.a 一致；工程用 hard 的话别用这个 .a，拿源码重编。\n")
+                       f"libtinyml.a:        arm-none-eabi-gcc {lib['flags']} {lib['defines']}\n"
+                       + (f"libtinyml_cmsis.a:  arm-none-eabi-gcc {lib_cmsis['flags']} {lib_cmsis['defines']}\n"
+                          if lib_cmsis and "path" in lib_cmsis else "")
+                       + "浮点 ABI 是 softfp，跟 GR551x SDK 的 libble_sdk.a 一致；工程用 hard 的话别用这些 .a，拿源码重编。\n"
+                       "两个 .a 二选一：libtinyml.a 是逐位一致的朴素实现；libtinyml_cmsis.a 把热点换成了 CMSIS 内核"
+                       "（CMSIS 的 .o 已经打在里面，不用再链 CMSIS）。接口、头文件完全一样。\n")
         for extra in ("board/README.md", "docs/ram_and_cache.md"):
             p = os.path.join(ROOT, extra)
             if os.path.exists(p):
                 z.write(p, extra)
         z.writestr("README.txt", readme)
     return os.path.getsize(out_zip)
+
+
+def _accel_readme(kind: str, fp: dict) -> str:
+    a = fp.get("accel")
+    if not a:
+        return ""
+    sw = "-DTM_CMSIS_DSP=1" if kind == "rf" else "-DTM_CMSIS_NN=1"
+    srcs = ", ".join(os.path.basename(p) for p in cmsis.sources(kind))
+    sub = "dsp" if kind == "rf" else "nn"
+    inc = (f"third_party/cmsis/{sub}/Include third_party/cmsis/{sub}/PrivateInclude（PC 上编加 -D__GNUC_PYTHON__）"
+           if kind == "rf" else f"third_party/cmsis/{sub}/Include")
+    return (
+        f"可选加速（{a['name']}，默认关）：\n"
+        f"  接法 A 加 {sw}，并把 third_party/cmsis/{sub}/Source/ 里的 {srcs} 一起编，-I {inc}；\n"
+        f"  交叉编译还要 CMSIS-Core 的 cmsis_compiler.h（SDK 自带，third_party/cmsis/core/Include 也有一份）。\n"
+        f"  接法 B 直接换链 lib/libtinyml_cmsis.a（CMSIS 的 .o 已打在里面），头文件不变。\n"
+        f"  {a['note']}。\n"
+        f"  占用变化：flash {a['flash']['delta']:+,} B，RAM {a['ram']['delta']:+,} B"
+        + (f"；x86 上每窗 {a['host_us_per_window']} µs" if a.get("host_us_per_window") is not None else "")
+        + "。\n"
+        + ("  M4F 上 CMSIS-NN 用 SMLAD 一次算两对乘加，卷积大致快 2～4 倍；" if kind != "rf" else
+           "  M4F 上 CMSIS 的 FFT 是基-8 + 循环展开，特征那一段大致快 2～3 倍；")
+        + "具体快多少要板上量。\n\n"
+    )
 
 
 def bundle_readme(kind: str, meta: dict, fp: dict) -> str:
@@ -279,6 +425,7 @@ def bundle_readme(kind: str, meta: dict, fp: dict) -> str:
         "  A. 源码：把 core/*.c 和 model/*.c 加进工程一起编（推荐，编译选项跟自己的 SDK 一定一致）\n"
         "  B. 静态库：链 lib/libtinyml.a，include/ 里是头文件。预编选项见 lib/BUILD_FLAGS.txt，\n"
         "     Cortex-M4F + softfp（跟 GR551x SDK 一致）；工程是 hard ABI 的话链不上，用 A\n\n"
+        + _accel_readme(kind, fp) +
         f"模型：{kind}，{meta.get('n_channels')} 通道 × {meta.get('window_size')} 点 @{meta.get('hz')}Hz，"
         f"类别 {','.join(meta.get('classes') or [])}\n\n"
         f"编译：务必带 -ffp-contract=off（否则浮点末位跟 PC 对不上，golden 自检会红）；\n"

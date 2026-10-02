@@ -48,9 +48,16 @@ static int selftest_cnn(tm_selftest_report_t *r)
             return -1;
         }
         const int8_t *want = tm_golden_out + (size_t)i * TM_N_CLASSES;
-        if (memcmp(out, want, TM_N_CLASSES) != 0) {
-            /* 逐字节比，不是比 argmax。只比 argmax 的话，一个已经算错、只是恰好
-             * 还没把类别翻过去的实现能一路混到量产。 */
+        /* 逐字节比，不是比 argmax。只比 argmax 的话，一个已经算错、只是恰好
+         * 还没把类别翻过去的实现能一路混到量产。
+         * TM_CMSIS_NN 那条路允许差 1 LSB（重量化平局的舍入方向不同，见 tm_accel.h）。 */
+        int mismatch = 0;
+        for (int c = 0; c < TM_N_CLASSES; c++) {
+            int d = (int)out[c] - (int)want[c];
+            if (d < 0) d = -d;
+            if (d > (TM_CMSIS_NN ? 1 : 0)) mismatch = 1;
+        }
+        if (mismatch) {
             r->fail_index = i;
             r->fail_kind = TM_SELFTEST_MISMATCH;
             r->got = out[0];
@@ -79,7 +86,11 @@ static int selftest_rf(tm_selftest_report_t *r)
             uint32_t a, b;
             memcpy(&a, &proba[c], sizeof a);
             memcpy(&b, &want[c], sizeof b);
-            if (a != b) {
+            /* TM_CMSIS_DSP 那条路特征不逐位（FFT 算法不同），概率按相对 1e-4 比 */
+            float da = proba[c] - want[c];
+            if (da < 0) da = -da;
+            int diff = TM_CMSIS_DSP ? (da > 1e-4f * (want[c] < 0 ? -want[c] : want[c]) + 1e-6f) : (a != b);
+            if (diff) {
                 r->fail_index = i;
                 r->fail_kind = TM_SELFTEST_MISMATCH;
                 r->got_bits = a;

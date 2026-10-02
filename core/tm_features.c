@@ -3,6 +3,10 @@
 #include <math.h>
 #include <string.h>
 
+#if TM_CMSIS_DSP
+#include "arm_math.h"
+#endif
+
 /* 所有求和都是从左到右逐个累加，跟 Python 参考实现的 fsum 一样。
  * 别"顺手"改成分块累加或者 SIMD——浮点加法不满足结合律，一改两边就对不上了，
  * 而且差别小到肉眼看不出来。真要提速，先改这里再重跑 golden vector。 */
@@ -13,6 +17,64 @@ static float fsum(const float *a, int n)
         acc += a[i];
     }
     return acc;
+}
+
+/* 下面几个是"可换成 CMSIS"的向量原语。默认走上面那种逐个累加（逐位一致）；
+ * TM_CMSIS_DSP=1 时换成 CMSIS-DSP 的实现——M4F 上两路并行累加、循环展开，
+ * 结果跟逐个累加差在末几位。 */
+static float vmean(const float *a, int n)
+{
+#if TM_CMSIS_DSP
+    float r;
+    arm_mean_f32(a, (uint32_t)n, &r);
+    return r;
+#else
+    return fsum(a, n) / (float)n;
+#endif
+}
+
+/* Σ a[i]*a[i] */
+static float vpower(const float *a, int n)
+{
+#if TM_CMSIS_DSP
+    float r;
+    arm_power_f32(a, (uint32_t)n, &r);
+    return r;
+#else
+    float acc = 0.0f;
+    for (int i = 0; i < n; i++) acc += a[i] * a[i];
+    return acc;
+#endif
+}
+
+/* Σ a[i]*b[i] */
+static float vdot(const float *a, const float *b, int n)
+{
+#if TM_CMSIS_DSP
+    float r;
+    arm_dot_prod_f32(a, b, (uint32_t)n, &r);
+    return r;
+#else
+    float acc = 0.0f;
+    for (int i = 0; i < n; i++) acc += a[i] * b[i];
+    return acc;
+#endif
+}
+
+static void vminmax(const float *a, int n, float *mn, float *mx)
+{
+#if TM_CMSIS_DSP
+    arm_min_no_idx_f32(a, (uint32_t)n, mn);
+    arm_max_no_idx_f32(a, (uint32_t)n, mx);
+#else
+    float lo = a[0], hi = a[0];
+    for (int i = 1; i < n; i++) {
+        if (a[i] < lo) lo = a[i];
+        if (a[i] > hi) hi = a[i];
+    }
+    *mn = lo;
+    *mx = hi;
+#endif
 }
 
 static void sort_asc(float *a, int n)
@@ -77,23 +139,18 @@ static void time_stats(const float *x, int n, float *out)
     static float d[TM_FEAT_MAX_T];
     static float tmp[TM_FEAT_MAX_T];
 
-    float mean = fsum(x, n) / (float)n;
+    float mean = vmean(x, n);
     for (int i = 0; i < n; i++) {
         d[i] = x[i] - mean;
     }
 
-    for (int i = 0; i < n; i++) tmp[i] = d[i] * d[i];
-    float m2 = fsum(tmp, n) / (float)n;
+    float m2 = vpower(d, n) / (float)n;
     float std = sqrtf(m2);
 
-    float xmin = x[0], xmax = x[0];
-    for (int i = 1; i < n; i++) {
-        if (x[i] < xmin) xmin = x[i];
-        if (x[i] > xmax) xmax = x[i];
-    }
+    float xmin, xmax;
+    vminmax(x, n, &xmin, &xmax);
 
-    for (int i = 0; i < n; i++) tmp[i] = x[i] * x[i];
-    float rms = sqrtf(fsum(tmp, n) / (float)n);
+    float rms = sqrtf(vpower(x, n) / (float)n);
 
     float skew = 0.0f, kurt = 0.0f;
     if (std > 1e-8f) {
@@ -132,6 +189,51 @@ static void time_stats(const float *x, int n, float *out)
     out[10] = (float)count_peaks(x, n);
 }
 
+#if TM_CMSIS_DSP
+/* CMSIS 的 FFT：复数交错存放（re0 im0 re1 im1 …），实例按段长初始化一次后缓存。
+ * 旋转因子和位反序表由 CMSIS 自带（编译时用 ARM_TABLE_* 只带需要的长度），
+ * cfg 里从 Python 导出的 cos/sin/bitrev 表在这条路上用不到。 */
+static void fft_r2(const tm_feat_cfg_t *cfg, float *re, float *im)
+{
+    const int n = cfg->nperseg;
+    static arm_cfft_instance_f32 inst;
+    static int inst_len = 0;
+    static float buf[2 * TM_FEAT_MAX_NPERSEG];
+    if (inst_len != n) {
+        /* 按长度调各自的 init，而不是 arm_cfft_init_f32：后者的 switch 把 16～4096 点的
+         * 表全引用进来，链接器就没法丢掉没用的那些（光 4096 点的旋转因子就 32 KB）。
+         * 再按 TM_FEAT_MAX_NPERSEG 把用不到的长度砍掉——编译时给 -DTM_FEAT_MAX_NPERSEG=16
+         * 就只带 16 点那一张表（0.2 KB）。 */
+        arm_status st;
+        switch (n) {
+        case 16:  st = arm_cfft_init_16_f32(&inst); break;
+#if TM_FEAT_MAX_NPERSEG >= 32
+        case 32:  st = arm_cfft_init_32_f32(&inst); break;
+#endif
+#if TM_FEAT_MAX_NPERSEG >= 64
+        case 64:  st = arm_cfft_init_64_f32(&inst); break;
+#endif
+#if TM_FEAT_MAX_NPERSEG >= 128
+        case 128: st = arm_cfft_init_128_f32(&inst); break;
+#endif
+#if TM_FEAT_MAX_NPERSEG >= 256
+        case 256: st = arm_cfft_init_256_f32(&inst); break;
+#endif
+        default:  st = ARM_MATH_ARGUMENT_ERROR; break;
+        }
+        if (st != ARM_MATH_SUCCESS) {
+            /* 这个段长没带表（third_party/cmsis 只带 16～256 点）：退回零输出，
+             * 让 golden 自检当场失败，而不是板上悄悄算出垃圾 */
+            for (int i = 0; i < n; i++) { re[i] = 0.0f; im[i] = 0.0f; }
+            return;
+        }
+        inst_len = n;
+    }
+    for (int i = 0; i < n; i++) { buf[2 * i] = re[i]; buf[2 * i + 1] = im[i]; }
+    arm_cfft_f32(&inst, buf, 0, 1);
+    for (int i = 0; i < n; i++) { re[i] = buf[2 * i]; im[i] = buf[2 * i + 1]; }
+}
+#else
 /* 就地基-2 DIT FFT。循环结构跟 Python 的 fft_r2 完全一致。 */
 static void fft_r2(const tm_feat_cfg_t *cfg, float *re, float *im)
 {
@@ -163,6 +265,7 @@ static void fft_r2(const tm_feat_cfg_t *cfg, float *re, float *im)
         }
     }
 }
+#endif /* TM_CMSIS_DSP */
 
 /* scipy.signal.welch 的默认参数：density / onesided / mean / detrend='constant'。 */
 static void welch_psd(const tm_feat_cfg_t *cfg, const float *x, int n, float *psd)
@@ -172,16 +275,14 @@ static void welch_psd(const tm_feat_cfg_t *cfg, const float *x, int n, float *ps
     const int step = nps - noverlap;
     const int n_out = nps / 2 + 1;
 
-    static float wp[TM_FEAT_MAX_NPERSEG];
-    for (int i = 0; i < nps; i++) wp[i] = cfg->win[i] * cfg->win[i];
-    const float scale = 1.0f / (cfg->fs * fsum(wp, nps));
+    const float scale = 1.0f / (cfg->fs * vpower(cfg->win, nps));
 
     for (int k = 0; k < n_out; k++) psd[k] = 0.0f;
 
     int n_seg = 0;
     static float re[TM_FEAT_MAX_NPERSEG], im[TM_FEAT_MAX_NPERSEG];
     for (int s0 = 0; s0 + nps <= n; s0 += step) {
-        float m = fsum(x + s0, nps) / (float)nps;
+        float m = vmean(x + s0, nps);
         for (int i = 0; i < nps; i++) {
             re[i] = (x[s0 + i] - m) * cfg->win[i];
             im[i] = 0.0f;
@@ -219,8 +320,7 @@ static void freq_stats(const tm_feat_cfg_t *cfg, const float *x, int n, float *o
     const float total = fsum(psd, n_out) + 1e-8f;
     for (int k = 0; k < n_out; k++) pn[k] = psd[k] / total;
 
-    for (int k = 0; k < n_out; k++) tmp[k] = freqs[k] * pn[k];
-    const float spec_mean = fsum(tmp, n_out);
+    const float spec_mean = vdot(freqs, pn, n_out);
 
     for (int k = 0; k < n_out; k++) {
         const float dv = freqs[k] - spec_mean;
@@ -266,20 +366,16 @@ static void magnitude(const float *x, int n_t, int c0, float *out, int n)
 
 static float corr(const float *xi, const float *xj, int n)
 {
-    static float tmp[TM_FEAT_MAX_T];
     static float di[TM_FEAT_MAX_T], dj[TM_FEAT_MAX_T];
-    const float mi = fsum(xi, n) / (float)n;
-    const float mj = fsum(xj, n) / (float)n;
+    const float mi = vmean(xi, n);
+    const float mj = vmean(xj, n);
     for (int i = 0; i < n; i++) { di[i] = xi[i] - mi; dj[i] = xj[i] - mj; }
-    for (int i = 0; i < n; i++) tmp[i] = di[i] * di[i];
-    const float si = sqrtf(fsum(tmp, n) / (float)n);
-    for (int i = 0; i < n; i++) tmp[i] = dj[i] * dj[i];
-    const float sj = sqrtf(fsum(tmp, n) / (float)n);
+    const float si = sqrtf(vpower(di, n) / (float)n);
+    const float sj = sqrtf(vpower(dj, n) / (float)n);
     if (si <= 1e-8f || sj <= 1e-8f) {
         return 0.0f;  /* 常数通道（传感器卡死）。不挡的话是 0/0 = nan */
     }
-    for (int i = 0; i < n; i++) tmp[i] = di[i] * dj[i];
-    return (fsum(tmp, n) / (float)n) / (si * sj);
+    return (vdot(di, dj, n) / (float)n) / (si * sj);
 }
 
 #ifdef TM_BENCH

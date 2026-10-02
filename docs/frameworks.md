@@ -40,8 +40,11 @@ Cortex-M4 的 SIMD/DSP 指令写的。Arm 给的数据是相对参考实现
 **4.6 倍吞吐、4.9 倍能效**（[TF 博客](https://blog.tensorflow.org/2021/02/accelerated-inference-on-arm-microcontrollers-with-tensorflow-lite.html)）。
 
 它是我们 CNN 那条路线**唯一值得现在就考虑的东西**：保留自己的运行时和 golden
-vector，只把三重循环换成 CMSIS-NN 的核。换完之后 golden vector 必须原样通过——
-这正是当初坚持"先有对照，再谈优化"的用处。
+vector，只把三重循环换成 CMSIS-NN 的核。**已经做了**，编译开关 `-DTM_CMSIS_NN=1`
+（`core/tm_accel.h`），默认关。换完 golden 没有"原样通过"：整数累加一样，但 CMSIS 的
+`arm_nn_doubling_high_mult_no_sat` 对负数平局也是 +2^30（向上），gemmlowp 是向远离零，
+所以个别输出差 1 LSB，自检按 ±1 比。这正是当初坚持"先有对照，再谈优化"的用处——
+差在哪、差多少，一眼就看得见。
 
 注意 CMSIS-NN 的量化约定跟 TFLite 一致（per-channel 乘子 + shift），而我们的
 `fixedpoint.py` 照抄的就是 gemmlowp/TFLite 那套，所以对接是顺的。这不是巧合，
