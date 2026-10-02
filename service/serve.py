@@ -43,7 +43,32 @@ FW = os.path.join(ROOT, "core")
 HOST_C = os.path.join(ROOT, "host", "tm_host.c")
 
 
-def build(gen_dir, out_so=None, cc="gcc"):
+def _cmsis_args(kind, use_cmsis):
+    """use_cmsis=True：PC 上也走 CMSIS 那条路（x86 上是 CMSIS 的通用 C 实现，没有 SIMD），
+    用来验证开了开关结果还对不对、顺便比个速度。CMSIS 自己的 .c 不带 -Werror 编（不是我们的代码）。"""
+    if not use_cmsis:
+        return [], []
+    from tinyml import cmsis
+    if not cmsis.available():
+        sys.exit("third_party/cmsis 不在，没法编 CMSIS 那条路")
+    flags = [f"-D{k}={v}" for k, v in cmsis.defines(kind, host=True).items()] + \
+            [f"-I{i}" for i in cmsis.include_dirs(kind, host=True)] + ["-ffunction-sections", "-fdata-sections"]
+    # CMSIS 的 .c 先单独编成 .o，带 -fvisibility=hidden：.so 里不导出它们的符号，--gc-sections
+    # 才能把 arm_cfft_init_f32 这种引用了 2048/4096 点表的通用入口扔掉（我们只带 16～256 点的表，
+    # 留着 dlopen 会报 undefined symbol）。我们自己的包装符号照常导出。
+    objdir = tempfile.mkdtemp()
+    objs = []
+    for src in cmsis.sources(kind):
+        obj = os.path.join(objdir, os.path.basename(src) + ".o")
+        r = subprocess.run(["gcc", "-c", "-O2", "-std=c99", "-fPIC", "-w", "-fvisibility=hidden", *flags, src, "-o", obj],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit(f"CMSIS 编译失败：{src}\n{r.stderr[-1500:]}")
+        objs.append(obj)
+    return flags, objs
+
+
+def build(gen_dir, out_so=None, cc="gcc", use_cmsis=False):
     """把固件的 C 编成共享库。
 
     -ffp-contract=off 不是可选项：FMA 收缩会少一次中间舍入，
@@ -56,19 +81,21 @@ def build(gen_dir, out_so=None, cc="gcc"):
         sys.exit(f"{gen_dir} 里缺 {missing}。\n"
                  "  先跑一次 export_cnn.py 生成，--out 指到这个目录。")
     out_so = out_so or os.path.join(tempfile.mkdtemp(), "tm_host.so")
+    cflags, csrcs = _cmsis_args("cnn", use_cmsis)
     cmd = [cc, "-O2", "-std=c99", "-Wall", "-Wextra", "-Werror",
-           "-ffp-contract=off", "-fno-math-errno", "-fPIC", "-shared",
+           "-ffp-contract=off", "-fno-math-errno", "-fPIC", "-shared", *cflags,
            f"-I{FW}", f"-I{gen_dir}",
            os.path.join(FW, "tm_prep.c"), os.path.join(FW, "tm_runtime.c"),
            os.path.join(gen_dir, "tm_model.c"), HOST_C,
-           "-lm", "-o", out_so]
+           *csrcs,
+           "-Wl,--gc-sections", "-lm", "-o", out_so]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit(f"编译失败：\n{r.stderr}")
     return out_so
 
 
-def build_rf(gen_dir, out_so=None, cc="gcc"):
+def build_rf(gen_dir, out_so=None, cc="gcc", use_cmsis=False):
     """编 RF 那条路线的 .so。紧凑编码和老 SoA 编码**自动识别**。
 
     跟 build() 分开，因为两条路线的导出文件名不同——合成一个带开关的函数，
@@ -97,14 +124,16 @@ def build_rf(gen_dir, out_so=None, cc="gcc"):
                  "  先跑 export_rf.py 生成，--out 指到这个目录。\n"
                  "  128KB 预算下基本只能用紧凑编码，记得带 --compact。")
     out_so = out_so or os.path.join(tempfile.mkdtemp(), "tm_host_rf.so")
+    cflags, csrcs = _cmsis_args("rf", use_cmsis)
     cmd = [cc, "-O2", "-std=c99", "-Wall", "-Wextra", "-Werror",
-           "-ffp-contract=off", "-fno-math-errno", "-fPIC", "-shared",
+           "-ffp-contract=off", "-fno-math-errno", "-fPIC", "-shared", *cflags,
            f"-I{FW}", f"-I{gen_dir}",
            os.path.join(FW, "tm_features.c"), os.path.join(FW, runtime),
            os.path.join(gen_dir, model_c),
            os.path.join(gen_dir, "tm_feat_cfg.c"),
            os.path.join(ROOT, "host", host_c),
-           "-lm", "-o", out_so]
+           *csrcs,
+           "-Wl,--gc-sections", "-lm", "-o", out_so]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit(f"编译失败：\n{r.stderr}")

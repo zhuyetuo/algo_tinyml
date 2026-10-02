@@ -289,9 +289,11 @@ cache 和预取都用得上。两者的取舍见 [docs/dl_edge.md](docs/dl_edge.
   [board/README.md](board/README.md)。
 - **没有 QMI8658B 的驱动。** 寄存器配置（量程、ODR、FIFO 水位）要对着手册写，
   写错了表现成"特征量纲不对、模型全错"，没凭印象写。
-- **没做性能优化。** 算子是最朴素的三重循环，没用 CMSIS-NN、没用 M4F 的 DSP 指令。
-  这是有意的：第一版要的是"板上跟 PC 一模一样"。换 CMSIS-NN 之后，这套 golden
-  vector 正好用来证明结果没变——**先有对照，再谈优化**。
+- **默认不做性能优化。** 算子是最朴素的三重循环，板上跟 PC 逐位一样。要快的话有一个
+  编译开关 `-DTM_USE_CMSIS`（见 `core/tm_accel.h`）：FFT / 向量统计换 CMSIS-DSP，
+  int8 卷积 / 池化 / 全连接换 CMSIS-NN，裁好的 CMSIS 子集在 `third_party/cmsis/`。
+  代价是不再逐位：特征相对误差 1e-6 级，CNN 个别输出差 1 LSB（重量化平局的舍入方向不同）。
+  `tests/test_cmsis_c.py` 钉着这两条容差；导出的源码包里两条路各有一个 .a。
 - **没量实际功耗和耗时。** 要板子。
 
 ---

@@ -8,12 +8,16 @@
  * libm 上末位可能不同，而那是两边对不上的一个来源，堵掉它比事后查便宜得多。
  *
  * 编译务必带 -ffp-contract=off。
+ *
+ * -DTM_CMSIS_DSP=1 把 FFT 和向量统计换成 CMSIS-DSP（见 tm_accel.h）：快，但不再逐位一致。
  */
 
 #ifndef TM_FEATURES_H
 #define TM_FEATURES_H
 
 #include <stdint.h>
+
+#include "tm_accel.h"
 
 #ifdef __cplusplus
 extern "C" {

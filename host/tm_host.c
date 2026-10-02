@@ -75,7 +75,8 @@ int th_infer_batch(const float *wins, int n, int8_t *classes, int8_t *scores)
  * 这是有意的：tm_prep 那一段有它自己的对照测试（tests/test_prep_c.py），
  * 混在一起的话，一旦对不上，分不清是量化错了还是推理错了。
  *
- * 返回不一致的**字节数**，0 表示逐位相同。 */
+ * 返回不一致的**字节数**，0 表示逐位相同。
+ * TM_CMSIS_NN 那条路允许差 1 LSB（重量化平局的舍入方向不同，见 tm_accel.h），差 2 以上才算错。 */
 int th_selftest(void)
 {
     int bad = 0;
@@ -86,7 +87,9 @@ int th_selftest(void)
             return -1;
         }
         for (int c = 0; c < TM_N_CLASSES; c++) {
-            if (g_out[c] != want[c]) {
+            int d = (int)g_out[c] - (int)want[c];
+            if (d < 0) d = -d;
+            if (d > (TM_CMSIS_NN ? 1 : 0)) {
                 bad++;
             }
         }

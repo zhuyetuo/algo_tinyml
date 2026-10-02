@@ -154,6 +154,27 @@ def _load_holdout(imu_train: str, processed_dir: str, hz: int, remap: str | None
     raise SystemExit(f"{processed_dir} 里一个窗口都没有")
 
 
+def _cmsis_bench(kind, gen_dir, windows, plain_cls):
+    """CMSIS 那条路在 PC 上也编一份，量每窗耗时、顺便看判决跟朴素实现一致多少。
+    编不出来（没带 third_party）就跳过，不影响导出。"""
+    try:
+        from footprint import bench_host
+        from tinyml import cmsis
+        if not cmsis.available():
+            return {}
+        eng = serve.Engine(serve.build(gen_dir, use_cmsis=True)) if kind == "cnn" \
+            else serve.RfEngine(serve.build_rf(gen_dir, use_cmsis=True))
+        cls = np.asarray(eng.infer(windows)[0])
+        return {"host_us_per_window_cmsis": bench_host(lambda w: eng.infer(w), windows),
+                "cmsis_agree": round(float(np.mean(cls == plain_cls)), 4)}
+    except SystemExit as e:  # serve.build 编不过是 sys.exit
+        print(f"（CMSIS 那条路在 PC 上没编过，跳过：{str(e)[:200]}）")
+        return {}
+    except Exception as e:  # noqa: BLE001
+        print(f"（CMSIS 那条路跳过：{e}）")
+        return {}
+
+
 def _job_meta(tag: str, model_path: str, meta: dict, n_ch: int, extra: dict) -> dict:
     job_id = int(tag[5:]) if tag.startswith("train") and tag[5:].isdigit() else None
     out = dict(meta)
@@ -255,7 +276,8 @@ def export_cnn(model_pt: str, tag: str, processed_dir: str, remap: str | None,
                            int(cfg.get("kernel_size", 3)))["macs"]
     edge["footprint"] = measure(out, "cnn", window, n_ch, len(classes), {
         "macs": macs, "arena_bytes": arena,
-        "host_us_per_window": bench_host(lambda w: eng.infer(w), Xc[:256])})
+        "host_us_per_window": bench_host(lambda w: eng.infer(w), Xc[:256]),
+        **_cmsis_bench("cnn", out, Xc[:256], np.asarray(eng.infer(Xc[:256])[0]))})
     fp = edge["footprint"]
     print(f"板上占用（{fp['toolchain']}）：flash {fp['flash']['total_without_golden'] / 1024:.1f} KB"
           f"（模型 {fp['flash']['model'] / 1024:.1f} + 代码 {fp['flash']['runtime'] / 1024:.1f}），RAM {fp['ram']['total_without_post'] / 1024:.1f} KB")
@@ -379,9 +401,11 @@ def export(model_pkl: str, tag: str, processed_dir: str, remap: str | None,
         print(f"  {c:<12} P {m['precision']:.2f}  R {m['recall']:.2f}  F1 {m['f1-score']:.2f}  (n={m['support']})")
 
     from footprint import bench_host, measure
+    Xb = np.ascontiguousarray(X[:256].transpose(0, 2, 1))
     edge["footprint"] = measure(out, "rf", window, n_ch, len(classes), {
         "trees": cf.n_trees, "depth": int(max(e.tree_.max_depth for e in model.estimators_)), "nodes": int(cf.n_nodes),
-        "host_us_per_window": bench_host(lambda w: eng.infer(w), np.ascontiguousarray(X[:256].transpose(0, 2, 1)))})
+        "host_us_per_window": bench_host(lambda w: eng.infer(w), Xb),
+        **_cmsis_bench("rf", out, Xb, np.asarray(eng.infer(Xb)[0]))})
     fp = edge["footprint"]
     print(f"板上占用（{fp['toolchain']}）：flash {fp['flash']['total_without_golden'] / 1024:.1f} KB"
           f"（模型 {fp['flash']['model'] / 1024:.1f} + 代码 {fp['flash']['runtime'] / 1024:.1f}），RAM {fp['ram']['total_without_post'] / 1024:.1f} KB")

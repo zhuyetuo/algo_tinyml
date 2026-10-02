@@ -6,12 +6,17 @@
  * 某次分配失败，表现成偶发死机。
  *
  * 没有 float：GR5513 有 FPU，但定点全程 int32 更省电、也更容易保证两边一致。
+ *
+ * -DTM_CMSIS_NN=1 把卷积/池化/全连接换成 CMSIS-NN（见 tm_accel.h）：结果逐位不变，
+ * 但 arena 要大一点（TM_ARENA_BYTES 由导出脚本按开关给，已含对齐余量）。
  */
 
 #ifndef TM_RUNTIME_H
 #define TM_RUNTIME_H
 
 #include <stdint.h>
+
+#include "tm_accel.h"
 
 #ifdef __cplusplus
 extern "C" {
