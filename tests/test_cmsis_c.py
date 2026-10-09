@@ -215,7 +215,7 @@ def test_footprint_报告cmsis变体并打出两个静态库(cnn_built):
     names = zipfile.ZipFile(z).namelist()
     assert "lib/libtinyml.a" in names and "lib/libtinyml_cmsis.a" in names
     assert "third_party/cmsis/dsp/Source/tm_cmsis_tables.c" in names and "third_party/cmsis/core/Include/cmsis_gcc.h" in names
-    assert "CMSIS" in zipfile.ZipFile(z).read("README.txt").decode()
+    assert "CMSIS" in zipfile.ZipFile(z).read("README.md").decode()
 
     _, _, d = cnn_built
     with tempfile.TemporaryDirectory() as tmp:
