@@ -81,6 +81,7 @@ core/         跟芯片无关的纯 C，PC 上也能编（tests/ 就是这么测
   tm_forest.c/h          随机森林推理（照抄 sklearn 的概率平均，不是多数投票）
   tm_gbdt.c/h            XGBoost 推理（判决是 < 不是 <=；叶子相加；端上不做 softmax）
   tm_features.c/h        193 维手工特征（含基-2 FFT、Welch、时域统计）
+  tm_imu.c/h             IMU 6 轴 → 模型 8 通道：重力对齐 + pitch/roll（训练时 gravity_align.py 的 C 版）
   models/edge_rf_d10/    上板的随机森林：权重导出成 C（flash 109.9 KB，见「上板占用」）
   models/edge_cnn_i8/    上板的 int8 CNN：同上（flash 79.0 KB）
 board/         挂进 Goodix SDK 的工程（见它自己的 README）
@@ -104,6 +105,24 @@ tools/host_sim.c         在 PC 上跑板上那份 C，喂真实数据
 `{名字: numpy 数组}` 的 npz，量化、导出、对照那一整条链只依赖 numpy。所以换框架、
 换训练机器都不波及固件，而且工具链能用随机权重自测——不用先有一个训好的模型
 才能验证它。
+
+---
+
+## 交给嵌入式的端侧包
+
+平台「模型训练 → 训练记录」每行的 **下载端侧包** 一键出 zip（没导过端侧会先自动导）。
+包是自包含的：`core/` 运行时 + `model/` 这版模型 + `core/tm_imu.c`（8 通道输入映射）+
+`pc/edge_cli.c`（PC 参考实现）+ `Makefile` + `README.md`。Linux 上：
+
+```bash
+unzip edge_rf_train14_v14.zip -d edge && cd edge
+make test                                   # golden 自检 + 跑示例 CSV
+./edge_cli 采集.csv --acc-scale 0.00048828125 --gyr-scale 0.06103515625   # int16 原始计数 → 逐窗口状态
+```
+
+包的模板在 `bundle/`（`edge_cli.c`、`Makefile`、`README.template.md`），打包逻辑在
+`service/footprint.py: write_bundle`。`tests/test_bundle.py` 每次都真的解压 → `make test`，
+包里少文件会在这里红。命令行打包：`python3 service/export_train.py --tag train14 --bundle out.zip`。
 
 ---
 

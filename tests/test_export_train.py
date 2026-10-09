@@ -105,7 +105,7 @@ def test_footprint_measures_committed_rf():
     z = tempfile.mktemp(suffix=".zip")
     write_bundle(gen, "rf", z, bundle_readme("rf", meta, fp))
     names = zipfile.ZipFile(z).namelist()
-    assert "core/tm_features.c" in names and "model/tm_forest_c_model.c" in names and "README.txt" in names
+    assert "core/tm_features.c" in names and "model/tm_forest_c_model.c" in names and "README.md" in names
 
 
 def test_quantize_percentile_range():

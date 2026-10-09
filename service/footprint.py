@@ -29,6 +29,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CORE = os.path.join(ROOT, "core")
+BUNDLE_SRC = os.path.join(ROOT, "bundle")  # 包里 pc/ 和 Makefile、README 的模板
 
 import sys  # noqa: E402
 
@@ -41,8 +42,8 @@ ARM_FLAGS = ["-Os", "-std=c99", "-mcpu=cortex-m4", "-mthumb", "-mfpu=fpv4-sp-d16
 HOST_FLAGS = ["-Os", "-std=c99", "-ffp-contract=off", "-fno-math-errno", "-ffunction-sections", "-fdata-sections"]
 
 RUNTIME = {
-    "rf": ["tm_features.c", "tm_forest_c.c", "tm_window.c", "tm_post.c", "tm_post_cfg.c"],
-    "cnn": ["tm_prep.c", "tm_runtime.c", "tm_window.c", "tm_post.c", "tm_post_cfg.c"],
+    "rf": ["tm_imu.c", "tm_features.c", "tm_forest_c.c", "tm_window.c", "tm_post.c", "tm_post_cfg.c"],
+    "cnn": ["tm_imu.c", "tm_prep.c", "tm_runtime.c", "tm_window.c", "tm_post.c", "tm_post_cfg.c"],
 }
 MODEL_FILES = {"rf": ["tm_forest_c_model.c"], "cnn": ["tm_model.c"]}
 TABLE_FILES = {"rf": ["tm_feat_cfg.c"], "cnn": []}
@@ -128,16 +129,17 @@ def golden_bytes(gen_dir: str, kind: str) -> int:
 
 def source_bundle_bytes(gen_dir: str, kind: str) -> dict:
     """交给嵌入式的源码包：core/ 里用得到的 .c/.h + 这份导出目录。按文件算。"""
-    names = set(RUNTIME[kind] + MODEL_FILES[kind] + TABLE_FILES[kind])
     files = {}
     for c in RUNTIME[kind]:
         for ext in (".c", ".h"):
             p = os.path.join(CORE, c.replace(".c", ext))
             if os.path.exists(p):
                 files[f"core/{os.path.basename(p)}"] = os.path.getsize(p)
-    for h in ("tm_forest_c.h", "tm_runtime.h", "tm_prep.h", "tm_window.h", "tm_post.h", "tm_post_cfg.h", "tm_features.h"):
+    # 只有头文件、没有 .c 的那几个（tm_features.h / tm_runtime.h 都 include 它）——
+    # 漏了它包里的 C 一个都编不过
+    for h in ("tm_accel.h",):
         p = os.path.join(CORE, h)
-        if os.path.exists(p) and f"core/{h}" not in files and h.replace(".h", ".c") in names:
+        if os.path.exists(p):
             files[f"core/{h}"] = os.path.getsize(p)
     for p in sorted(glob.glob(os.path.join(gen_dir, "*"))):
         if os.path.isfile(p):
@@ -372,12 +374,146 @@ def write_bundle(gen_dir: str, kind: str, out_zip: str, readme: str,
                        + "浮点 ABI 是 softfp，跟 GR551x SDK 的 libble_sdk.a 一致；工程用 hard 的话别用这些 .a，拿源码重编。\n"
                        "两个 .a 二选一：libtinyml.a 是逐位一致的朴素实现；libtinyml_cmsis.a 把热点换成了 CMSIS 内核"
                        "（CMSIS 的 .o 已经打在里面，不用再链 CMSIS）。接口、头文件完全一样。\n")
+        extras = []
         for extra in ("board/README.md", "docs/ram_and_cache.md"):
             p = os.path.join(ROOT, extra)
             if os.path.exists(p):
                 z.write(p, extra)
-        z.writestr("README.txt", readme)
+                extras.append(extra)
+        # PC 参考实现：Linux 上 make 一下就能命令行跑，嵌入式拿它对板上结果
+        geo = bundle_geometry(gen_dir, kind)
+        z.write(os.path.join(BUNDLE_SRC, "edge_cli.c"), "pc/edge_cli.c")
+        z.writestr("pc/tm_edge_cfg.h", _edge_cfg_h(geo))
+        z.writestr("pc/sample.csv", sample_csv(geo["hz"], geo["n_ch"] - 2))
+        mk = open(os.path.join(BUNDLE_SRC, "Makefile"), encoding="utf-8").read()
+        z.writestr("Makefile", mk.replace("@KIND@", kind).replace("@N_T@", str(max(geo["n_t"], 16)))
+                   .replace("@N_CLASSES@", str(max(geo["n_classes"], 2))))
+        z.writestr("README.md", _fill_file_lists(readme, files, extras, has_lib=bool(lib and "path" in lib),
+                                                  zip_name=os.path.basename(out_zip),
+                                                  has_cmsis=any(n.startswith("third_party/") for n in z.namelist())))
     return os.path.getsize(out_zip)
+
+
+def _define(path: str, name: str) -> int | None:
+    if not os.path.exists(path):
+        return None
+    m = re.search(rf"#define\s+{name}\s+(\d+)", open(path, encoding="utf-8").read())
+    return int(m.group(1)) if m else None
+
+
+def bundle_geometry(gen_dir: str, kind: str) -> dict:
+    """窗口几何：以导出的头文件为准（编进板子的就是它），meta.json 补采样率和步长。"""
+    import json
+
+    meta = {}
+    mp = os.path.join(gen_dir, "meta.json")
+    if os.path.exists(mp):
+        with open(mp, encoding="utf-8") as f:
+            meta = json.load(f)
+    if kind == "rf":
+        n_ch = _define(os.path.join(gen_dir, "tm_feat_cfg.h"), "TM_FEAT_N_CH")
+        n_t = _define(os.path.join(gen_dir, "tm_feat_cfg.h"), "TM_FEAT_N_T")
+        n_cls = _define(os.path.join(gen_dir, "tm_forest_c_model.h"), "TM_FC_N_CLASSES")
+    else:
+        n_ch = _define(os.path.join(gen_dir, "tm_model.h"), "TM_N_CH")
+        n_t = _define(os.path.join(gen_dir, "tm_model.h"), "TM_N_T")
+        n_cls = _define(os.path.join(gen_dir, "tm_model.h"), "TM_N_CLASSES")
+    n_t = n_t or int(meta.get("window_size") or 16)
+    return {
+        "n_ch": n_ch or int(meta.get("n_channels") or 8),
+        "n_t": n_t,
+        "n_classes": n_cls or len(meta.get("classes") or []) or 2,
+        "hz": int(meta.get("hz") or 16),
+        "hop": int(meta.get("stride") or max(n_t // 2, 1)),
+    }
+
+
+def _edge_cfg_h(geo: dict) -> str:
+    return ("/* 自动生成：这一版模型的采样几何，pc/edge_cli.c 用。 */\n"
+            "#ifndef TM_EDGE_CFG_H\n#define TM_EDGE_CFG_H\n"
+            f"#define TM_EDGE_HZ {geo['hz']}        /* 模型采样率 */\n"
+            f"#define TM_EDGE_HOP {geo['hop']}       /* 窗口步长（点），跟训练一致 */\n"
+            f"#define TM_EDGE_N_SENSOR {geo['n_ch'] - 2}  /* IMU 轴数（模型通道数 - pitch/roll 两路） */\n"
+            "#endif\n")
+
+
+def sample_csv(hz: int, n_sensor: int, seconds: int = 60, seed: int = 0) -> str:
+    """合成的示例 CSV（g / °/s）：静止趴着 → 走动 → 高频抖动。**不是真数据**，只用来验证能跑通。"""
+    import math
+    import random
+
+    rnd = random.Random(seed)
+    cols = ["timestamp", "acc_x", "acc_y", "acc_z"] + (["gyro_x", "gyro_y", "gyro_z"] if n_sensor == 6 else [])
+    rows = [",".join(cols)]
+    n = seconds * hz
+    for i in range(n):
+        t = i / hz
+        phase = 3 * i // n
+        if phase == 0:      # 静止：项圈微微倾斜
+            a = [0.17, -0.05, 0.98]
+            g = [0.0, 0.0, 0.0]
+            na, ng = 0.01, 0.5
+        elif phase == 1:    # 走动：~2 Hz 步频
+            w = 2 * math.pi * 2.0 * t
+            a = [0.17 + 0.25 * math.sin(w), -0.05 + 0.1 * math.sin(w / 2), 0.98 + 0.3 * math.cos(w)]
+            g = [20 * math.sin(w), 10 * math.cos(w), 15 * math.sin(w / 2)]
+            na, ng = 0.05, 5.0
+        else:               # 抖动：~6 Hz 大幅
+            w = 2 * math.pi * 6.0 * t
+            a = [0.17 + 0.8 * math.sin(w), -0.05 + 0.6 * math.cos(w), 0.98 + 0.5 * math.sin(2 * w)]
+            g = [150 * math.sin(w), 120 * math.cos(w), 80 * math.sin(w)]
+            na, ng = 0.1, 15.0
+        v = [x + rnd.gauss(0, na) for x in a] + ([x + rnd.gauss(0, ng) for x in g] if n_sensor == 6 else [])
+        rows.append(f"{t:.4f}," + ",".join(f"{x:.5f}" for x in v))
+    return "\n".join(rows) + "\n"
+
+
+_FILE_NOTES = {
+    "tm_features.c": "193 维（3 轴 79 维）手工特征：FFT / Welch / 时域统计",
+    "tm_forest_c.c": "紧凑随机森林推理（整数累加，板上和 PC 逐位一致）",
+    "tm_prep.c": "CNN 输入：逐通道 z-score + int8 量化",
+    "tm_runtime.c": "int8 推理（conv1d / maxpool / dense）",
+    "tm_window.c": "CNN 用的 int8 环形窗口（RF 用 tm_imu 的流式接口即可）",
+    "tm_post.c": "可选：板上后处理（逐窗口判决 → 事件）",
+    "tm_post_cfg.c": "后处理参数",
+    "tm_accel.h": "可选加速（CMSIS）开关，默认关",
+    "tm_feat_cfg.c": "特征常量表（Hann 窗 / FFT 旋转因子 / 位反序）",
+    "tm_forest_c_model.c": "森林：节点表 + uint8 叶子",
+    "tm_model.c": "CNN：int8 权重 + 归一化参数",
+    "tm_forest_c_pipeline_golden.h": "golden：映射好的输入窗口 → 整数票数（自检用，不进量产固件）",
+    "tm_forest_c_golden.h": "golden：特征 → 票数（自检用）",
+    "tm_golden.h": "golden：int8 输入 → int8 输出（自检用）",
+    "meta.json": "训练信息：类别、窗口、各类 F1",
+}
+
+
+def _fill_file_lists(readme: str, files: dict, extras: list, has_lib: bool, zip_name: str,
+                     has_cmsis: bool = False) -> str:
+    def lines(prefix):
+        out, seen = [], set()
+        for rel in files:
+            if not rel.startswith(prefix) or rel == "core/tm_imu.c" or rel == "core/tm_imu.h":
+                continue
+            base = os.path.basename(rel)
+            stem = base[:-2] if base.endswith((".c", ".h")) and base != "tm_accel.h" and not base.endswith("golden.h") else base
+            if stem in seen:
+                continue
+            seen.add(stem)
+            both = base.endswith((".c", ".h")) and stem != base
+            name = f"{stem}.c/h" if both and f"{prefix}{stem}.h" in files and f"{prefix}{stem}.c" in files else base
+            note = _FILE_NOTES.get(stem + ".c", _FILE_NOTES.get(base, ""))
+            out.append(f"  {name:<16} {note}")
+        return "\n".join(out)
+
+    extra = ""
+    if has_lib:
+        extra += "lib/           预编静态库（Cortex-M4F softfp），见 lib/BUILD_FLAGS.txt\ninclude/       只链 .a 时用的头文件\n"
+    if has_cmsis:
+        extra += "third_party/   可选加速用的 CMSIS 子集（默认不用，见「可选加速」）\n"
+    extra += "".join(f"{e:<22} 参考\n" for e in extras)
+    return (readme.replace("@CORE_LIST@", lines("core/")).replace("@MODEL_LIST@", lines("model/"))
+            .replace("@EXTRA_LIST@", extra).replace("@ZIP_NAME@", zip_name)
+            .replace("@ZIP_STEM@", os.path.splitext(zip_name)[0]))
 
 
 def _accel_readme(kind: str, fp: dict) -> str:
@@ -405,40 +541,76 @@ def _accel_readme(kind: str, fp: dict) -> str:
 
 
 def bundle_readme(kind: str, meta: dict, fp: dict) -> str:
+    """包里的 README.md：Linux 上怎么编、怎么命令行测、8 通道怎么来、板上怎么调、占多少。
+    文件清单那几处（@CORE_LIST@ 等）由 write_bundle 按实际打进去的文件填。"""
     fl, rm, inf = fp["flash"], fp["ram"], fp["inference"]
+    classes = list(meta.get("classes") or [])
+    n_ch = int(meta.get("n_channels") or 8)
+    n_sensor = n_ch - 2
+    n_t = int(meta.get("window_size") or 16)
+    hz = int(meta.get("hz") or 16)
+    hop = int(meta.get("stride") or max(n_t // 2, 1))
+    six = n_sensor == 6
     api = (
-        "调用顺序（RF）：\n"
-        "  tm_window_push(&win, sample_float, buf)  每来一个 IMU 样本喂一次，攒满一个窗口返回 1\n"
-        "  tm_features(&tm_feat_cfg, buf, feats)   窗口 → 特征（float[TM_FEAT_DIM]）\n"
-        "  tm_forest_c_predict(&tm_forest_c, feats, votes)  → 每类整数票数，argmax 即类别\n"
-        "  tm_post_on_window(...)                  可选：板上后处理（稳定版 v2），把逐窗口判决聚成事件\n"
+        "```c\n"
+        "#include \"tm_imu.h\"\n#include \"tm_feat_cfg.h\"\n#include \"tm_forest_c_model.h\"\n\n"
+        f"static float x[{n_ch} * {n_t}], feats[TM_FEAT_DIM];\nint32_t votes[TM_FC_N_CLASSES];\n\n"
+        f"if (tm_imu_push(&s, sample, x)) {{                 /* 1. 样本 → {n_ch} 通道窗口（见上一节） */\n"
+        "    tm_features(&tm_feat_cfg, x, feats);          /* 2. 窗口 → 特征 float[TM_FEAT_DIM] */\n"
+        "    int cls = tm_forest_c_predict(&tm_forest_c, feats, votes);  /* 3. → 类别下标；votes 是每类整数票数 */\n"
+        "    /* 4. 可选：tm_post_on_window(...) 板上后处理（稳定版 v2），逐窗口判决聚成事件 */\n"
+        "}\n```"
         if kind == "rf" else
-        "调用顺序（1D-CNN）：\n"
-        "  tm_window_push(&win, sample_float, buf)  每来一个 IMU 样本喂一次，攒满一个窗口返回 1\n"
-        "  tm_prep(&tm_model_prep, buf, x_i8)      逐通道 z-score + 量化成 int8（均值/方差已导进 tm_model.c）\n"
-        "  tm_invoke(&tm_model, x_i8, out, arena, TM_ARENA_BYTES)  → int8 分数，tm_argmax 即类别\n"
-        "  tm_post_on_window(...)                  可选：板上后处理\n"
+        "```c\n"
+        "#include \"tm_imu.h\"\n#include \"tm_model.h\"\n\n"
+        f"static float x[{n_ch} * {n_t}];\nstatic int8_t xi[{n_ch} * {n_t}], arena[TM_ARENA_BYTES];\nint8_t out[TM_N_CLASSES];\n\n"
+        f"if (tm_imu_push(&s, sample, x)) {{                 /* 1. 样本 → {n_ch} 通道窗口（见上一节） */\n"
+        "    tm_prep(&tm_model_prep, x, xi);               /* 2. 逐通道 z-score + 量化成 int8 */\n"
+        "    tm_invoke(&tm_model, xi, out, arena, TM_ARENA_BYTES);  /* 3. → int8 分数 */\n"
+        "    int cls = tm_argmax(out, TM_N_CLASSES);\n"
+        "    /* 4. 可选：tm_post_on_window(...) 板上后处理 */\n"
+        "}\n```"
     )
-    return (
-        f"端侧模型源码包  {meta.get('train', {}).get('tag', '')}\n\n"
-        "两种接法，二选一：\n"
-        "  A. 源码：把 core/*.c 和 model/*.c 加进工程一起编（推荐，编译选项跟自己的 SDK 一定一致）\n"
-        "  B. 静态库：链 lib/libtinyml.a，include/ 里是头文件。预编选项见 lib/BUILD_FLAGS.txt，\n"
-        "     Cortex-M4F + softfp（跟 GR551x SDK 一致）；工程是 hard ABI 的话链不上，用 A\n\n"
-        + _accel_readme(kind, fp) +
-        f"模型：{kind}，{meta.get('n_channels')} 通道 × {meta.get('window_size')} 点 @{meta.get('hz')}Hz，"
-        f"类别 {','.join(meta.get('classes') or [])}\n\n"
-        f"编译：务必带 -ffp-contract=off（否则浮点末位跟 PC 对不上，golden 自检会红）；\n"
-        f"      -DTM_FEAT_MAX_T={meta.get('window_size')} 按真实窗口开缓冲，不给的话按 64 编、RAM 多占一倍。\n"
-        f"      核心代码不依赖任何 OS 接口，裸机或 RTOS 任务里都能调；只用 libm。\n\n"
-        f"占用（{fp['toolchain']}）：\n"
-        f"  flash  模型 {fl['model']:,} B + 常量表 {fl['tables']:,} B + 工程代码 {fl['runtime']:,} B"
-        f" = {fl['total_without_golden']:,} B（{fl['total_without_golden'] / 1024:.1f} KB）；"
-        f"自检 golden 另 {fl['golden']:,} B，量产可只留几条\n"
-        f"  RAM    运行时 {rm['runtime_bss']:,} B + 窗口缓冲 {rm['window_buffer']:,} B"
-        f"{' + arena ' + format(rm['arena'], ',') + ' B' if rm.get('arena') else ''}"
-        f" = {rm['total_without_post']:,} B；用板上后处理再加 {rm['post_state']:,} B\n"
-        f"  推理   {inf.get('note', '')}\n\n" + api +
-        "\n文件：core/ 是跟模型无关的运行时（两条路线共用一份 C），model/ 是这份模型的导出。\n"
-        "golden 自检：host/ 目录没打进来，自检怎么接见 board/README.md。\n"
+    ch_rows = ["| 0, 1, 2 | 重力对齐后的 acc_x, acc_y, acc_z（g） |"]
+    if six:
+        ch_rows.append("| 3, 4, 5 | 重力对齐后的 gyro_x, gyro_y, gyro_z（°/s，跟 acc 用同一个 R） |")
+    ch_rows.append(f"| {n_ch - 2} | pitch（弧度，对齐**前**算） |")
+    ch_rows.append(f"| {n_ch - 1} | roll（弧度，对齐**前**算） |")
+    footprint = (
+        f"| 项 | 字节 |\n|---|---|\n"
+        f"| flash：模型 | {fl['model']:,} |\n| flash：常量表 | {fl['tables']:,} |\n"
+        f"| flash：工程代码 | {fl['runtime']:,} |\n"
+        f"| **flash 合计**（不含 golden） | **{fl['total_without_golden']:,}（{fl['total_without_golden'] / 1024:.1f} KB）** |\n"
+        f"| flash：自检 golden（量产可只留几条） | {fl['golden']:,} |\n"
+        f"| RAM：运行时 | {rm['runtime_bss']:,} |\n| RAM：窗口缓冲 | {rm['window_buffer']:,} |\n"
+        + (f"| RAM：arena | {rm['arena']:,} |\n" if rm.get("arena") else "")
+        + f"| **RAM 合计** | **{rm['total_without_post']:,}** |\n"
+        f"| RAM：用板上后处理另加 | {rm['post_state']:,} |\n\n"
+        f"推理：{inf.get('note', '')}\n"
     )
+    score_note = ("RF 是各类票数占比（叶子 uint8 求和后归一化），判类别看 argmax。" if kind == "rf" else
+                  "CNN 的 int8 分数反量化后做 softmax，只为给个 0~1 的数；判类别看 int8 的 argmax。")
+    rep = {
+        "@TAG@": str((meta.get("train") or {}).get("tag") or "@ZIP_STEM@"),
+        "@KIND_NAME@": "随机森林（rf）" if kind == "rf" else "1D-CNN int8（cnn）",
+        "@N_CH@": str(n_ch), "@N_T@": str(n_t), "@HZ@": str(hz), "@HOP@": str(hop),
+        "@N_SENSOR@": str(n_sensor),
+        "@WIN_S@": f"{n_t / hz:g}", "@HOP_S@": f"{hop / hz:g}",
+        "@CLASSES@": "  ".join(f"{i}={c}" for i, c in enumerate(classes)),
+        "@GYR_COLS@": ",`gyro_x,gyro_y,gyro_z`" if six else "",
+        "@GYR_NOHDR@": ",gx,gy,gz" if six else "",
+        "@GYR_SAMPLE@": " gyro_x gyro_y gyro_z" if six else "",
+        "@GYR_UNIT@": "、角速度 **°/s**" if six else "",
+        "@GYR_ROT@": " 和 gyro" if six else "",
+        "@GYR_SAMPLE_C@": ", gx_dps, gy_dps, gz_dps" if six else "",
+        "@CH_TABLE@": "\n".join(ch_rows),
+        "@API@": api,
+        "@SCORE_NOTE@": score_note,
+        "@ACCEL@": _accel_readme(kind, fp).replace("可选加速（", "### 可选加速（", 1).replace("默认关）：\n", "默认关）\n\n", 1),
+        "@TOOLCHAIN@": fp.get("toolchain", ""),
+        "@FOOTPRINT@": footprint,
+    }
+    s = open(os.path.join(BUNDLE_SRC, "README.template.md"), encoding="utf-8").read()
+    for k, v in rep.items():
+        s = s.replace(k, v)
+    return s
