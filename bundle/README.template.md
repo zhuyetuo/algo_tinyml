@@ -47,6 +47,7 @@ golden 是导出时 Python 参考实现算的，C 必须逐位一样。
 
 ```bash
 ./edge_cli data.csv                          # 结果打到屏幕（CSV）
+./edge_cli 采集.csv --in-hz 50               # 平台样本是 50 Hz
 ./edge_cli data.csv --out result.csv         # 写文件；汇总（各类窗口数、占比、耗时）打在 stderr
 ./edge_cli --help
 ```
@@ -57,7 +58,7 @@ CSV 要求：
 |---|---|
 | 列 | 表头里有 `acc_x,acc_y,acc_z`@GYR_COLS@（`AccX` / `ax` 这类写法也认，大小写不敏感）；其它列（时间戳等）忽略。没表头就按 `ax,ay,az@GYR_NOHDR@` 的列序读 |
 | 单位 | 加速度 **g**，角速度 **°/s**。原始 int16 计数用 `--acc-scale` / `--gyr-scale` 换算（见下） |
-| 采样率 | 默认按 @HZ@ Hz。采集是它的整数倍时加 `--in-hz 50` 之类，会按块平均降到 @HZ@ Hz |
+| 采样率 | 默认按 @HZ@ Hz。不是的话加 `--in-hz`，如平台样本是 50 Hz 就 `--in-hz 50`，按平台同一套方法重采样到 @HZ@ Hz |
 | 缺失 | 空格 / `nan` 当缺失：前向填充，一个窗口缺 > 30% 就跳过（跟平台一致） |
 
 int16 原始计数的换算（量程 / 32768）：
@@ -79,10 +80,10 @@ window,start_s,end_s,class_id,class,conf,p_<类别0>,p_<类别1>,...
 
 `conf` / `p_*`：@SCORE_NOTE@
 
-> 跟平台「端侧模型 · 板上 C」的结果比：模型、特征、输入映射是同一份 C，
-> 采集本来就是 @HZ@ Hz 时逐窗口判决应当一致。降采样不同：平台用 scipy `resample_poly`（FIR），
-> 这里是块平均，所以 `--in-hz` 不等于 @HZ@ 时边缘窗口可能有个别差异。
-> 板上建议直接把 IMU 输出配成 @HZ@ Hz，或者自己做低通 + 抽取。
+> 跟平台「端侧模型 · 板上 C」的结果比：模型、特征、输入映射、重采样都是同一套，逐窗口判决应当一致。
+> 重采样照抄平台：整数倍（如 32→@HZ@）隔点抽；其它比例（如 50→@HZ@）是 scipy `resample_poly`
+> 那套 Kaiser 窗 FIR，测过跟 scipy 输出逐窗口一致。
+> 板上建议直接把 IMU 输出配成 @HZ@ Hz；配不了的话按 `pc/edge_cli.c` 里的 `resample_poly` 做。
 
 ---
 

@@ -4,7 +4,7 @@
  *   CSV → （可选）按量程换算成 g / °/s → （可选）整数倍降采样 → 滑窗
  *       → tm_imu_channels（重力对齐 + pitch/roll，8 通道）
  *       → RF: tm_features + tm_forest_c_predict   /   CNN: tm_prep + tm_invoke
- * 所以这里的判决就是板上会给的判决（降采样那一步除外，见 --in-hz）。
+ * 所以这里的判决就是板上会给的判决；--in-hz 50 这种重采样也照抄平台（resample_poly）。
  *
  *   ./edge_cli --selftest              golden 自检（跟导出时 Python 算的逐位对答案）
  *   ./edge_cli sample.csv              逐窗口结果打到 stdout（CSV）
@@ -14,6 +14,7 @@
  */
 
 #define _POSIX_C_SOURCE 200809L /* clock_gettime；-std=c99 下默认不给 */
+#define _XOPEN_SOURCE 700       /* M_PI */
 
 #include <ctype.h>
 #include <math.h>
@@ -264,21 +265,110 @@ static int read_csv(const char *path, float acc_scale, float gyr_scale, series_t
     return 0;
 }
 
-/* 整数倍降采样：块平均。平台用的是 scipy resample_poly（FIR），两者在边沿上会有小差别 */
-static void decimate(series_t *s, int k)
+/* ── 重采样：照抄平台（imu_train infer_csv_scratch.downsample）──────────────────
+ *   采样率相同      → 不动
+ *   整数倍（up==1） → 直接隔点抽（data[::down]，平台就是这么做的，不滤波）
+ *   其它（50→16）  → scipy.signal.resample_poly(x, up, down)：Kaiser(β=5) 窗 FIR 低通，
+ *                     半长 10×max(up,down)，零填充边界，取中心对齐的那段输出
+ * 平台对缺失掩码也走同一个函数再 > 0.5，这里一样。 */
+static double bessel_i0(double x)
 {
-    if (k <= 1) return;
-    long m = s->n / k;
-    for (long i = 0; i < m; i++) {
-        int nv = 0;
-        for (int c = 0; c < N_SENSOR; c++) {
-            double acc = 0.0;
-            for (int j = 0; j < k; j++) acc += s->x[(i * k + j) * N_SENSOR + c];
-            s->x[i * N_SENSOR + c] = (float)(acc / k);
-        }
-        for (int j = 0; j < k; j++) nv += s->valid[i * k + j];
-        s->valid[i] = (unsigned char)(nv * 2 > k);
+    double s = 1.0, t = 1.0;
+    for (int k = 1; k < 200; k++) {
+        const double q = x / (2.0 * k);
+        t *= q * q;
+        s += t;
+        if (t < 1e-17 * s) break;
     }
+    return s;
+}
+
+/* scipy firwin(2*half+1, 1/max_rate, window=('kaiser', 5.0))，再 × up。
+ * 平台的输入是 float32，scipy 会把 h 转成 float32 再乘 up——这里一样 */
+static float *design_fir(int up, int down, int *half_len)
+{
+    const int max_rate = up > down ? up : down;
+    const int half = 10 * max_rate, n = 2 * half + 1;
+    const double fc = 1.0 / max_rate, beta = 5.0, i0b = bessel_i0(beta);
+    double *hd = malloc(sizeof(double) * n), sum = 0.0;
+    float *h = malloc(sizeof(float) * n);
+    for (int i = 0; i < n; i++) {
+        const double m = i - 0.5 * (n - 1);
+        const double xs = fc * m;
+        const double sinc = xs == 0.0 ? 1.0 : sin(M_PI * xs) / (M_PI * xs);
+        const double r = 2.0 * i / (n - 1) - 1.0;
+        hd[i] = fc * sinc * bessel_i0(beta * sqrt(1.0 - r * r)) / i0b;
+        sum += hd[i];
+    }
+    for (int i = 0; i < n; i++) h[i] = (float)(hd[i] / sum) * (float)up;
+    free(hd);
+    *half_len = half;
+    return h;
+}
+
+/* 一路信号：x[k*stride]，k < n_in → y[i*stride]，i < 返回值 */
+static long resample_poly(const float *x, long n_in, int stride, float *y, int up, int down,
+                          const float *h, int half)
+{
+    const long n_out = (n_in * up) / down + ((n_in * up) % down != 0);
+    const int pre_pad = down - half % down;
+    const long pre_remove = (half + pre_pad) / down;
+    const long hlen = 2L * half + 1;
+    for (long i = 0; i < n_out; i++) {
+        /* upfirdn：y[o] = Σ_j hp[j]·xu[o·down − j]，hp = [pre_pad 个 0, h]，xu 是插零上采样 */
+        const long m0 = (i + pre_remove) * down - pre_pad;   /* 对 h 本身的下标偏移 */
+        long k_lo = m0 - (hlen - 1);
+        k_lo = k_lo <= 0 ? 0 : (k_lo + up - 1) / up;
+        long k_hi = m0 < 0 ? -1 : m0 / up;
+        if (k_hi > n_in - 1) k_hi = n_in - 1;
+        double acc = 0.0;
+        for (long k = k_lo; k <= k_hi; k++) acc += (double)h[m0 - k * up] * x[k * stride];
+        y[i * stride] = (float)acc;
+    }
+    return n_out;
+}
+
+static long gcd_l(long a, long b)
+{
+    while (b) {
+        long t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+static void resample_series(series_t *s, int in_hz, int model_hz)
+{
+    if (in_hz == model_hz || s->n == 0) return;
+    const long g = gcd_l(in_hz, model_hz);
+    const int up = (int)(model_hz / g), down = (int)(in_hz / g);
+    float *vf = malloc(sizeof(float) * s->n);
+    for (long i = 0; i < s->n; i++) vf[i] = s->valid[i] ? 1.0f : 0.0f;
+    long m;
+    if (up == 1) {
+        m = (s->n + down - 1) / down;
+        for (long i = 0; i < m; i++) {
+            memmove(s->x + i * N_SENSOR, s->x + i * down * N_SENSOR, sizeof(float) * N_SENSOR);
+            vf[i] = vf[i * down];
+        }
+    } else {
+        int half;
+        float *h = design_fir(up, down, &half);
+        const long cap = (s->n * up) / down + 1;
+        float *y = malloc(sizeof(float) * N_SENSOR * cap), *vy = malloc(sizeof(float) * cap);
+        m = 0;
+        for (int c = 0; c < N_SENSOR; c++) m = resample_poly(s->x + c, s->n, N_SENSOR, y + c, up, down, h, half);
+        resample_poly(vf, s->n, 1, vy, up, down, h, half);
+        free(s->x);
+        free(h);
+        free(vf);
+        s->x = y;
+        vf = vy;
+        s->valid = realloc(s->valid, cap);
+    }
+    for (long i = 0; i < m; i++) s->valid[i] = (unsigned char)(vf[i] > 0.5f);
+    free(vf);
     s->n = m;
 }
 
@@ -291,7 +381,8 @@ static void usage(const char *argv0)
            "CSV：表头里要有 acc_x,acc_y,acc_z%s（AccX/ax 这类写法也认），其它列忽略；\n"
            "     没表头就按 ax,ay,az%s 的列序读。空格 / NaN 当缺失（前向填充，缺失 > 30%% 的窗口跳过）。\n\n"
            "选项：\n"
-           "  --in-hz N        CSV 的采样率，默认 = 模型的 %d Hz；必须是它的整数倍（块平均降采样）\n"
+           "  --in-hz N        CSV 的采样率（如 50），默认 = 模型的 %d Hz；按平台同一套方法重采样\n"
+           "                   （整数倍隔点抽，其它比例用 resample_poly 那套 FIR，跟平台逐窗口对得上）\n"
            "  --acc-scale F    加速度乘 F 换成 g。int16 原始计数用 量程/32768，例如 ±16g → 0.00048828125\n"
            "  --gyr-scale F    角速度乘 F 换成 °/s，例如 ±2000dps → 0.06103515625\n"
            "  --hop N          窗口步长（点），默认 %d\n"
@@ -328,14 +419,14 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return 2;
     }
-    if (in_hz <= 0 || in_hz % TM_EDGE_HZ != 0 || hop <= 0) {
-        fprintf(stderr, "--in-hz 要是 %d 的整数倍、--hop 要 > 0\n", TM_EDGE_HZ);
+    if (in_hz <= 0 || in_hz > 10000 || hop <= 0) {
+        fprintf(stderr, "--in-hz 要 > 0、--hop 要 > 0\n");
         return 2;
     }
 
     series_t s;
     if (read_csv(path, acc_scale, gyr_scale, &s) != 0) return 1;
-    decimate(&s, in_hz / TM_EDGE_HZ);
+    resample_series(&s, in_hz, TM_EDGE_HZ);
     /* 量纲自检：重力是 1g。原始计数没换算的话这里是几千 */
     if (s.n > 0) {
         double g = 0.0;
