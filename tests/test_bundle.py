@@ -110,7 +110,8 @@ def test_lib_bundle_has_no_source(kind, tmp_path):
     z = str(tmp_path / f"edge_{kind}_lib.zip")
     write_lib_bundle(gen, kind, z, meta, measure(gen, kind, 16, 8, 5, {}), window=16, n_classes=5)
     names = zipfile.ZipFile(z).namelist()
-    assert not [n for n in names if n.endswith((".c", "golden.h", "Makefile"))], names
+    assert not [n for n in names if n.endswith((".c", "Makefile")) and n != "example/board_selftest.c"], names
+    assert "pc/sample_result.csv" in names and "example/board_selftest.c" in names
     for need in ("lib/libtinyml.a", "lib/BUILD_FLAGS.txt", "include/tm_imu.h", "README.md"):
         assert need in names, need
     readme = zipfile.ZipFile(z).read("README.md").decode()
@@ -121,3 +122,16 @@ def test_lib_bundle_has_no_source(kind, tmp_path):
         os.chmod(d / "pc" / "edge_cli", 0o755)
         r = subprocess.run(["./pc/edge_cli", "--selftest"], cwd=d, capture_output=True, text=True)
         assert r.returncode == 0 and "17/17" in r.stdout, r.stdout + r.stderr
+        # README 里给的正确结果就是这个包实际跑出来的
+        assert "selftest: 17/17 通过" in readme and "diff result.csv pc/sample_result.csv" in readme
+        r = subprocess.run(["./pc/edge_cli", "pc/sample.csv"], cwd=d, capture_output=True, text=True)
+        assert r.stdout == (d / "pc" / "sample_result.csv").read_text(encoding="utf-8")
+        # 对方按 README 编板上自检：头文件 + 库就够
+        exe = tmp_path / "st"
+        flags = (d / "lib" / "BUILD_FLAGS.txt").read_text().split("\n")[0].split()
+        defs = [f for f in flags if f.startswith("-D")]
+        k = "-DTM_KIND_RF" if kind == "rf" else "-DTM_KIND_CNN"
+        r = subprocess.run(["arm-none-eabi-gcc", "-c", "-mcpu=cortex-m4", "-mthumb", "-mfpu=fpv4-sp-d16",
+                            "-mfloat-abi=softfp", "-ffp-contract=off", *defs, k, f"-I{d / 'include'}",
+                            str(d / "example" / "board_selftest.c"), "-o", str(exe) + ".o"], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
