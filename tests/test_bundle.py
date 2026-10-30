@@ -135,3 +135,42 @@ def test_lib_bundle_has_no_source(kind, tmp_path):
                             "-mfloat-abi=softfp", "-ffp-contract=off", *defs, k, f"-I{d / 'include'}",
                             str(d / "example" / "board_selftest.c"), "-o", str(exe) + ".o"], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
+
+
+@pytest.mark.skipif(not shutil.which("arm-none-eabi-gcc"), reason="没有 arm-none-eabi-gcc")
+def test_keil_objects(tmp_path):
+    """keil/ 下的目标文件：外部只依赖 __aeabi_* 和 memcpy/memset/strcmp（Keil 的 C 库都有），
+    wchar_t 属性是「未使用」（不跟 ARMCC 的 2 冲突）；两种调用约定在 Cortex-M4 上板上自检都过。"""
+    from footprint import KEIL_ALLOWED_UNDEF, write_lib_bundle
+
+    gen = MODELS["rf"]
+    meta = json.load(open(os.path.join(gen, "meta.json"), encoding="utf-8"))
+    z = str(tmp_path / "lib.zip")
+    write_lib_bundle(gen, "rf", z, meta, measure(gen, "rf", 16, 8, 5, {}), window=16, n_classes=5)
+    d = tmp_path / "x"
+    zipfile.ZipFile(z).extractall(d)
+    readme = (d / "README.md").read_text(encoding="utf-8")
+    assert readme.startswith("# 端侧模型包") and "Keil" in readme and "tinyml_hard.o" in readme
+    assert "0x1." not in "".join(p.read_text(encoding="utf-8") for p in (d / "include").glob("*.h"))
+    defs = [f for f in (d / "lib" / "BUILD_FLAGS.txt").read_text().split("\n")[0].split() if f.startswith("-D")]
+    q = os.path.join(os.path.dirname(__file__), "pb_qemu")
+    (tmp_path / "m.c").write_text("int tm_board_selftest(void); int main(void){return tm_board_selftest();}\n")
+    for abi in ("softfp", "hard"):
+        o = d / "keil" / f"tinyml_{abi}.o"
+        undef = subprocess.run(["arm-none-eabi-nm", "-u", str(o)], capture_output=True, text=True).stdout.split()
+        assert [s for s in undef if s != "U" and not KEIL_ALLOWED_UNDEF.match(s)] == []
+        attrs = subprocess.run(["arm-none-eabi-readelf", "-A", str(o)], capture_output=True, text=True).stdout
+        assert "Tag_ABI_PCS_wchar_t: None" in attrs
+        assert ("VFP registers" in attrs) == (abi == "hard")
+        if not shutil.which("qemu-system-arm"):
+            continue
+        elf = tmp_path / f"{abi}.elf"
+        r = subprocess.run(["arm-none-eabi-gcc", "-mcpu=cortex-m4", "-mthumb", "-mfpu=fpv4-sp-d16", f"-mfloat-abi={abi}",
+                            "-ffp-contract=off", *defs, "-DTM_KIND_RF", f"-I{d / 'include'}", os.path.join(q, "boot.c"),
+                            str(tmp_path / "m.c"), str(d / "example" / "board_selftest.c"), str(o), "-lm",
+                            "--specs=rdimon.specs", "-T", os.path.join(q, "m4.ld"), "-o", str(elf)],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        r = subprocess.run(["qemu-system-arm", "-M", "mps2-an386", "-nographic", "-semihosting-config",
+                            "enable=on,target=native", "-kernel", str(elf)], capture_output=True, text=True, timeout=300)
+        assert "selftest: 17/17 通过" in r.stdout, abi + r.stdout + r.stderr

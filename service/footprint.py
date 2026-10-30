@@ -394,6 +394,162 @@ def write_bundle(gen_dir: str, kind: str, out_zip: str, readme: str,
     return os.path.getsize(out_zip)
 
 
+# ── Keil（ARMCC 5 / armlink）用的目标文件 ──────────────────────────────────────────
+# 源码是 C99，ARMCC 5 编不了，也不给源码；但 armlink 能链 GCC 编出来的 ELF 目标文件，只要：
+#   1. 浮点调用约定一致：softfp / hard 各出一份，让对方按工程选；
+#   2. 构建属性不冲突：GCC 标 wchar_t=4，ARMCC 是 2，armlink 会报 L6242E——我们没用 wchar_t，改成 0（未使用）；
+#   3. 不依赖 GCC 的 C 库：用到的数学函数（logf / atan2f / cos ...）从 newlib 抽出来改名打进去，
+#      板上算出来和 GCC 版逐位一样（换成 Keil 的 libm 末位可能不同，golden 自检会红）。
+# 打完只剩 __aeabi_* 运行时函数和 memcpy/memset/strcmp 要外部提供，Keil 的 C 库（含 microlib）都有。
+KEIL_ALLOWED_UNDEF = re.compile(r"^(__aeabi_\w+|memcpy|memset|memmove|strcmp)$")
+KEIL_PREFIX = "tm_m_"
+
+
+def _uleb(b: bytes, i: int) -> tuple[int, int]:
+    v = sh = 0
+    while True:
+        c = b[i]
+        i += 1
+        v |= (c & 0x7F) << sh
+        sh += 7
+        if not c & 0x80:
+            return v, i
+
+
+def _patch_wchar_attr(obj: str) -> None:
+    """把目标文件 .ARM.attributes 里的 Tag_ABI_PCS_wchar_t 改成 0（未使用），armlink 就不会拿它跟 2 比。"""
+    import struct
+
+    data = bytearray(open(obj, "rb").read())
+    shoff, = struct.unpack_from("<I", data, 0x20)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 0x2E)
+    secs = [struct.unpack_from("<IIIIIIIIII", data, shoff + k * shentsize) for k in range(shnum)]
+    strtab = secs[shstrndx][4]
+    for sec in secs:
+        name = data[strtab + sec[0]:data.index(0, strtab + sec[0])].decode()
+        if name != ".ARM.attributes":
+            continue
+        off, size = sec[4], sec[5]
+        assert data[off] == ord("A")
+        i, end = off + 1, off + size
+        while i < end:                                   # vendor 子节
+            sub_len, = struct.unpack_from("<I", data, i)
+            j = data.index(0, i + 4) + 1
+            vendor = data[i + 4:j - 1].decode()
+            while vendor == "aeabi" and j < i + sub_len:  # tag 子节（1 = 整个文件）
+                tag, k = _uleb(data, j)
+                sl, = struct.unpack_from("<I", data, k)
+                a, a_end = k + 4, j + sl
+                while tag == 1 and a < a_end:
+                    t, a = _uleb(data, a)
+                    if t in (4, 5, 67) or (t > 32 and t % 2 == 1) or t == 65:
+                        a = data.index(0, a) + 1
+                    elif t == 32:
+                        _, a = _uleb(data, a)
+                        a = data.index(0, a) + 1
+                    else:
+                        if t == 18:                      # Tag_ABI_PCS_wchar_t，值是单字节 ULEB
+                            data[a] = 0
+                        _, a = _uleb(data, a)
+                j = a_end
+            i += sub_len
+    open(obj, "wb").write(bytes(data))
+
+
+def build_keil_objects(gen_dir: str, kind: str, window: int, n_classes: int, out_dir: str) -> dict:
+    """出 keil/tinyml_softfp.o 和 keil/tinyml_hard.o（各自一个预链接的目标文件）。返回 {abi: 路径}。"""
+    cc, _, arm = toolchain()
+    nm, objcopy = shutil.which("arm-none-eabi-nm"), shutil.which("arm-none-eabi-objcopy")
+    if not (arm and nm and objcopy):
+        raise RuntimeError("出 Keil 目标文件要 arm-none-eabi-gcc / nm / objcopy")
+    srcs = [os.path.join(CORE, f) for f in RUNTIME[kind]] + \
+           [os.path.join(gen_dir, f) for f in MODEL_FILES[kind] + TABLE_FILES[kind] if os.path.exists(os.path.join(gen_dir, f))]
+    defines = [f"-DTM_FEAT_MAX_T={max(int(window), 16)}", f"-DTM_FEAT_MAX_NPERSEG={max(int(window), 16)}",
+               f"-DTM_POST_MAX_CLASSES={max(int(n_classes), 2)}"]
+
+    def run(cmd):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"{os.path.basename(cmd[0])} 失败：{r.stderr.strip()[-500:]}")
+        return r.stdout
+
+    def syms(obj, kind_):   # kind_ = "U" 未定义 / "D" 已定义全局
+        out = run([nm, "-g", "--defined-only", obj] if kind_ == "D" else [nm, "-u", obj])
+        names = set()
+        for ln in out.splitlines():
+            p = ln.split()
+            if not p or p[0].endswith(":"):
+                continue
+            names.add(p[-1])
+        return names
+
+    os.makedirs(out_dir, exist_ok=True)
+    result = {}
+    for abi in ("softfp", "hard"):
+        flags = [f if not f.startswith("-mfloat-abi=") else f"-mfloat-abi={abi}" for f in ARM_FLAGS]
+        with tempfile.TemporaryDirectory() as tmp:
+            objs = []
+            for f in srcs:
+                o = os.path.join(tmp, os.path.basename(f) + ".o")
+                run([cc, "-c", *flags, *defines, f"-I{CORE}", f"-I{gen_dir}", f, "-o", o])
+                objs.append(o)
+            ours = os.path.join(tmp, "ours.o")
+            run([cc, *flags, "-nostdlib", "-r", *objs, "-o", ours])
+            need = {s for s in syms(ours, "U") if not KEIL_ALLOWED_UNDEF.match(s)}
+            renames = {}
+            parts = [ours]
+            if need:
+                mo = os.path.join(tmp, "m.o")
+                run([cc, *flags, "-nostdlib", "-r", *[f"-Wl,-u,{s}" for s in sorted(need)],
+                     "-Wl,--start-group", "-lm", "-Wl,--end-group", "-o", mo])
+                defined = syms(mo, "D")
+                missing = need - defined
+                if missing:
+                    raise RuntimeError("newlib 里找不到：" + ", ".join(sorted(missing)))
+                renames = {s: KEIL_PREFIX + s for s in defined}
+                if "__errno" in syms(mo, "U"):
+                    renames["__errno"] = KEIL_PREFIX + "errno"
+                    eo = os.path.join(tmp, "errno.o")
+                    ec = os.path.join(tmp, "errno.c")
+                    with open(ec, "w") as f:
+                        f.write(f"static int e;\nint *{KEIL_PREFIX}errno(void) {{ return &e; }}\n")
+                    run([cc, "-c", *flags, ec, "-o", eo])
+                    parts.append(eo)
+                parts.append(mo)
+            # 先各自改名再合：合并之后再改名，引用和定义会变成两个同名符号，连不上
+            if renames:
+                rf = os.path.join(tmp, "renames.txt")
+                with open(rf, "w") as f:
+                    f.write("".join(f"{a} {b}\n" for a, b in sorted(renames.items())))
+                for p_ in parts:
+                    run([objcopy, f"--redefine-syms={rf}", p_])
+            out = os.path.join(out_dir, f"tinyml_{abi}.o")
+            merged = os.path.join(tmp, "merged.o")
+            run([cc, *flags, "-nostdlib", "-r", *parts, "-o", merged])
+            run([objcopy, "--strip-debug", "--strip-unneeded", "--remove-section=.comment", merged, out])
+            _patch_wchar_attr(out)
+            left = {s for s in syms(out, "U") if not KEIL_ALLOWED_UNDEF.match(s)}
+            if left:
+                raise RuntimeError("Keil 目标文件还依赖外部符号：" + ", ".join(sorted(left)))
+            result[abi] = out
+    return result
+
+
+def decimal_floats(text: str) -> str:
+    """C 的十六进制浮点字面量（0x1.8p-3f）换成十进制：ARMCC 5 不一定认前者。%.9g 对 float 是精确往返的。"""
+    import struct
+
+    def rep(m):
+        v = float.fromhex(m.group(1))
+        f32 = struct.unpack("<f", struct.pack("<f", v))[0]
+        s = f"{f32:.9g}"
+        if "." not in s and "e" not in s and "inf" not in s:
+            s += ".0"
+        return s + "f"
+
+    return re.sub(r"(-?0x[0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?p[+-]?\d+)f", rep, text)
+
+
 def _strip_lib(path: str) -> None:
     """去掉调试信息和用不到的本地符号（静态函数名、文件名之类），重定位要的留着，链接不受影响。"""
     strip = shutil.which("arm-none-eabi-strip")
@@ -483,6 +639,8 @@ def lib_readme(kind: str, meta: dict, fp: dict, has_cli: bool, has_cmsis: bool, 
              "lib/libtinyml.a        静态库（运行时 + 这一版模型），Cortex-M4F softfp\n"
              + ("lib/libtinyml_cmsis.a  同上，热点换成 CMSIS 内核（二选一，接口一样）\n" if has_cmsis else "")
              + "lib/BUILD_FLAGS.txt    库的编译选项\n"
+             "keil/tinyml_softfp.o   Keil（ARMCC 5 / armlink）用，softfp 调用约定\n"
+             "keil/tinyml_hard.o     Keil 用，hard 调用约定\n"
              "include/               头文件（*golden.h 只给板上自检用）\n"
              "example/board_selftest.c  板上自检示例\n"
              + ("pc/edge_cli            Linux x86_64 命令行工具（自检 + 跑 CSV）\n"
@@ -493,7 +651,7 @@ def lib_readme(kind: str, meta: dict, fp: dict, has_cli: bool, has_cmsis: bool, 
     kind_def = "-DTM_KIND_RF" if kind == "rf" else "-DTM_KIND_CNN"
     verify = ""
     if has_cli:
-        head = "\n".join(ex.get("csv", "").splitlines()[:6])
+        csv_head = "\n".join(ex.get("csv", "").splitlines()[:6])
         verify = ("## 1. 验证\n\n"
                   "两步：PC 上确认工具和数据没问题，板上确认库在你的工程里算得对。结果和下面示例一致即为正确。\n\n"
                   "### 1.1 PC 上（Linux x86_64）\n\n"
@@ -503,7 +661,7 @@ def lib_readme(kind: str, meta: dict, fp: dict, has_cli: bool, has_cmsis: bool, 
                   "正确结果：屏幕（stderr）上的汇总应为\n\n"
                   f"```\n{ex.get('summary', '')}\n```\n\n"
                   "`result.csv` 应与包里的 `pc/sample_result.csv` 完全相同（`diff result.csv pc/sample_result.csv` 无输出），开头几行：\n\n"
-                  f"```\n{head}\n```\n\n"
+                  f"```\n{csv_head}\n```\n\n"
                   "每行一个窗口：序号、起止时间（秒）、类别下标、类别、置信度、各类概率。"
                   "`sample.csv` 是合成数据，只用于确认能跑通，类别本身没有意义。\n\n"
                   "自己的采集数据：`./pc/edge_cli 采集.csv --in-hz 50`（单位 g / °/s，`--help` 看全部参数），"
@@ -523,7 +681,18 @@ def lib_readme(kind: str, meta: dict, fp: dict, has_cli: bool, has_cmsis: bool, 
             "3. 库是 Cortex-M4F + `-mfloat-abi=softfp`（跟 GR551x SDK 一致），hard ABI 的工程链不上。\n"
             "4. 建议链接加 `-Wl,--gc-sections`，没用到的函数会丢掉。\n"
             "5. 无 malloc、不依赖 OS，裸机或 RTOS 任务里都能调；不可重入，多任务调用请自行加锁。\n\n"
-            "调用顺序：\n\n@API@\n\n")
+            "调用顺序：\n\n@API@\n\n"
+            "### Keil MDK（ARMCC 5）\n\n"
+            "源码是 C99，ARMCC 5 不用编它：直接链 `keil/` 下预链接好的目标文件（GCC 编译，armlink 可直接链接）。\n\n"
+            "1. 按工程的浮点调用约定选一个，加进工程（Add Existing Files，文件类型选 Object file）：\n"
+            "   - 硬件浮点调用约定（`--fpu=FPv4-SP`）→ `keil/tinyml_hard.o`\n"
+            "   - 软件浮点调用约定（`--fpu=softvfp+fpv4-sp`，或要和 softfp 的 SDK 库一起链）→ `keil/tinyml_softfp.o`\n"
+            "   - 选错时 armlink 报 L6242E（属性不兼容），换另一个即可。不要再加 `lib/*.a`。\n"
+            f"2. C/C++ 页：Include Paths 加 `include`；Define 填 `{defs.replace('-D', '').replace(' ', ',')},{kind_def[2:]}`；"
+            "包含头文件的源文件需勾 C99 Mode（只有 `board_selftest.c` 和调用库的那个文件需要）。\n"
+            "3. 数学函数已打在 .o 里（与 PC 结果逐位一致），不依赖 Keil 的数学库；C 库（含 microlib）只需提供 "
+            "`memcpy` / `memset` / `strcmp` 和 `__aeabi_*` 运行时函数。\n"
+            "4. 用 1.2 节的板上自检确认：串口打印的结果与 1.2 节一致即为链接正确。\n\n")
     # 推理那行写了特征怎么算，保密包不带
     foot = "\n".join(ln for ln in sec.get("4.", "").split("\n") if not ln.startswith(("推理：", "| flash：自检 golden")))
     head = head.replace("@ZIP_STEM@", os.path.splitext(zip_name)[0])
@@ -549,6 +718,7 @@ def write_lib_bundle(gen_dir: str, kind: str, out_zip: str, meta: dict, fp: dict
             lib_cmsis = None
         cli = os.path.join(tmp, "edge_cli")
         has_cli = _host_edge_cli(gen_dir, kind, geo, cli)
+        keil = build_keil_objects(gen_dir, kind, window, n_classes, os.path.join(tmp, "keil"))
         sample = sample_csv(geo["hz"], geo["n_ch"] - 2)
         board = _board_selftest_check(gen_dir, kind, geo, lib, tmp)
         expected = _expected_outputs(cli, sample, tmp) if has_cli else None
@@ -565,8 +735,10 @@ def write_lib_bundle(gen_dir: str, kind: str, out_zip: str, meta: dict, fp: dict
                 # golden 头文件也给：只是测试输入和标准答案，板上自检要用
                 if rel.endswith(".h") and (not rel.endswith("golden.h") or rel.endswith(GOLDEN_HEADERS[kind][-1])):
                     src = os.path.join(CORE, rel[5:]) if rel.startswith("core/") else os.path.join(gen_dir, rel[6:])
-                    z.write(src, "include/" + os.path.basename(rel))
+                    z.writestr("include/" + os.path.basename(rel), decimal_floats(open(src, encoding="utf-8").read()))
             z.write(os.path.join(BUNDLE_SRC, "board_selftest.c"), "example/board_selftest.c")
+            for abi, path in keil.items():
+                z.write(path, f"keil/tinyml_{abi}.o")
             if expected.get("csv"):
                 z.writestr("pc/sample_result.csv", expected["csv"])
             if has_cli:
