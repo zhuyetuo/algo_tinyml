@@ -457,9 +457,13 @@ def main():
             from footprint import measure
             fp = measure(gen, kind, int(meta["window_size"]), int(meta.get("n_channels") or 8), len(meta["classes"]))
         if args.lib_only:
-            from footprint import write_lib_bundle
-            n = write_lib_bundle(gen, kind, os.path.expanduser(args.bundle), meta, fp,
-                                 window=int(meta["window_size"]), n_classes=len(meta["classes"]))
+            from footprint import bundle_geometry, write_lib_bundle, write_pb_bundle
+            if bundle_geometry(gen, kind)["n_ch"] == 5:
+                # 三轴加速度模型：按《宠物行为识别库 · 接口协议》出 pet_behavior
+                n = write_pb_bundle(gen, kind, os.path.expanduser(args.bundle), meta, fp)
+            else:
+                n = write_lib_bundle(gen, kind, os.path.expanduser(args.bundle), meta, fp,
+                                     window=int(meta["window_size"]), n_classes=len(meta["classes"]))
         else:
             n = write_bundle(gen, kind, os.path.expanduser(args.bundle), bundle_readme(kind, meta, fp),
                              window=int(meta["window_size"]), n_classes=len(meta["classes"]))

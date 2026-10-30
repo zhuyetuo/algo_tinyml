@@ -510,6 +510,302 @@ def write_lib_bundle(gen_dir: str, kind: str, out_zip: str, meta: dict, fp: dict
     return os.path.getsize(out_zip)
 
 
+# ── pet_behavior：按接口协议交付的编译库（三轴加速度模型才有） ──────────────────────────
+PB_SRC = os.path.join(BUNDLE_SRC, "pb")
+PB_LIB_VERSION = 1
+# 协议类别（pet_behavior.h 的 PB_TYPE_*）。模型类别名按关键字归过去，归不上的算「其他」
+PB_TYPES = ["休息", "进食", "喝水", "舔舐", "抓挠", "吠叫", "其他", "未佩戴"]
+_PB_RULES = [(7, ("未佩戴", "没戴", "摘下")), (4, ("抓", "挠")), (3, ("舔",)), (2, ("喝", "饮水")),
+             (1, ("吃", "进食", "食")), (5, ("吠", "叫")), (0, ("休息", "睡", "静止", "趴", "卧", "躺"))]
+
+
+def pb_type_of(name: str) -> int:
+    for code, keys in _PB_RULES:
+        if any(k in name for k in keys):
+            return code
+    return 6
+
+
+def pb_model_version(meta: dict) -> int:
+    tag = str((meta.get("train") or {}).get("tag") or "")
+    m = re.search(r"(\d+)$", tag)
+    return int(m.group(1)) & 0xFFFF if m else 0
+
+
+def _pb_model_cfg_h(kind: str, classes: list, hz: int, hop: int, model_version: int) -> str:
+    names = ", ".join('"' + c.replace('"', "") + '"' for c in classes)
+    types = ", ".join(str(pb_type_of(c)) for c in classes)
+    return ("/* 自动生成：pet_behavior 的模型参数（只参与编译，不随包发布） */\n"
+            "#ifndef PB_MODEL_CFG_H\n#define PB_MODEL_CFG_H\n#include <stdint.h>\n"
+            f"#define {'PB_KIND_RF' if kind == 'rf' else 'PB_KIND_CNN'} 1\n"
+            f"#define PB_MODEL_VERSION {model_version}u\n#define PB_HZ {hz}\n#define PB_HOP {hop}\n"
+            f"static const uint8_t PB_TYPE_OF_CLASS[] = {{{types}}};\n"
+            f"static const char *const PB_CLASS_NAMES[] = {{{names}}};\n#endif\n")
+
+
+def _pb_header(work_size: int, hz: int, header_version: int) -> str:
+    h = open(os.path.join(PB_SRC, "pet_behavior.h"), encoding="utf-8").read()
+    return (h.replace("@WORK_SIZE@", str(work_size)).replace("@HZ@", str(hz))
+            .replace("@HEADER_VERSION@", f"0x{header_version:08X}"))
+
+
+def pb_test_input(hz: int, acc_range_g: int = 8, seconds: int = 180, batch: int | None = None) -> bytes:
+    """验收输入 test_input.bin（格式见 example.c）：合成数据，换成 int16 原始计数。"""
+    import struct
+
+    batch = batch or min(hz * 10, 256)
+    rows = []
+    for seed in range(1, 4):   # 静止 → 走动 → 抖动，换种子来三轮，片段边界多一些
+        rows += sample_csv(hz, 3, seconds=seconds // 3, seed=seed).splitlines()[1:]
+    lsb = acc_range_g / 32768.0
+    samples = []
+    for ln in rows:
+        v = [float(x) for x in ln.split(",")[1:4]]
+        samples.append([max(-32768, min(32767, int(round(a / lsb)))) for a in v])
+    out = b"PBIN" + struct.pack("<HBBHHI", hz, acc_range_g, 0, batch, 0, len(samples))
+    return out + b"".join(struct.pack("<hhh", *s) for s in samples)
+
+
+def write_pb_bundle(gen_dir: str, kind: str, out_zip: str, meta: dict, fp: dict) -> int:
+    """按《宠物行为识别库 · 接口协议》交付：pet_behavior.h + libpetbehavior.a + example.c + 验收数据。
+    不含源码。只支持三轴加速度（5 通道）模型。返回字节数。"""
+    import zipfile
+
+    geo = bundle_geometry(gen_dir, kind)
+    if geo["n_ch"] != 5:
+        raise ValueError(f"这一版模型是 {geo['n_ch'] - 2} 轴输入，pet_behavior 只支持三轴加速度模型")
+    cc, _, arm = toolchain()
+    ar, nm, strip = (shutil.which(f"arm-none-eabi-{t}") for t in ("ar", "nm", "strip"))
+    host_cc = shutil.which("gcc")
+    if not (arm and ar and nm and host_cc):
+        raise RuntimeError("打 pet_behavior 库要 arm-none-eabi-gcc/ar/nm 和 gcc")
+    classes = list(meta.get("classes") or [])
+    n_t, hz, hop, n_cls = geo["n_t"], geo["hz"], geo["hop"], max(geo["n_classes"], 2)
+    mv = pb_model_version(meta)
+    hver = (PB_LIB_VERSION << 16) | mv
+    defines = [f"-DTM_FEAT_MAX_T={max(n_t, 16)}", f"-DTM_FEAT_MAX_NPERSEG={max(n_t, 16)}",
+               f"-DTM_POST_MAX_CLASSES={n_cls}"]
+    srcs = [os.path.join(CORE, f) for f in RUNTIME[kind]] + \
+           [os.path.join(gen_dir, f) for f in MODEL_FILES[kind] + TABLE_FILES[kind] if os.path.exists(os.path.join(gen_dir, f))]
+
+    def run(cmd):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(" ".join(os.path.basename(c) for c in cmd[:1]) + " 失败：" + r.stderr.strip()[-600:])
+        return r.stdout
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inc = os.path.join(tmp, "inc")
+        os.makedirs(inc)
+        with open(os.path.join(inc, "pb_model_cfg.h"), "w", encoding="utf-8") as f:
+            f.write(_pb_model_cfg_h(kind, classes, hz, hop, mv))
+        # .c 拷到生成的头文件旁边编：#include "pet_behavior.h" 先找同目录，原地编会拿到带占位符的模板
+        pb_c = shutil.copy(os.path.join(PB_SRC, "pet_behavior.c"), inc)
+        incs = [f"-I{inc}", f"-I{CORE}", f"-I{gen_dir}"]
+
+        # 1. 工作内存多大：ARM 和 x86 各量一次（x86 指针 8 字节，结构体大一点），头文件取大的
+        sizes = []
+        for comp, flags in ((cc, ARM_FLAGS), (host_cc, HOST_FLAGS)):
+            with open(os.path.join(inc, "pet_behavior.h"), "w", encoding="utf-8") as f:
+                f.write(_pb_header(0, hz, hver))
+            obj = os.path.join(tmp, "probe.o")
+            run([comp, "-c", *flags, *defines, "-DPB_SIZE_PROBE", *incs, pb_c, "-o", obj])
+            out = run([nm if comp == cc else "nm", "-S", obj])
+            m = re.search(r"^\S+\s+([0-9a-fA-F]+)\s+\w\s+pb_state_size_probe$", out, re.M)
+            if not m:
+                raise RuntimeError("量不出 pb_state_t 的大小")
+            sizes.append(int(m.group(1), 16))
+        work = (max(sizes) + 7) // 8 * 8
+        header = _pb_header(work, hz, hver)
+        with open(os.path.join(inc, "pet_behavior.h"), "w", encoding="utf-8") as f:
+            f.write(header)
+
+        # 2. 板上的 libpetbehavior.a 和 PC 上的 libpetbehavior_host.a
+        def build(comp, flags, arch, ar_tool, out_lib):
+            objs = []
+            for src in srcs + [pb_c]:
+                o = os.path.join(tmp, f"{arch}_{os.path.basename(src)}.o")
+                run([comp, "-c", *flags, *defines, *incs, src, "-o", o])
+                objs.append(o)
+            run([ar_tool, "rcs", out_lib, *objs])
+            return out_lib
+
+        lib_arm = build(cc, ARM_FLAGS, "arm", ar, os.path.join(tmp, "libpetbehavior.a"))
+        if strip:
+            run([strip, "--strip-debug", "--strip-unneeded", lib_arm])
+        lib_host = build(host_cc, HOST_FLAGS, "x86", shutil.which("ar") or "ar", os.path.join(tmp, "libpetbehavior_host.a"))
+        run(["strip", "--strip-debug", "--strip-unneeded", lib_host]) if shutil.which("strip") else None
+        # 板上实际占用：链一个只调接口的小程序，-gc-sections 之后量
+        size_tool = shutil.which("arm-none-eabi-size")
+        flash = ram_static = None
+        if size_tool:
+            probe_c = os.path.join(tmp, "use.c")
+            with open(probe_c, "w") as f:
+                f.write('#include "pet_behavior.h"\nstatic pb_segment_t s[8];\n'
+                        'int main(void){pb_config_t c={PB_SAMPLE_RATE_HZ,8,0};static unsigned char m[PB_WORK_SIZE];'
+                        'pb_init(&c,m,sizeof m);uint8_t t,q;pb_current(&t,&q);return pb_push(0,0,0,s,8)+pb_flush(s,8)+(int)pb_version();}\n')
+            elf = os.path.join(tmp, "use.elf")
+            r = subprocess.run([cc, *ARM_FLAGS, f"-I{inc}", probe_c, lib_arm, "-lm", "--specs=nosys.specs",
+                                "-Wl,--gc-sections", "-o", elf], capture_output=True, text=True)
+            base = os.path.join(tmp, "base.elf")
+            with open(os.path.join(tmp, "base.c"), "w") as f:
+                f.write("int main(void){return 0;}\n")
+            r2 = subprocess.run([cc, *ARM_FLAGS, os.path.join(tmp, "base.c"), "-lm", "--specs=nosys.specs",
+                                 "-Wl,--gc-sections", "-o", base], capture_output=True, text=True)
+            if r.returncode == 0 and r2.returncode == 0:
+                def sz(e):
+                    t, d, b = map(int, run([size_tool, e]).splitlines()[1].split()[:3])
+                    return t + d, d + b
+                (f1, r1), (f0, r0) = sz(elf), sz(base)
+                flash, ram_static = f1 - f0, r1 - r0 - work   # 去掉 probe 里的 m[PB_WORK_SIZE]
+
+        # 3. PC 上的示例程序 + 验收数据
+        ex = shutil.copy(os.path.join(PB_SRC, "example.c"), inc)
+        exe = os.path.join(tmp, "pb_example")
+        built = False
+        for extra in (["-static"], []):
+            if subprocess.run([host_cc, "-O2", "-s", *extra, "-DPB_EXAMPLE_MAIN", f"-I{inc}", ex, lib_host, "-o", exe, "-lm"],
+                              capture_output=True).returncode == 0:
+                built = True
+                break
+        if not built:
+            raise RuntimeError("PC 上的 example 编不过")
+        tin = os.path.join(tmp, "test_input.bin")
+        with open(tin, "wb") as f:
+            f.write(pb_test_input(hz))
+        texp = os.path.join(tmp, "test_expect.bin")
+        run([exe, tin, "--write", texp])
+        chk = run([exe, tin, texp])
+        if "集成验收：通过" not in chk:
+            raise RuntimeError("PC 上自验不过：" + chk[-400:])
+
+        readme = pb_readme(meta, fp, geo, classes, work, flash, ram_static, mv, os.path.getsize(texp) // 12)
+        with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("pet_behavior.h", header)
+            z.write(lib_arm, "libpetbehavior.a")
+            z.write(ex, "example.c")
+            z.write(tin, "test_input.bin")
+            z.write(texp, "test_expect.bin")
+            z.write(lib_host, "pc/libpetbehavior_host.a")
+            info = zipfile.ZipInfo("pc/pb_example")
+            info.external_attr = 0o755 << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            z.writestr(info, open(exe, "rb").read())
+            z.writestr("README.md", readme)
+    return os.path.getsize(out_zip)
+
+
+def pb_readme(meta: dict, fp: dict, geo: dict, classes: list, work: int, flash: int | None,
+              ram_static: int | None, model_version: int, n_expect: int) -> str:
+    hz, n_t, hop = geo["hz"], geo["n_t"], geo["hop"]
+    maps = "\n".join(f"| {c} | {pb_type_of(c)} | {PB_TYPES[pb_type_of(c)]} |" for c in classes)
+    kb = lambda b: "-" if b is None else f"{b:,} B（{b / 1024:.1f} KB）"  # noqa: E731
+    return f"""# 宠物行为识别库 pet_behavior
+
+库版本 v0.{PB_LIB_VERSION}，模型版本 {model_version}（`pb_version()` = `0x{(PB_LIB_VERSION << 16) | model_version:08X}`）。
+以静态库形式交付，不含源码。
+
+| 文件 | 说明 |
+| --- | --- |
+| `pet_behavior.h` | 头文件 |
+| `libpetbehavior.a` | 静态库（含模型），Cortex-M4F，`-mfloat-abi=softfp` |
+| `example.c` | 调用示例 + 集成验收函数 `pb_acceptance()` |
+| `test_input.bin` / `test_expect.bin` | 集成验收数据（{n_expect} 个片段） |
+| `pc/pb_example`、`pc/libpetbehavior_host.a` | Linux x86_64 上先跑一遍验收用 |
+
+## 1. 使用方法
+
+```c
+#include "pet_behavior.h"
+
+static uint8_t pb_mem[PB_WORK_SIZE] __attribute__((aligned(4)));
+
+pb_config_t cfg = {{ .sample_rate_hz = PB_SAMPLE_RATE_HZ, .acc_range_g = 8 }};
+int r = pb_init(&cfg, pb_mem, sizeof pb_mem);      /* 0 = 成功（内含自检） */
+
+/* 每 5~10 秒从 IMU FIFO 读一批，喂给库 */
+pb_segment_t segs[8];
+int n = pb_push(samples, count, t0_ms, segs, 8);
+while (n > 0) {{
+    /* 存储或上报 segs[0..n) */
+    n = (n == 8) ? pb_push(NULL, 0, 0, segs, 8) : 0;   /* 一次没取完，再取 */
+}}
+
+/* 休眠前、数据断档前、上报前：取出剩余片段（同样 n == 8 时再调一次） */
+n = pb_flush(segs, 8);
+
+/* App 实时显示（可选） */
+uint8_t type, conf;
+if (pb_current(&type, &conf) == 0) {{ /* ... */ }}
+```
+
+## 2. 输入要求
+
+| 项 | 要求 |
+| --- | --- |
+| 传感器 | 加速度计三轴，陀螺仪不需要 |
+| 采样率 | **{hz} Hz**（`PB_SAMPLE_RATE_HZ`），间隔均匀 |
+| 数据 | int16 原始计数，按采样先后排列；量程在 `pb_init` 中告知 |
+| 时间 | `t0_ms` 为该批第一个样本的时间，其余按采样间隔推算；uint32 回绕可正常处理 |
+| 批次 | 每批样本数不限；相邻两批须连续，断档前调用 `pb_flush` |
+
+坐标系：佩戴后静止时重力大致落在某一轴上即可，库内部会自适应方向。
+
+## 3. 输出说明
+
+| type | 类别 |
+| --- | --- |
+""" + "\n".join(f"| {i} | {n} |" for i, n in enumerate(PB_TYPES)) + f"""
+
+本版模型实际输出的类别：
+
+| 模型类别 | type | 协议类别 |
+| --- | --- | --- |
+{maps}
+
+- 片段在行为结束后输出，最大延迟约 1.5 分钟；时间精度约 {hop / hz:g} 秒。
+- 开机后至少 {n_t / hz:g} 秒数据才开始判断。
+- `out` 放不下的片段留在库内（最多 64 个），下次 `pb_push` / `pb_flush` 时输出；溢出丢弃的数量见 `pb_lost()`。
+
+## 4. 资源与约束
+
+| 项 | 数值 |
+| --- | --- |
+| Flash（代码 + 模型，`--gc-sections` 后） | {kb(flash)} |
+| 工作内存 `PB_WORK_SIZE`（调用方提供） | {kb(work)} |
+| 库内静态 RAM（.bss/.data） | {kb(ram_static)} |
+| 推理频率 | 每 {hop / hz:g} 秒数据推理一次（{hop} 个样本） |
+| 调用位置 | 任务或主循环，不可在中断中调用 |
+| 线程安全 | 单实例，不可重入 |
+| 动态内存 | 不使用 malloc |
+
+编译链接：
+
+- 库为 Cortex-M4F + `-mfloat-abi=softfp`（与 GR551x SDK 一致）；hard ABI 工程无法链接，请联系算法侧另出。
+- 链 `libpetbehavior.a` 和 `-lm`；建议 `-Wl,--gc-sections`。
+
+## 5. 错误码
+
+| 值 | 宏 | 含义 |
+| --- | --- | --- |
+| -1 | `PB_ERR_PARAM` | 参数错误（采样率 / 量程 / 内存大小或对齐） |
+| -2 | `PB_ERR_NOT_INIT` | 未初始化 |
+| -3 | `PB_ERR_TIME` | 时间戳倒退 |
+| -4 | `PB_ERR_SELFTEST` | 自检未通过，拒绝推理 |
+| -5 | `PB_ERR_VERSION` | 头文件与库版本不一致（换库时头文件要一起换） |
+
+## 6. 集成验收
+
+1. PC 上（可选）：`./pc/pb_example test_input.bin test_expect.bin`，应输出「集成验收：通过」。
+2. 板上：`pb_init` 返回 0。
+3. 板上：把两个 bin 编进验收固件（如 `xxd -i`），调用 `example.c` 里的
+   `pb_acceptance(in, in_len, expect, expect_len)`，返回 0 即输出与 `test_expect.bin` 逐字节一致。
+4. 记录实际 Flash、RAM、单次 `pb_push` 耗时，回填接口协议第 6 节。
+
+验收数据为合成数据，只用于确认集成正确，不代表识别效果。
+"""
+
+
 def _define(path: str, name: str) -> int | None:
     if not os.path.exists(path):
         return None
