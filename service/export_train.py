@@ -444,6 +444,8 @@ def main():
     ap.add_argument("--remove", action="store_true", help="撤掉这个标签（清单 + 导出目录）")
     ap.add_argument("--bundle", default="", help="把这个标签的源码包（core/ + 导出目录 + README）打成这个 zip")
     ap.add_argument("--lib-only", action="store_true", help="配合 --bundle：只打编译好的库（保密，不含源码）")
+    ap.add_argument("--pb", action="store_true",
+                    help="配合 --lib-only：按《宠物行为识别库 · 接口协议》出 pet_behavior（三轴模型；暂不默认）")
     args = ap.parse_args()
 
     if args.bundle:
@@ -458,8 +460,8 @@ def main():
             fp = measure(gen, kind, int(meta["window_size"]), int(meta.get("n_channels") or 8), len(meta["classes"]))
         if args.lib_only:
             from footprint import bundle_geometry, write_lib_bundle, write_pb_bundle
-            if bundle_geometry(gen, kind)["n_ch"] == 5:
-                # 三轴加速度模型：按《宠物行为识别库 · 接口协议》出 pet_behavior
+            if args.pb and bundle_geometry(gen, kind)["n_ch"] == 5:
+                # 三轴加速度模型：按《宠物行为识别库 · 接口协议》出 pet_behavior（25 Hz 那套定下来之前不默认）
                 n = write_pb_bundle(gen, kind, os.path.expanduser(args.bundle), meta, fp)
             else:
                 n = write_lib_bundle(gen, kind, os.path.expanduser(args.bundle), meta, fp,

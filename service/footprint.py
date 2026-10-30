@@ -424,7 +424,46 @@ def _host_edge_cli(gen_dir: str, kind: str, geo: dict, out_path: str) -> bool:
     return False
 
 
-def lib_readme(kind: str, meta: dict, fp: dict, has_cli: bool, has_cmsis: bool, zip_name: str = "") -> str:
+def _expected_outputs(cli: str, sample: str, tmp: str) -> dict | None:
+    """PC 验证工具在打包时实际跑出来的结果：写进 README 给对方对照，sample 的逐窗口结果另存一份。"""
+    p = os.path.join(tmp, "sample.csv")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(sample)
+    st = subprocess.run([cli, "--selftest"], capture_output=True, text=True)
+    run = subprocess.run([cli, p], capture_output=True, text=True)
+    if st.returncode != 0 or run.returncode != 0:
+        raise RuntimeError("打包时 PC 验证工具自己都没跑通：" + (st.stdout + st.stderr + run.stderr)[-400:])
+    summary = [ln for ln in run.stderr.splitlines() if not ln.startswith("每窗")]   # 耗时每台机器不同
+    return {"selftest": st.stdout.strip(), "csv": run.stdout, "summary": "\n".join(summary).strip()}
+
+
+def _board_selftest_check(gen_dir: str, kind: str, geo: dict, lib: dict, tmp: str) -> str:
+    """example/board_selftest.c 链上打出来的 libtinyml.a 能编过（ARM），并且在 PC 上跑出来全通过。
+    返回它的正确输出（README 里给对方看）。"""
+    src = os.path.join(BUNDLE_SRC, "board_selftest.c")
+    k = "-DTM_KIND_RF" if kind == "rf" else "-DTM_KIND_CNN"
+    defs = lib["defines"].split()
+    cc, _, arm = toolchain()
+    r = subprocess.run([cc, "-c", *ARM_FLAGS, *defs, k, f"-I{CORE}", f"-I{gen_dir}", src,
+                        "-o", os.path.join(tmp, "board_selftest.o")], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("board_selftest.c 用 ARM 编不过：" + r.stderr[-400:])
+    host = shutil.which("gcc")
+    srcs = [os.path.join(CORE, f) for f in RUNTIME[kind]] + \
+           [os.path.join(gen_dir, f) for f in MODEL_FILES[kind] + TABLE_FILES[kind] if os.path.exists(os.path.join(gen_dir, f))]
+    exe = os.path.join(tmp, "board_selftest")
+    r = subprocess.run([host, *HOST_FLAGS, *defs, k, "-DTM_SELFTEST_MAIN", f"-I{CORE}", f"-I{gen_dir}", src, *srcs,
+                        "-o", exe, "-lm"], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("board_selftest.c 在 PC 上编不过：" + r.stderr[-400:])
+    out = subprocess.run([exe], capture_output=True, text=True)
+    if out.returncode != 0:
+        raise RuntimeError("board_selftest 在 PC 上没通过：" + out.stdout[-400:])
+    return out.stdout.strip()
+
+
+def lib_readme(kind: str, meta: dict, fp: dict, has_cli: bool, has_cmsis: bool, zip_name: str = "",
+               expected: dict | None = None) -> str:
     """编译库包的 README：从源码包 README 里借「输入映射」「资源占用」两节，其余按只给库重写。"""
     full = bundle_readme(kind, meta, fp)
     head = full.split("这个包是", 1)[0].rstrip()
@@ -444,18 +483,40 @@ def lib_readme(kind: str, meta: dict, fp: dict, has_cli: bool, has_cmsis: bool, 
              "lib/libtinyml.a        静态库（运行时 + 这一版模型），Cortex-M4F softfp\n"
              + ("lib/libtinyml_cmsis.a  同上，热点换成 CMSIS 内核（二选一，接口一样）\n" if has_cmsis else "")
              + "lib/BUILD_FLAGS.txt    库的编译选项\n"
-             "include/               头文件\n"
+             "include/               头文件（*golden.h 只给板上自检用）\n"
+             "example/board_selftest.c  板上自检示例\n"
              + ("pc/edge_cli            Linux x86_64 命令行工具（自检 + 跑 CSV）\n"
-                "pc/sample.csv          合成示例数据，只用来验证能跑通\n" if has_cli else "")
+                "pc/sample.csv          合成示例数据，只用来验证能跑通\n"
+                "pc/sample_result.csv   sample.csv 的正确结果\n" if has_cli else "")
              + "```\n")
-    verify = ("## 1. Linux 上验证\n\n"
-              "```bash\n"
-              "./pc/edge_cli --selftest          # golden 自检\n"
-              "./pc/edge_cli pc/sample.csv       # 逐窗口结果（CSV）\n"
-              "./pc/edge_cli 采集.csv --in-hz 50  # 自己的数据；单位 g / °/s，--help 看全部参数\n"
-              "```\n\n"
-              "输出每行一个窗口：`window,start_s,end_s,class_id,class,conf,p_<类别>...`，"
-              "板上结果应与之逐窗口一致。\n\n") if has_cli else ""
+    ex = expected or {}
+    kind_def = "-DTM_KIND_RF" if kind == "rf" else "-DTM_KIND_CNN"
+    verify = ""
+    if has_cli:
+        head = "\n".join(ex.get("csv", "").splitlines()[:6])
+        verify = ("## 1. 验证\n\n"
+                  "两步：PC 上确认工具和数据没问题，板上确认库在你的工程里算得对。结果和下面示例一致即为正确。\n\n"
+                  "### 1.1 PC 上（Linux x86_64）\n\n"
+                  "```bash\n./pc/edge_cli --selftest\n```\n\n正确结果：\n\n"
+                  f"```\n{ex.get('selftest', 'selftest: N/N 通过')}\n```\n\n"
+                  "```bash\n./pc/edge_cli pc/sample.csv --out result.csv\n```\n\n"
+                  "正确结果：屏幕（stderr）上的汇总应为\n\n"
+                  f"```\n{ex.get('summary', '')}\n```\n\n"
+                  "`result.csv` 应与包里的 `pc/sample_result.csv` 完全相同（`diff result.csv pc/sample_result.csv` 无输出），开头几行：\n\n"
+                  f"```\n{head}\n```\n\n"
+                  "每行一个窗口：序号、起止时间（秒）、类别下标、类别、置信度、各类概率。"
+                  "`sample.csv` 是合成数据，只用于确认能跑通，类别本身没有意义。\n\n"
+                  "自己的采集数据：`./pc/edge_cli 采集.csv --in-hz 50`（单位 g / °/s，`--help` 看全部参数），"
+                  "板上同一段数据的逐窗口判决应与之一致。\n\n")
+    verify += ("### 1.2 板上\n\n"
+               "把 `example/board_selftest.c` 加进工程（编译选项同第 2 节，另加 `" + kind_def + "`），"
+               "printf 重定向到串口，开机调用一次：\n\n"
+               "```c\nint tm_board_selftest(void);   /* 返回 0 = 通过 */\n\nif (tm_board_selftest() != 0) {\n"
+               "    /* 不通过：多半是编译选项不一致（-ffp-contract=off、浮点 ABI、上面的 -D 宏） */\n}\n```\n\n"
+               "正确结果（串口）：\n\n"
+               f"```\n{ex.get('board', 'selftest: N/N 通过')}\n```\n\n"
+               "不通过时会逐条打出 `golden #i 不一致：本板/期望`，把串口输出发给算法侧即可。"
+               "自检用的 golden 数据约占几 KB flash，量产固件可不带 `board_selftest.c`。\n\n")
     link = ("## 2. 接入工程\n\n"
             "1. `include/` 加进头文件路径，链 `lib/libtinyml.a` 和 `-lm`。\n"
             f"2. 包含这些头文件的源文件编译时加：`{defs}`（与库一致，否则结构体大小对不上）。\n"
@@ -488,6 +549,10 @@ def write_lib_bundle(gen_dir: str, kind: str, out_zip: str, meta: dict, fp: dict
             lib_cmsis = None
         cli = os.path.join(tmp, "edge_cli")
         has_cli = _host_edge_cli(gen_dir, kind, geo, cli)
+        sample = sample_csv(geo["hz"], geo["n_ch"] - 2)
+        board = _board_selftest_check(gen_dir, kind, geo, lib, tmp)
+        expected = _expected_outputs(cli, sample, tmp) if has_cli else None
+        expected = dict(expected or {}, board=board)
         with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
             for name, l in (("libtinyml.a", lib), ("libtinyml_cmsis.a", lib_cmsis)):
                 if l:
@@ -497,16 +562,21 @@ def write_lib_bundle(gen_dir: str, kind: str, out_zip: str, meta: dict, fp: dict
                        f"arm-none-eabi-gcc {lib['flags']} {lib['defines']}\n"
                        + (f"libtinyml_cmsis.a 另加：{lib_cmsis['defines']}\n" if lib_cmsis else ""))
             for rel in files:
-                if rel.endswith(".h") and not rel.endswith("golden.h"):
+                # golden 头文件也给：只是测试输入和标准答案，板上自检要用
+                if rel.endswith(".h") and (not rel.endswith("golden.h") or rel.endswith(GOLDEN_HEADERS[kind][-1])):
                     src = os.path.join(CORE, rel[5:]) if rel.startswith("core/") else os.path.join(gen_dir, rel[6:])
                     z.write(src, "include/" + os.path.basename(rel))
+            z.write(os.path.join(BUNDLE_SRC, "board_selftest.c"), "example/board_selftest.c")
+            if expected.get("csv"):
+                z.writestr("pc/sample_result.csv", expected["csv"])
             if has_cli:
                 info = zipfile.ZipInfo("pc/edge_cli")
                 info.external_attr = 0o755 << 16
                 info.compress_type = zipfile.ZIP_DEFLATED
                 z.writestr(info, open(cli, "rb").read())
-                z.writestr("pc/sample.csv", sample_csv(geo["hz"], geo["n_ch"] - 2))
-            z.writestr("README.md", lib_readme(kind, meta, fp, has_cli, bool(lib_cmsis), os.path.basename(out_zip)))
+                z.writestr("pc/sample.csv", sample)
+            z.writestr("README.md", lib_readme(kind, meta, fp, has_cli, bool(lib_cmsis), os.path.basename(out_zip),
+                                               expected))
     return os.path.getsize(out_zip)
 
 
