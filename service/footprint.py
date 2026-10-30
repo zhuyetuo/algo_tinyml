@@ -685,7 +685,10 @@ def lib_readme(kind: str, meta: dict, fp: dict, has_cli: bool, has_cmsis: bool, 
                   "每行一个窗口：序号、起止时间（秒）、类别下标、类别、置信度、各类概率。"
                   "`sample.csv` 是合成数据，只用于确认能跑通，类别本身没有意义。\n\n"
                   "自己的采集数据：`./pc/edge_cli 采集.csv --in-hz 50`（单位 g / °/s，`--help` 看全部参数），"
-                  "板上同一段数据的逐窗口判决应与之一致。\n\n")
+                  "板上同一段数据的逐窗口判决应与之一致。\n\n"
+                  "行为片段：`./pc/edge_cli 采集.csv --post seg.csv`，另把板上后处理（稳定版 v2，跟 `sched/` 调度库"
+                  "同一份）合成的片段写到 `seg.csv`（segment,start_s,end_s,dur_s,class_id,class,conf_mean,conf_max,n_windows）。"
+                  "调度库发给 App 的片段（0x09）就是这些。\n\n")
     verify += ("### 1.2 板上\n\n"
                "把 `example/board_selftest.c` 加进工程（编译选项同第 2 节，另加 `" + kind_def + "`），"
                "printf 重定向到串口，开机调用一次：\n\n"

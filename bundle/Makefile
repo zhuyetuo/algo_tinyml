@@ -21,10 +21,10 @@ LDLIBS   += -lm
 
 ifeq ($(KIND),rf)
   CFLAGS += -DTM_KIND_RF
-  SRCS    = core/tm_imu.c core/tm_features.c core/tm_forest_c.c model/tm_feat_cfg.c model/tm_forest_c_model.c
+  SRCS    = core/tm_imu.c core/tm_features.c core/tm_forest_c.c core/tm_post.c core/tm_post_cfg.c model/tm_feat_cfg.c model/tm_forest_c_model.c
 else
   CFLAGS += -DTM_KIND_CNN
-  SRCS    = core/tm_imu.c core/tm_prep.c core/tm_runtime.c model/tm_model.c
+  SRCS    = core/tm_imu.c core/tm_prep.c core/tm_runtime.c core/tm_post.c core/tm_post_cfg.c model/tm_model.c
 endif
 OBJS = $(patsubst %.c,build/%.o,$(SRCS))
 

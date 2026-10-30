@@ -25,6 +25,8 @@
 
 #include "tm_edge_cfg.h"
 #include "tm_imu.h"
+#include "tm_post.h"
+#include "tm_post_cfg.h"
 
 #if defined(TM_KIND_RF)
 #include "tm_feat_cfg.h"
@@ -386,7 +388,10 @@ static void usage(const char *argv0)
            "  --acc-scale F    加速度乘 F 换成 g。int16 原始计数用 量程/32768，例如 ±16g → 0.00048828125\n"
            "  --gyr-scale F    角速度乘 F 换成 °/s，例如 ±2000dps → 0.06103515625\n"
            "  --hop N          窗口步长（点），默认 %d\n"
-           "  --out FILE       结果写到文件，默认 stdout\n\n"
+           "  --out FILE       结果写到文件，默认 stdout\n"
+           "  --post FILE      另外把板上后处理（稳定版 v2，跟调度库同一份 tm_post）合成的行为片段写到 FILE：\n"
+           "                   segment,start_s,end_s,dur_s,class_id,class,conf_mean,conf_max,n_windows\n"
+           "                   这就是调度库发给 App 的片段（0x09）；缺失跳过的窗口处当断档，前后各自收尾\n\n"
            "输出 CSV：window,start_s,end_s,class_id,class,conf,<每类置信度…>；汇总打到 stderr。\n",
            argv0, argv0, N_CLASSES, N_CH, N_T, TM_EDGE_HZ, TM_EDGE_HOP,
            N_SENSOR == 6 ? ",gyro_x,gyro_y,gyro_z" : "", N_SENSOR == 6 ? ",gx,gy,gz" : "", TM_EDGE_HZ,
@@ -397,7 +402,7 @@ int main(int argc, char **argv)
 {
     int in_hz = TM_EDGE_HZ, hop = TM_EDGE_HOP;
     float acc_scale = 1.0f, gyr_scale = 1.0f;
-    const char *path = NULL, *out_path = NULL;
+    const char *path = NULL, *out_path = NULL, *post_path = NULL;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "--selftest")) return selftest();
@@ -410,6 +415,7 @@ int main(int argc, char **argv)
         else if (i + 1 < argc && !strcmp(a, "--gyr-scale")) gyr_scale = strtof(argv[++i], NULL);
         else if (i + 1 < argc && !strcmp(a, "--hop")) hop = atoi(argv[++i]);
         else if (i + 1 < argc && !strcmp(a, "--out")) out_path = argv[++i];
+        else if (i + 1 < argc && !strcmp(a, "--post")) post_path = argv[++i];
         else if (a[0] == '-' && a[1]) {
             fprintf(stderr, "不认识的参数 %s（--help 看用法）\n", a);
             return 2;
@@ -450,6 +456,28 @@ int main(int argc, char **argv)
     for (int c = 0; c < N_CLASSES; c++) fprintf(fo, ",p_%s", CLASS_NAMES[c]);
     fprintf(fo, "\n");
 
+    /* 板上后处理：跟调度库一样按类别名配（抓挠 / 甩身体是事件，其余是状态） */
+    static tm_post_t post;
+    static tm_seg_t segs[TM_POST_DELAY + 8];
+    tm_post_cfg_t pc;
+    FILE *fp = NULL;
+    long n_seg = 0;
+    if (post_path) {
+        fp = fopen(post_path, "w");
+        if (!fp) {
+            perror(post_path);
+            return 1;
+        }
+        fprintf(fp, "segment,start_s,end_s,dur_s,class_id,class,conf_mean,conf_max,n_windows\n");
+        tm_post_cfg_from_names(&pc, CLASS_NAMES, N_CLASSES, (float)N_T / TM_EDGE_HZ, (float)hop / TM_EDGE_HZ);
+        tm_post_init(&post, &pc);
+    }
+#define EMIT_SEGS(k)                                                                                        \
+    for (int q = 0; q < (k); q++, n_seg++)                                                                   \
+        fprintf(fp, "%ld,%.3f,%.3f,%.3f,%d,%s,%.4f,%.4f,%u\n", n_seg, segs[q].start_ms / 1000.0,               \
+                segs[q].end_ms / 1000.0, (segs[q].end_ms - segs[q].start_ms) / 1000.0, segs[q].cls,            \
+                CLASS_NAMES[segs[q].cls], segs[q].conf_mean, segs[q].conf_max, (unsigned)segs[q].n_windows)
+
     static float x[N_CH * N_T];
     float score[N_CLASSES];
     long count[N_CLASSES] = {0}, n_win = 0, n_skip = 0;
@@ -459,6 +487,11 @@ int main(int argc, char **argv)
         for (int t = 0; t < N_T; t++) nv += s.valid[st + t];
         if (nv < 0.7 * N_T) {
             n_skip++;
+            if (fp) {   /* 断档：前面的收尾，后面重新开始（调度库遇到 FIFO 溢出也是这样） */
+                const int k = tm_post_flush(&post, segs, TM_POST_DELAY + 8);
+                if (k > 0) EMIT_SEGS(k);
+                tm_post_init(&post, &pc);
+            }
             continue;
         }
         double t0 = now_sec();
@@ -472,11 +505,27 @@ int main(int argc, char **argv)
         count[cls]++;
         fprintf(fo, "%ld,%.3f,%.3f,%d,%s,%.4f", n_win, (double)st / TM_EDGE_HZ,
                 (double)(st + N_T) / TM_EDGE_HZ, cls, CLASS_NAMES[cls], score[cls]);
-        for (int c = 0; c < N_CLASSES; c++) fprintf(fo, ",%.4f", score[c]);
+        /* 各类概率多给两位：服务端后处理按对数算，0.0000 和 0.00004 差别很大 */
+        for (int c = 0; c < N_CLASSES; c++) fprintf(fo, ",%.6f", score[c]);
         fprintf(fo, "\n");
         n_win++;
+        if (fp) {
+            const int k = tm_post_on_window(&post, score, (uint32_t)((uint64_t)st * 1000u / TM_EDGE_HZ), segs,
+                                            TM_POST_DELAY + 8);
+            if (k < 0) {
+                fprintf(stderr, "后处理配置不合法（延迟线不够长）\n");
+                return 1;
+            }
+            EMIT_SEGS(k);
+        }
     }
     if (fo != stdout) fclose(fo);
+    if (fp) {
+        const int k = tm_post_flush(&post, segs, TM_POST_DELAY + 8);
+        if (k > 0) EMIT_SEGS(k);
+        fclose(fp);
+        fprintf(stderr, "行为片段 %ld 段 → %s\n", n_seg, post_path);
+    }
 
     fprintf(stderr, "样本 %ld 个（@%d Hz，%.1f s），窗口 %ld 个，因缺失跳过 %ld 个\n", s.n, TM_EDGE_HZ,
             (double)s.n / TM_EDGE_HZ, n_win, n_skip);

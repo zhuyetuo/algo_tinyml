@@ -733,3 +733,18 @@ def test_tm_log_is_accurate_enough(lib):
     srt = np.sort(xs)
     vals = np.array([m.tm_log_probe(float(x)) for x in srt])
     assert np.all(np.diff(vals) >= -1e-7), "不单调了，分段规约的边界写错了"
+
+
+def test_first_window_decoded_when_forced_from_the_start(lib):
+    """开机后路径一直不汇合（两类概率几乎打平），第一次走强制定稿时，第 0 个窗口也要有标签。
+    以前它被漏掉：片段从第 2 个窗口才开始，端上比服务端少半秒。"""
+    rng = np.random.default_rng(3)
+    n = 400
+    probs = np.full((n, 5), 0.01, np.float32)
+    probs[:, 0] = 0.48 + rng.normal(0, 0.01, n)
+    probs[:, 1] = 0.48 - (probs[:, 0] - 0.48)
+    probs /= probs.sum(1, keepdims=True)
+    got, forced = c_decode(lib, probs, ts_of(n))   # c_decode 里断言了每个窗口都定稿
+    assert forced > 0, "这条要走强制定稿分支，不然测不到"
+    segs, _ = c_run(lib, probs, ts_of(n))
+    assert segs and segs[0]["start"] == 0

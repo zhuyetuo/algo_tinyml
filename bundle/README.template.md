@@ -49,6 +49,7 @@ golden 是导出时 Python 参考实现算的，C 必须逐位一样。
 ./edge_cli data.csv                          # 结果打到屏幕（CSV）
 ./edge_cli 采集.csv --in-hz 50               # 平台样本是 50 Hz
 ./edge_cli data.csv --out result.csv         # 写文件；汇总（各类窗口数、占比、耗时）打在 stderr
+./edge_cli data.csv --post seg.csv           # 另把板上后处理（稳定版 v2）合成的行为片段写到 seg.csv
 ./edge_cli --help
 ```
 
