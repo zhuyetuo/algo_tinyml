@@ -97,3 +97,27 @@ def _check_50hz_matches_scipy(d):
     pa = np.array([[float(v) for v in r.split(",")[5:]] for r in ra])
     pb = np.array([[float(v) for v in r.split(",")[5:]] for r in rb])
     assert np.abs(pa - pb).max() < 1e-3
+
+
+@pytest.mark.skipif(not shutil.which("arm-none-eabi-gcc"), reason="没有 arm-none-eabi-gcc")
+@pytest.mark.parametrize("kind", ["rf", "cnn"])
+def test_lib_bundle_has_no_source(kind, tmp_path):
+    """编译库包（保密）：只有 .a + 头文件 + PC 验证工具，一个 .c 都不能有；验证工具能自检。"""
+    from footprint import write_lib_bundle
+
+    gen = MODELS[kind]
+    meta = json.load(open(os.path.join(gen, "meta.json"), encoding="utf-8"))
+    z = str(tmp_path / f"edge_{kind}_lib.zip")
+    write_lib_bundle(gen, kind, z, meta, measure(gen, kind, 16, 8, 5, {}), window=16, n_classes=5)
+    names = zipfile.ZipFile(z).namelist()
+    assert not [n for n in names if n.endswith((".c", "golden.h", "Makefile"))], names
+    for need in ("lib/libtinyml.a", "lib/BUILD_FLAGS.txt", "include/tm_imu.h", "README.md"):
+        assert need in names, need
+    readme = zipfile.ZipFile(z).read("README.md").decode()
+    assert "core/" not in readme and "FFT" not in readme and "@ZIP" not in readme
+    if "pc/edge_cli" in names:
+        d = tmp_path / "x"
+        zipfile.ZipFile(z).extractall(d)
+        os.chmod(d / "pc" / "edge_cli", 0o755)
+        r = subprocess.run(["./pc/edge_cli", "--selftest"], cwd=d, capture_output=True, text=True)
+        assert r.returncode == 0 and "17/17" in r.stdout, r.stdout + r.stderr

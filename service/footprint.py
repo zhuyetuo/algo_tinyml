@@ -394,6 +394,122 @@ def write_bundle(gen_dir: str, kind: str, out_zip: str, readme: str,
     return os.path.getsize(out_zip)
 
 
+def _strip_lib(path: str) -> None:
+    """去掉调试信息和用不到的本地符号（静态函数名、文件名之类），重定位要的留着，链接不受影响。"""
+    strip = shutil.which("arm-none-eabi-strip")
+    if strip:
+        subprocess.run([strip, "--strip-debug", "--strip-unneeded", path], check=True, capture_output=True)
+
+
+def _host_edge_cli(gen_dir: str, kind: str, geo: dict, out_path: str) -> bool:
+    """PC 上的 edge_cli 可执行文件（x86_64 Linux，静态链接、去符号）：只给编译好的东西，
+    对方照样能在 Linux 上命令行跑 / 自检，拿它对板上结果。编不出来就不给。"""
+    cc = shutil.which("gcc")
+    if not cc:
+        return False
+    n_t = max(geo["n_t"], 16)
+    srcs = [os.path.join(CORE, f) for f in RUNTIME[kind]] + \
+           [os.path.join(gen_dir, f) for f in MODEL_FILES[kind] + TABLE_FILES[kind] if os.path.exists(os.path.join(gen_dir, f))]
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "tm_edge_cfg.h"), "w", encoding="utf-8") as f:
+            f.write(_edge_cfg_h(geo))
+        base = [cc, "-O2", "-std=c99", "-ffp-contract=off", "-fno-math-errno", "-s",
+                f"-DTM_FEAT_MAX_T={n_t}", f"-DTM_FEAT_MAX_NPERSEG={n_t}",
+                f"-DTM_POST_MAX_CLASSES={max(geo['n_classes'], 2)}", "-DTM_KIND_RF" if kind == "rf" else "-DTM_KIND_CNN",
+                f"-I{CORE}", f"-I{gen_dir}", f"-I{tmp}", os.path.join(BUNDLE_SRC, "edge_cli.c"), *srcs,
+                "-o", out_path, "-lm"]
+        for extra in (["-static"], []):   # 静态的哪台 Linux 都能跑；没有静态 libc 就退回动态
+            if subprocess.run(base[:1] + extra + base[1:], capture_output=True).returncode == 0:
+                return True
+    return False
+
+
+def lib_readme(kind: str, meta: dict, fp: dict, has_cli: bool, has_cmsis: bool, zip_name: str = "") -> str:
+    """编译库包的 README：从源码包 README 里借「输入映射」「资源占用」两节，其余按只给库重写。"""
+    full = bundle_readme(kind, meta, fp)
+    head = full.split("这个包是", 1)[0].rstrip()
+    parts = re.split(r"(?m)^## ", full)
+    sec = {p[:2]: "## " + p for p in parts[1:]}
+    m2 = sec.get("2.", "")
+    imu_code = re.search(r"```c\n.*?```", m2, re.S)
+    mapping = (m2.split("\n", 1)[0].replace("## 2.", "## 3.") + "\n\n"
+               "原始 IMU 样本（单位 g" + ("、°/s" if "°/s" in m2 else "") + "）直接喂 `tm_imu_push`，"
+               "库内完成坐标变换，凑满一个窗口吐出模型输入。**不要自己预处理**，否则模型照样出类别，只是准确率莫名其妙地掉。\n\n"
+               + (imu_code.group(0) if imu_code else ""))
+    api = re.search(r"```c\n.*?```", sec.get("3.", ""), re.S)
+    n_t = int(meta.get("window_size") or 16)
+    n_cls = max(len(meta.get("classes") or []), 2)
+    defs = f"-DTM_FEAT_MAX_T={n_t} -DTM_FEAT_MAX_NPERSEG={n_t} -DTM_POST_MAX_CLASSES={n_cls}"
+    files = ("```\n"
+             "lib/libtinyml.a        静态库（运行时 + 这一版模型），Cortex-M4F softfp\n"
+             + ("lib/libtinyml_cmsis.a  同上，热点换成 CMSIS 内核（二选一，接口一样）\n" if has_cmsis else "")
+             + "lib/BUILD_FLAGS.txt    库的编译选项\n"
+             "include/               头文件\n"
+             + ("pc/edge_cli            Linux x86_64 命令行工具（自检 + 跑 CSV）\n"
+                "pc/sample.csv          合成示例数据，只用来验证能跑通\n" if has_cli else "")
+             + "```\n")
+    verify = ("## 1. Linux 上验证\n\n"
+              "```bash\n"
+              "./pc/edge_cli --selftest          # golden 自检\n"
+              "./pc/edge_cli pc/sample.csv       # 逐窗口结果（CSV）\n"
+              "./pc/edge_cli 采集.csv --in-hz 50  # 自己的数据；单位 g / °/s，--help 看全部参数\n"
+              "```\n\n"
+              "输出每行一个窗口：`window,start_s,end_s,class_id,class,conf,p_<类别>...`，"
+              "板上结果应与之逐窗口一致。\n\n") if has_cli else ""
+    link = ("## 2. 接入工程\n\n"
+            "1. `include/` 加进头文件路径，链 `lib/libtinyml.a` 和 `-lm`。\n"
+            f"2. 包含这些头文件的源文件编译时加：`{defs}`（与库一致，否则结构体大小对不上）。\n"
+            "3. 库是 Cortex-M4F + `-mfloat-abi=softfp`（跟 GR551x SDK 一致），hard ABI 的工程链不上。\n"
+            "4. 建议链接加 `-Wl,--gc-sections`，没用到的函数会丢掉。\n"
+            "5. 无 malloc、不依赖 OS，裸机或 RTOS 任务里都能调；不可重入，多任务调用请自行加锁。\n\n"
+            "调用顺序：\n\n@API@\n\n")
+    # 推理那行写了特征怎么算，保密包不带
+    foot = "\n".join(ln for ln in sec.get("4.", "").split("\n") if not ln.startswith(("推理：", "| flash：自检 golden")))
+    head = head.replace("@ZIP_STEM@", os.path.splitext(zip_name)[0])
+    api_txt = api.group(0).replace("（见上一节）", "（见第 3 节）") if api else ""
+    link = link.replace("@API@", api_txt)
+    return f"{head}\n\n本包为编译好的静态库，不含源码。\n\n{files}\n{verify}{link}{mapping}\n\n{foot}"
+
+
+def write_lib_bundle(gen_dir: str, kind: str, out_zip: str, meta: dict, fp: dict,
+                     window: int, n_classes: int) -> int:
+    """编译库包（保密）：只给预编的 .a + 头文件 + PC 验证工具，不含任何 .c。返回字节数。
+    没有交叉编译器编不出 .a 就抛错——这个包没有 .a 就没意义。"""
+    import zipfile
+
+    files = source_bundle_bytes(gen_dir, kind)["files"]
+    geo = bundle_geometry(gen_dir, kind)
+    with tempfile.TemporaryDirectory() as tmp:
+        lib = build_static_lib(gen_dir, kind, window, n_classes, tmp)
+        if not lib or "path" not in lib:
+            raise RuntimeError("编不出 libtinyml.a：" + ((lib or {}).get("error") or "没装 arm-none-eabi-gcc"))
+        lib_cmsis = build_static_lib(gen_dir, kind, window, n_classes, tmp, use_cmsis=True)
+        if lib_cmsis and "path" not in lib_cmsis:
+            lib_cmsis = None
+        cli = os.path.join(tmp, "edge_cli")
+        has_cli = _host_edge_cli(gen_dir, kind, geo, cli)
+        with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
+            for name, l in (("libtinyml.a", lib), ("libtinyml_cmsis.a", lib_cmsis)):
+                if l:
+                    _strip_lib(l["path"])
+                    z.write(l["path"], "lib/" + name)
+            z.writestr("lib/BUILD_FLAGS.txt",
+                       f"arm-none-eabi-gcc {lib['flags']} {lib['defines']}\n"
+                       + (f"libtinyml_cmsis.a 另加：{lib_cmsis['defines']}\n" if lib_cmsis else ""))
+            for rel in files:
+                if rel.endswith(".h") and not rel.endswith("golden.h"):
+                    src = os.path.join(CORE, rel[5:]) if rel.startswith("core/") else os.path.join(gen_dir, rel[6:])
+                    z.write(src, "include/" + os.path.basename(rel))
+            if has_cli:
+                info = zipfile.ZipInfo("pc/edge_cli")
+                info.external_attr = 0o755 << 16
+                info.compress_type = zipfile.ZIP_DEFLATED
+                z.writestr(info, open(cli, "rb").read())
+                z.writestr("pc/sample.csv", sample_csv(geo["hz"], geo["n_ch"] - 2))
+            z.writestr("README.md", lib_readme(kind, meta, fp, has_cli, bool(lib_cmsis), os.path.basename(out_zip)))
+    return os.path.getsize(out_zip)
+
+
 def _define(path: str, name: str) -> int | None:
     if not os.path.exists(path):
         return None

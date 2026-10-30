@@ -443,6 +443,7 @@ def main():
     ap.add_argument("--local", default=LOCAL_JSON, help="登记到哪份清单")
     ap.add_argument("--remove", action="store_true", help="撤掉这个标签（清单 + 导出目录）")
     ap.add_argument("--bundle", default="", help="把这个标签的源码包（core/ + 导出目录 + README）打成这个 zip")
+    ap.add_argument("--lib-only", action="store_true", help="配合 --bundle：只打编译好的库（保密，不含源码）")
     args = ap.parse_args()
 
     if args.bundle:
@@ -455,8 +456,13 @@ def main():
         if not fp:
             from footprint import measure
             fp = measure(gen, kind, int(meta["window_size"]), int(meta.get("n_channels") or 8), len(meta["classes"]))
-        n = write_bundle(gen, kind, os.path.expanduser(args.bundle), bundle_readme(kind, meta, fp),
-                         window=int(meta["window_size"]), n_classes=len(meta["classes"]))
+        if args.lib_only:
+            from footprint import write_lib_bundle
+            n = write_lib_bundle(gen, kind, os.path.expanduser(args.bundle), meta, fp,
+                                 window=int(meta["window_size"]), n_classes=len(meta["classes"]))
+        else:
+            n = write_bundle(gen, kind, os.path.expanduser(args.bundle), bundle_readme(kind, meta, fp),
+                             window=int(meta["window_size"]), n_classes=len(meta["classes"]))
         r = {"tag": args.tag, "zip": os.path.abspath(os.path.expanduser(args.bundle)), "bytes": n}
     elif args.remove:
         r = remove(args.tag, args.local)
