@@ -11,6 +11,7 @@ import subprocess
 import sys
 import zipfile
 
+import numpy as np
 import pytest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -174,3 +175,44 @@ def test_keil_objects(tmp_path):
         r = subprocess.run(["qemu-system-arm", "-M", "mps2-an386", "-nographic", "-semihosting-config",
                             "enable=on,target=native", "-kernel", str(elf)], capture_output=True, text=True, timeout=300)
         assert "selftest: 17/17 通过" in r.stdout, abi + r.stdout + r.stderr
+
+
+@pytest.mark.skipif(not shutil.which("arm-none-eabi-gcc"), reason="没有 arm-none-eabi-gcc")
+def test_invariant_model_bundle_ignores_mounting(tmp_path):
+    """channel_mode=inv 的模型：库带 -DTM_IMU_INVARIANT=1 编；同一段数据换任意佩戴方向，
+    包里的 edge_cli 逐窗判决完全一样（端到端的「怎么戴都一样」）。"""
+    import csv
+
+    from footprint import write_lib_bundle
+
+    gen = tmp_path / "gen"
+    shutil.copytree(MODELS["rf"], gen)
+    meta = json.load(open(gen / "meta.json", encoding="utf-8"))
+    meta["channel_mode"] = "inv"
+    (gen / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    z = str(tmp_path / "lib.zip")
+    write_lib_bundle(str(gen), "rf", z, meta, measure(str(gen), "rf", 16, 8, 5, {}), window=16, n_classes=5)
+    d = tmp_path / "x"
+    zipfile.ZipFile(z).extractall(d)
+    assert "-DTM_IMU_INVARIANT=1" in (d / "lib" / "BUILD_FLAGS.txt").read_text()
+    os.chmod(d / "pc" / "edge_cli", 0o755)
+
+    rows = list(csv.reader(open(d / "pc" / "sample.csv", encoding="utf-8")))
+    data = np.array(rows[1:], float)
+
+    def classes_of(R):
+        x = data.copy()
+        x[:, 1:4] = data[:, 1:4] @ R.T
+        x[:, 4:7] = data[:, 4:7] @ R.T
+        p = tmp_path / "r.csv"
+        p.write_text(",".join(rows[0]) + "\n" + "\n".join(",".join(f"{v:.6f}" for v in r) for r in x) + "\n")
+        out = subprocess.run([str(d / "pc" / "edge_cli"), str(p)], capture_output=True, text=True, check=True).stdout
+        return [ln.split(",")[3] for ln in out.splitlines()[1:]]
+
+    base = classes_of(np.eye(3))
+    c, s = np.cos(0.7), np.sin(0.7)
+    for R in (np.diag([1.0, -1.0, -1.0]), np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
+              np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])):
+        got = classes_of(R)
+        same = sum(a == b for a, b in zip(base, got))
+        assert same >= len(base) - 1, f"{same}/{len(base)}"   # 只允许输入精度（6 位小数）造成的个别边界窗口

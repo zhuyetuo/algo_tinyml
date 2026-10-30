@@ -49,6 +49,19 @@ MODEL_FILES = {"rf": ["tm_forest_c_model.c"], "cnn": ["tm_model.c"]}
 TABLE_FILES = {"rf": ["tm_feat_cfg.c"], "cnn": []}
 GOLDEN_HEADERS = {"rf": ["tm_forest_c_golden.h", "tm_forest_c_pipeline_golden.h"], "cnn": ["tm_golden.h"]}
 
+
+def imu_defines(gen_dir: str) -> dict:
+    """这一版模型的输入映射要哪套：训练时 channel_mode=inv（方向无关）的，tm_imu.c 要带
+    -DTM_IMU_INVARIANT=1 编。读导出目录的 meta.json；老模型没有这一项，就是原来那套。"""
+    import json
+
+    try:
+        with open(os.path.join(gen_dir, "meta.json"), encoding="utf-8") as f:
+            mode = (json.load(f) or {}).get("channel_mode")
+    except (OSError, ValueError):
+        mode = None
+    return {"TM_IMU_INVARIANT": 1} if mode == "inv" else {}
+
 _CTYPE_BYTES = {"int8_t": 1, "uint8_t": 1, "int16_t": 2, "uint16_t": 2, "int32_t": 4, "uint32_t": 4,
                 "float": 4, "int": 4, "double": 8}
 
@@ -153,7 +166,7 @@ def measure(gen_dir: str, kind: str, window: int, n_ch: int, n_classes: int,
     gen_dir = os.path.abspath(gen_dir)
     cc, size_bin, arm = toolchain()
     defines = {"TM_FEAT_MAX_T": max(int(window), 16), "TM_FEAT_MAX_NPERSEG": max(int(window), 16),
-               "TM_POST_MAX_CLASSES": max(int(n_classes), 2)}
+               "TM_POST_MAX_CLASSES": max(int(n_classes), 2), **imu_defines(gen_dir)}
     include = [CORE, gen_dir]
     runtime = _compile_all([os.path.join(CORE, f) for f in RUNTIME[kind]], include, defines, arm, cc, size_bin)
     model = _compile_all([os.path.join(gen_dir, f) for f in MODEL_FILES[kind] if os.path.exists(os.path.join(gen_dir, f))],
@@ -312,7 +325,7 @@ def build_static_lib(gen_dir: str, kind: str, window: int, n_classes: int, out_d
     srcs = [os.path.join(CORE, f) for f in RUNTIME[kind]] + \
            [os.path.join(gen_dir, f) for f in MODEL_FILES[kind] + TABLE_FILES[kind] if os.path.exists(os.path.join(gen_dir, f))]
     defines = {"TM_FEAT_MAX_T": max(int(window), 16), "TM_FEAT_MAX_NPERSEG": max(int(window), 16),
-               "TM_POST_MAX_CLASSES": max(int(n_classes), 2)}
+               "TM_POST_MAX_CLASSES": max(int(n_classes), 2), **imu_defines(gen_dir)}
     inc = [CORE, gen_dir]
     if use_cmsis:
         srcs += cmsis.sources(kind)
@@ -387,7 +400,8 @@ def write_bundle(gen_dir: str, kind: str, out_zip: str, readme: str,
         z.writestr("pc/sample.csv", sample_csv(geo["hz"], geo["n_ch"] - 2))
         mk = open(os.path.join(BUNDLE_SRC, "Makefile"), encoding="utf-8").read()
         z.writestr("Makefile", mk.replace("@KIND@", kind).replace("@N_T@", str(max(geo["n_t"], 16)))
-                   .replace("@N_CLASSES@", str(max(geo["n_classes"], 2))))
+                   .replace("@N_CLASSES@", str(max(geo["n_classes"], 2)))
+                   .replace("@IMU_DEFS@", " ".join(f"-D{k}={v}" for k, v in imu_defines(gen_dir).items())))
         z.writestr("README.md", _fill_file_lists(readme, files, extras, has_lib=bool(lib and "path" in lib),
                                                   zip_name=os.path.basename(out_zip),
                                                   has_cmsis=any(n.startswith("third_party/") for n in z.namelist())))
@@ -465,7 +479,8 @@ def build_keil_objects(gen_dir: str, kind: str, window: int, n_classes: int, out
     srcs = [os.path.join(CORE, f) for f in RUNTIME[kind]] + \
            [os.path.join(gen_dir, f) for f in MODEL_FILES[kind] + TABLE_FILES[kind] if os.path.exists(os.path.join(gen_dir, f))]
     defines = [f"-DTM_FEAT_MAX_T={max(int(window), 16)}", f"-DTM_FEAT_MAX_NPERSEG={max(int(window), 16)}",
-               f"-DTM_POST_MAX_CLASSES={max(int(n_classes), 2)}"]
+               f"-DTM_POST_MAX_CLASSES={max(int(n_classes), 2)}",
+               *[f"-D{k}={v}" for k, v in imu_defines(gen_dir).items()]]
 
     def run(cmd):
         r = subprocess.run(cmd, capture_output=True, text=True)
@@ -572,6 +587,7 @@ def _host_edge_cli(gen_dir: str, kind: str, geo: dict, out_path: str) -> bool:
         base = [cc, "-O2", "-std=c99", "-ffp-contract=off", "-fno-math-errno", "-s",
                 f"-DTM_FEAT_MAX_T={n_t}", f"-DTM_FEAT_MAX_NPERSEG={n_t}",
                 f"-DTM_POST_MAX_CLASSES={max(geo['n_classes'], 2)}", "-DTM_KIND_RF" if kind == "rf" else "-DTM_KIND_CNN",
+                *[f"-D{k}={v}" for k, v in imu_defines(gen_dir).items()],
                 f"-I{CORE}", f"-I{gen_dir}", f"-I{tmp}", os.path.join(BUNDLE_SRC, "edge_cli.c"), *srcs,
                 "-o", out_path, "-lm"]
         for extra in (["-static"], []):   # 静态的哪台 Linux 都能跑；没有静态 libc 就退回动态
@@ -826,7 +842,7 @@ def write_pb_bundle(gen_dir: str, kind: str, out_zip: str, meta: dict, fp: dict)
     mv = pb_model_version(meta)
     hver = (PB_LIB_VERSION << 16) | mv
     defines = [f"-DTM_FEAT_MAX_T={max(n_t, 16)}", f"-DTM_FEAT_MAX_NPERSEG={max(n_t, 16)}",
-               f"-DTM_POST_MAX_CLASSES={n_cls}"]
+               f"-DTM_POST_MAX_CLASSES={n_cls}", *[f"-D{k}={v}" for k, v in imu_defines(gen_dir).items()]]
     srcs = [os.path.join(CORE, f) for f in RUNTIME[kind]] + \
            [os.path.join(gen_dir, f) for f in MODEL_FILES[kind] + TABLE_FILES[kind] if os.path.exists(os.path.join(gen_dir, f))]
 
@@ -1264,7 +1280,25 @@ def bundle_readme(kind: str, meta: dict, fp: dict) -> str:
         "@TOOLCHAIN@": fp.get("toolchain", ""),
         "@FOOTPRINT@": footprint,
     }
+    inv = str(meta.get("channel_mode") or "tilt") == "inv"
+    rep["@IMU_NOTE@"] = ("- `-DTM_IMU_INVARIANT=1`：这一版是方向无关输入，`tm_imu.c` 必须带它编"
+                         "（不带的话照样出结果，只是全错）\n") if inv else ""
     s = open(os.path.join(BUNDLE_SRC, "README.template.md"), encoding="utf-8").read()
     for k, v in rep.items():
         s = s.replace(k, v)
+    if inv:
+        # 方向无关输入：第 2 节换成这套的说明（原文讲的是重力对齐 + pitch/roll）
+        a = s.index("## 2. 输入映射")
+        b = s.index("```c\n#include \"tm_imu.h\"", a)
+        rows = ["| 0 | 竖直分量 v = a·u（g） |", "| 1 | 水平分量的模 |a − v·u|（g） |", "| 2 | 加速度模 |a|（g） |"]
+        if six:
+            rows += ["| 3, 4, 5 | 角速度：竖直分量、水平分量的模、模（°/s） |"]
+        rows += [f"| {n_ch - 2} | 偏角 θ = atan2(水平, 竖直)（弧度） |", f"| {n_ch - 1} | jerk |a_t − a_(t−1)|（g） |"]
+        s = s[:a] + (
+            f"## 2. 输入映射：IMU {n_sensor} 轴 → 模型 {n_ch} 通道（方向无关）\n\n"
+            "**佩戴方向不限**：这一版的输入只用跟设备朝向无关的量，正着戴、倒着戴、转个角度，"
+            "模型看到的输入都一样。IMU 原始轴直接喂，**不要做坐标变换**。已经实现在 `core/tm_imu.c`"
+            "（编译带 `-DTM_IMU_INVARIANT=1`）。\n\n"
+            f"凑满一个窗口（{n_t} 个样本）后，u = 窗口内加速度均值的方向（重力方向），逐样本算：\n\n"
+            "| 通道 | 内容 |\n|---|---|\n" + "\n".join(rows) + "\n\n") + s[b:]
     return s

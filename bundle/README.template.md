@@ -137,7 +137,7 @@ if (tm_imu_push(&s, sample, x)) {
 
 - `-ffp-contract=off`（否则浮点末位跟 PC 对不上，golden 自检会红）
 - `-DTM_FEAT_MAX_T=@N_T@ -DTM_FEAT_MAX_NPERSEG=@N_T@`：按真实窗口开缓冲，不给的话按 64 编、RAM 多占
-- 核心代码不依赖任何 OS 接口，裸机或 RTOS 任务里都能调；只用 libm；无 malloc。
+@IMU_NOTE@- 核心代码不依赖任何 OS 接口，裸机或 RTOS 任务里都能调；只用 libm；无 malloc。
 
 板上自检：把 golden 头文件（`model/*golden.h`）编进自检程序，跟 `pc/edge_cli.c` 里 `selftest()` 一样逐位比，
 怎么挂进 GR551x 工程见 `board/README.md`。
