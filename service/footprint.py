@@ -415,7 +415,7 @@ def write_bundle(gen_dir: str, kind: str, out_zip: str, readme: str,
 #   3. 不依赖 GCC 的 C 库：用到的数学函数（logf / atan2f / cos ...）从 newlib 抽出来改名打进去，
 #      板上算出来和 GCC 版逐位一样（换成 Keil 的 libm 末位可能不同，golden 自检会红）。
 # 打完只剩 __aeabi_* 运行时函数和 memcpy/memset/strcmp 要外部提供，Keil 的 C 库（含 microlib）都有。
-KEIL_ALLOWED_UNDEF = re.compile(r"^(__aeabi_\w+|memcpy|memset|memmove|strcmp)$")
+KEIL_ALLOWED_UNDEF = re.compile(r"^(__aeabi_\w+|memcpy|memset|memmove|memcmp|strcmp)$")
 KEIL_PREFIX = "tm_m_"
 
 
@@ -470,8 +470,10 @@ def _patch_wchar_attr(obj: str) -> None:
     open(obj, "wb").write(bytes(data))
 
 
-def build_keil_objects(gen_dir: str, kind: str, window: int, n_classes: int, out_dir: str) -> dict:
-    """出 keil/tinyml_softfp.o 和 keil/tinyml_hard.o（各自一个预链接的目标文件）。返回 {abi: 路径}。"""
+def build_keil_objects(gen_dir: str, kind: str, window: int, n_classes: int, out_dir: str,
+                       extra_srcs: tuple = (), extra_inc: tuple = (), name: str = "tinyml") -> dict:
+    """出 keil/<name>_softfp.o 和 keil/<name>_hard.o（各自一个预链接的目标文件）。返回 {abi: 路径}。
+    extra_srcs / extra_inc：调度层那份再加 pet_behavior.c 和生成的头文件目录。"""
     cc, _, arm = toolchain()
     nm, objcopy = shutil.which("arm-none-eabi-nm"), shutil.which("arm-none-eabi-objcopy")
     if not (arm and nm and objcopy):
@@ -504,9 +506,9 @@ def build_keil_objects(gen_dir: str, kind: str, window: int, n_classes: int, out
         flags = [f if not f.startswith("-mfloat-abi=") else f"-mfloat-abi={abi}" for f in ARM_FLAGS]
         with tempfile.TemporaryDirectory() as tmp:
             objs = []
-            for f in srcs:
+            for f in srcs + list(extra_srcs):
                 o = os.path.join(tmp, os.path.basename(f) + ".o")
-                run([cc, "-c", *flags, *defines, f"-I{CORE}", f"-I{gen_dir}", f, "-o", o])
+                run([cc, "-c", *flags, *defines, *[f"-I{i}" for i in extra_inc], f"-I{CORE}", f"-I{gen_dir}", f, "-o", o])
                 objs.append(o)
             ours = os.path.join(tmp, "ours.o")
             run([cc, *flags, "-nostdlib", "-r", *objs, "-o", ours])
@@ -538,7 +540,7 @@ def build_keil_objects(gen_dir: str, kind: str, window: int, n_classes: int, out
                     f.write("".join(f"{a} {b}\n" for a, b in sorted(renames.items())))
                 for p_ in parts:
                     run([objcopy, f"--redefine-syms={rf}", p_])
-            out = os.path.join(out_dir, f"tinyml_{abi}.o")
+            out = os.path.join(out_dir, f"{name}_{abi}.o")
             merged = os.path.join(tmp, "merged.o")
             run([cc, *flags, "-nostdlib", "-r", *parts, "-o", merged])
             run([objcopy, "--strip-debug", "--strip-unneeded", "--remove-section=.comment", merged, out])
@@ -655,7 +657,9 @@ def lib_readme(kind: str, meta: dict, fp: dict, has_cli: bool, has_cmsis: bool, 
              "lib/libtinyml.a        静态库（运行时 + 这一版模型），Cortex-M4F softfp\n"
              + ("lib/libtinyml_cmsis.a  同上，热点换成 CMSIS 内核（二选一，接口一样）\n" if has_cmsis else "")
              + "lib/BUILD_FLAGS.txt    库的编译选项\n"
-             "keil/tinyml_softfp.o   Keil（ARMCC 5 / armlink）用，softfp 调用约定\n"
+             + ("sched/                 调度库（量产用：常驻识别 + Flash 缓存 + 断连补发），见 sched/README.md\n"
+                if int(meta.get("n_channels") or 8) == 5 else "")
+             + "keil/tinyml_softfp.o   Keil（ARMCC 5 / armlink）用，softfp 调用约定\n"
              "keil/tinyml_hard.o     Keil 用，hard 调用约定\n"
              "include/               头文件（*golden.h 只给板上自检用）\n"
              "example/board_selftest.c  板上自检示例\n"
@@ -735,6 +739,9 @@ def write_lib_bundle(gen_dir: str, kind: str, out_zip: str, meta: dict, fp: dict
         cli = os.path.join(tmp, "edge_cli")
         has_cli = _host_edge_cli(gen_dir, kind, geo, cli)
         keil = build_keil_objects(gen_dir, kind, window, n_classes, os.path.join(tmp, "keil"))
+        sched = None
+        if geo["n_ch"] == 5:   # 三轴加速度模型：附带调度库（量产用）
+            sched = build_sched(gen_dir, kind, meta, os.path.join(tmp, "sched"))
         sample = sample_csv(geo["hz"], geo["n_ch"] - 2)
         board = _board_selftest_check(gen_dir, kind, geo, lib, tmp)
         expected = _expected_outputs(cli, sample, tmp) if has_cli else None
@@ -755,6 +762,13 @@ def write_lib_bundle(gen_dir: str, kind: str, out_zip: str, meta: dict, fp: dict
             z.write(os.path.join(BUNDLE_SRC, "board_selftest.c"), "example/board_selftest.c")
             for abi, path in keil.items():
                 z.write(path, f"keil/tinyml_{abi}.o")
+            if sched:
+                z.write(sched["header"], "sched/pet_behavior.h")
+                z.write(sched["lib_arm"], "sched/libpetbehavior.a")
+                for abi, path in sched["keil"].items():
+                    z.write(path, f"sched/keil/petbehavior_{abi}.o")
+                z.write(os.path.join(SCHED_SRC, "example_hal.c"), "sched/example_hal.c")
+                z.writestr("sched/README.md", sched_readme(meta, sched))
             if expected.get("csv"):
                 z.writestr("pc/sample_result.csv", expected["csv"])
             if has_cli:
@@ -951,6 +965,204 @@ def write_pb_bundle(gen_dir: str, kind: str, out_zip: str, meta: dict, fp: dict)
             z.writestr(info, open(exe, "rb").read())
             z.writestr("README.md", readme)
     return os.path.getsize(out_zip)
+
+
+# ── 调度层（pb_hal_t + pb_on_event）：嵌入式只实现硬件接口、转发事件 ─────────────────
+SCHED_SRC = os.path.join(BUNDLE_SRC, "sched")
+SCHED_LIB_VERSION = 2
+
+
+def build_sched(gen_dir: str, kind: str, meta: dict, out_dir: str) -> dict:
+    """编调度库：pet_behavior.h（填好 PB_WORK_SIZE）、libpetbehavior.a（ARM，去符号）、
+    libpetbehavior_host.a（x86，PC 模拟用）、Keil 的 petbehavior_{softfp,hard}.o。返回各文件路径。"""
+    geo = bundle_geometry(gen_dir, kind)
+    if geo["n_ch"] != 5:
+        raise ValueError(f"这一版模型是 {geo['n_ch'] - 2} 轴输入，调度库只支持三轴加速度模型")
+    cc, _, arm = toolchain()
+    ar, nm, strip = (shutil.which(f"arm-none-eabi-{t}") for t in ("ar", "nm", "strip"))
+    host_cc = shutil.which("gcc")
+    if not (arm and ar and nm and host_cc):
+        raise RuntimeError("打调度库要 arm-none-eabi-gcc/ar/nm 和 gcc")
+    classes = list(meta.get("classes") or [])
+    n_t, hz, hop, n_cls = geo["n_t"], geo["hz"], geo["hop"], max(geo["n_classes"], 2)
+    mv = pb_model_version(meta)
+    hver = (SCHED_LIB_VERSION << 16) | mv
+    defines = [f"-DTM_FEAT_MAX_T={max(n_t, 16)}", f"-DTM_FEAT_MAX_NPERSEG={max(n_t, 16)}",
+               f"-DTM_POST_MAX_CLASSES={n_cls}", *[f"-D{k}={v}" for k, v in imu_defines(gen_dir).items()]]
+    srcs = [os.path.join(CORE, f) for f in RUNTIME[kind]] + \
+           [os.path.join(gen_dir, f) for f in MODEL_FILES[kind] + TABLE_FILES[kind] if os.path.exists(os.path.join(gen_dir, f))]
+
+    def run(cmd):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"{os.path.basename(cmd[0])} 失败：{r.stderr.strip()[-600:]}")
+        return r.stdout
+
+    def header(work):
+        h = open(os.path.join(SCHED_SRC, "pet_behavior.h"), encoding="utf-8").read()
+        return h.replace("@WORK_SIZE@", str(work)).replace("@HEADER_VERSION@", f"0x{hver:08X}")
+
+    inc = os.path.join(out_dir, "inc")
+    os.makedirs(inc, exist_ok=True)
+    with open(os.path.join(inc, "pb_model_cfg.h"), "w", encoding="utf-8") as f:
+        f.write(_pb_model_cfg_h(kind, classes, hz, hop, mv))
+    # .c 拷到生成的头文件旁边编：#include "pet_behavior.h" 先找同目录
+    pb_c = shutil.copy(os.path.join(SCHED_SRC, "pet_behavior.c"), inc)
+    incs = [f"-I{inc}", f"-I{CORE}", f"-I{gen_dir}"]
+
+    sizes = []
+    for comp, flags, nm_tool in ((cc, ARM_FLAGS, nm), (host_cc, HOST_FLAGS, "nm")):
+        with open(os.path.join(inc, "pet_behavior.h"), "w", encoding="utf-8") as f:
+            f.write(header(0))
+        obj = os.path.join(out_dir, "probe.o")
+        run([comp, "-c", *flags, *defines, "-DPB_SIZE_PROBE", *incs, pb_c, "-o", obj])
+        m = re.search(r"^\S+\s+([0-9a-fA-F]+)\s+\w\s+pb_state_size_probe$", run([nm_tool, "-S", obj]), re.M)
+        if not m:
+            raise RuntimeError("量不出 pb_state_t 的大小")
+        sizes.append(int(m.group(1), 16))
+    work = (max(sizes) + 7) // 8 * 8
+    with open(os.path.join(inc, "pet_behavior.h"), "w", encoding="utf-8") as f:
+        f.write(header(work))
+
+    def build(comp, flags, arch, ar_tool, out_lib):
+        objs = []
+        for src in srcs + [pb_c]:
+            o = os.path.join(out_dir, f"{arch}_{os.path.basename(src)}.o")
+            run([comp, "-c", *flags, *defines, *incs, src, "-o", o])
+            objs.append(o)
+        if os.path.exists(out_lib):
+            os.remove(out_lib)
+        run([ar_tool, "rcs", out_lib, *objs])
+        return out_lib
+
+    lib_arm = build(cc, ARM_FLAGS, "arm", ar, os.path.join(out_dir, "libpetbehavior.a"))
+    if strip:
+        run([strip, "--strip-debug", "--strip-unneeded", lib_arm])
+    lib_host = build(host_cc, HOST_FLAGS, "x86", shutil.which("ar") or "ar", os.path.join(out_dir, "libpetbehavior_host.a"))
+    keil = build_keil_objects(gen_dir, kind, n_t, n_cls, os.path.join(out_dir, "keil"),
+                              extra_srcs=(pb_c,), extra_inc=(inc,), name="petbehavior")
+
+    # 板上占用：只调接口的小程序 -gc-sections 链一次，减掉空程序
+    flash = ram_static = None
+    size_tool = shutil.which("arm-none-eabi-size")
+    if size_tool:
+        use = os.path.join(out_dir, "use.c")
+        with open(use, "w") as f:
+            f.write('#include "pet_behavior.h"\nstatic unsigned char m[PB_WORK_SIZE];static pb_hal_t h;\n'
+                    'int main(void){int r=pb_init(&h,m,sizeof m);pb_on_event(1,0,0);return r+(int)pb_version();}\n')
+        base = os.path.join(out_dir, "base.c")
+        with open(base, "w") as f:
+            f.write("int main(void){return 0;}\n")
+        elfs = []
+        for src, extra in ((use, [lib_arm]), (base, [])):
+            e = src + ".elf"
+            r = subprocess.run([cc, *ARM_FLAGS, f"-I{inc}", src, *extra, "-lm", "--specs=nosys.specs",
+                                "-Wl,--gc-sections", "-o", e], capture_output=True, text=True)
+            elfs.append(e if r.returncode == 0 else None)
+        if all(elfs):
+            def sz(e):
+                t, d, b = map(int, run([size_tool, e]).splitlines()[1].split()[:3])
+                return t + d, d + b
+            (f1, r1), (f0, r0) = sz(elfs[0]), sz(elfs[1])
+            flash, ram_static = f1 - f0, r1 - r0 - work
+    return {"header": os.path.join(inc, "pet_behavior.h"), "inc": inc, "lib_arm": lib_arm, "lib_host": lib_host,
+            "keil": keil, "work": work, "flash": flash, "ram_static": ram_static, "version": hver,
+            "hz": hz, "classes": classes}
+
+
+def sched_readme(meta: dict, info: dict) -> str:
+    classes = info["classes"]
+    kb = lambda b: "-" if b is None else f"{b:,} B（{b / 1024:.1f} KB）"  # noqa: E731
+    v = info["version"]
+    cls_rows = "\n".join(f"| {i} | {c} |" for i, c in enumerate(classes))
+    return f"""# 宠物行为识别库 pet_behavior（调度层 + 算法 + 模型）
+
+库版本 v0.{v >> 16}，模型版本 {v & 0xFFFF}（`pb_version()` = `0x{v:08X}`）。不含源码。
+
+嵌入式侧只做两件事：实现 `pb_hal_t` 里的硬件接口；事件发生时调 `pb_on_event()`。
+取数节奏、识别、片段存储、上报、断连补发都在库里，**不连手机也一直在识别**。
+
+| 文件 | 说明 |
+| --- | --- |
+| `pet_behavior.h` | 头文件 |
+| `libpetbehavior.a` | 静态库（GCC，Cortex-M4F softfp） |
+| `keil/petbehavior_hard.o` / `keil/petbehavior_softfp.o` | Keil（ARMCC 5）用，按浮点调用约定二选一 |
+| `example_hal.c` | 硬件接口和事件转发示例 |
+
+## 1. 接入
+
+```c
+#include "pet_behavior.h"
+static uint8_t pb_mem[PB_WORK_SIZE] __attribute__((aligned(4)));
+
+pb_init(&hal, pb_mem, sizeof pb_mem);      /* 开机一次，0 = 成功（内含自检） */
+pb_on_event(PB_EVT_WAKEUP, NULL, 0);       /* 事件发生时，在任务 / 主循环里调 */
+```
+
+`pb_hal_t` 各函数要求见头文件注释，完整示例见 `example_hal.c`。比接口协议草案多一个字段
+`flash_erase_unit`（擦除单位，如 4096）。
+
+| 事件 | 时机 | data |
+| --- | --- | --- |
+| `PB_EVT_WAKEUP` | `set_wakeup` 设定的时间到 | 无 |
+| `PB_EVT_IMU_FIFO` | IMU FIFO 到水位（可选，有定时唤醒就够） | 无 |
+| `PB_EVT_BLE_CONNECTED` / `PB_EVT_BLE_DISCONNECTED` | 手机连上 / 断开 | 无 |
+| `PB_EVT_BLE_SENT` | 上一包发送完成 | 无 |
+| `PB_EVT_BLE_RECEIVED` | 收到手机数据 | 原始字节 |
+| `PB_EVT_TIME_SYNCED` | 校时完成 | 无 |
+
+约束：所有 `pb_*` 在同一个任务（或主循环）里调，不在中断里调；hal 函数里不要回调 `pb_on_event`；不用 malloc。
+
+## 2. 库的行为
+
+- 开机 `imu_config({info['hz']}, 8)`：只开加速度计，{info['hz']} Hz、±8 g。
+- 每 5 秒唤醒一次读 FIFO（FIFO 至少要装得下 5 秒 = {info['hz'] * 5} 个样本），逐窗口识别，合成行为片段写 Flash。
+- 连着手机时：每个窗口推一条当前行为（0x07），新片段和没确认的片段随时补发（0x09）；App 回确认（0x0A）后才可覆盖。
+- 断开、断电都不丢：重连 / 重启后从没确认的接着发。Flash 写满时覆盖最旧的，丢失数见 `pb_get_stats()`。
+- FIFO 溢出（取数中断超过 3 秒）记一次断档，前后两段各自收尾。
+
+## 3. BLE 数据（沿用现有帧格式）
+
+帧：`55 AA 00 cmd len(2 字节大端) data 校验和`，校验和 = 前面所有字节求和取低 8 位。
+
+| cmd | 方向 | 内容 |
+| --- | --- | --- |
+| `0x07` | 设备→App | 当前行为，与现有格式相同：DP `0x0A` 时间戳（8）/ `0x30` 类别（枚举）/ `0x31` 置信度（2） |
+| `0x09` | 设备→App | 行为片段：`n`（1）+ n × 13 字节，见下 |
+| `0x0A` | App→设备 | 确认：`seq`（4，大端），≤ seq 的片段都已收到 |
+
+片段（13 字节，大端）：
+
+| 偏移 | 长度 | 内容 |
+| --- | --- | --- |
+| 0 | 4 | seq，递增（不连续，按大小比较） |
+| 4 | 4 | 开始时间，见 flags |
+| 8 | 2 | 时长，0.1 秒 |
+| 10 | 1 | 类别，见下表 |
+| 11 | 1 | 置信度 0~100 |
+| 12 | 1 | flags：bit0=1 开始时间是 Unix 秒；bit0=0 且 bit1=0 未校时，开始时间 = 发送时距片段开始的秒数；bit1=1 时间未知（上次开机、未校时） |
+
+App 收到后回 `0x0A`（最大 seq）即可；同一个 seq 可能重复收到（没确认就断开时），按 seq 去重。
+
+| 类别 | 名称 |
+| --- | --- |
+{cls_rows}
+
+## 4. 资源
+
+| 项 | 数值 |
+| --- | --- |
+| Flash（代码 + 模型，`--gc-sections` 后） | {kb(info['flash'])} |
+| 工作内存 `PB_WORK_SIZE` | {kb(info['work'])} |
+| 库内静态 RAM | {kb(info['ram_static'])} |
+| 库专用 Flash 区域 | 每个片段 16 字节，64 KB 约存 4000 个片段 |
+
+## 5. 验收
+
+1. `pb_init` 返回 0（内含模型自检）。
+2. 连手机后 App 每秒收到 `0x07`；一段时间后收到 `0x09` 片段，回 `0x0A` 后断开重连不再重发已确认的。
+3. 断电重启后，没确认的片段仍会补发。
+"""
 
 
 def pb_readme(meta: dict, fp: dict, geo: dict, classes: list, work: int, flash: int | None,
