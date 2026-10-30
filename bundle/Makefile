@@ -15,6 +15,7 @@ CC       ?= gcc
 CFLAGS   ?= -O2
 CFLAGS   += -std=c99 -Wall -ffp-contract=off -fno-math-errno \
             -DTM_FEAT_MAX_T=$(N_T) -DTM_FEAT_MAX_NPERSEG=$(N_T) -DTM_POST_MAX_CLASSES=$(N_CLASS) \
+            @IMU_DEFS@ \
             -Icore -Imodel -Ipc
 LDLIBS   += -lm
 

@@ -175,6 +175,8 @@ class EdgeRunner:
         self.model_hz = int(meta["hz"])
         self.stride = int(meta.get("stride") or max(self.window_size // 2, 1))
         self.gravity_aligned = bool(meta.get("gravity_aligned", True))
+        # 输入通道：tilt（重力对齐 + 姿态角）/ inv（方向无关）。照训练时的来，老模型没有就是 tilt
+        self.channel_mode = str(meta.get("channel_mode") or "tilt")
         self.label_mode = str(meta.get("label_mode") or "majority")
         # 喂几个通道给预处理链。**不能让 infer_file 用它默认的 8**：3 轴模型是
         # 5 通道（acc3 + pitch/roll），按 8 切出来的窗口进 C 会被形状检查拦住——
@@ -220,6 +222,7 @@ class EdgeRunner:
                         label_mode=self.label_mode, resample_method=self.resample,
                         target_labels=targets, is_dl=self.is_dl,
                         n_channels=self.n_channels,
+                        channel_mode=self.channel_mode,
                     )
             except Exception:
                 sys.stdout.write(noise.getvalue())

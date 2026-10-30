@@ -5,9 +5,77 @@
 #include <math.h>
 #include <string.h>
 
+/* 方向无关通道（训练时 channel_mode=inv）：跟 imu_train gravity_align.invariant_channels 逐行对应。
+ * 每一路对设备的任意固定旋转都不变——用户怎么戴都一样。u = 窗口内加速度均值方向：
+ *   0 v=a·u  1 h=|a−v·u|  2 |a|  [3 ωv  4 ωh  5 |ω|]  倒数第二 θ=atan2(h,v)  最后 jerk=|a_t−a_{t−1}|
+ * 按模型编译：这一版模型是 inv 的话库里带 -DTM_IMU_INVARIANT=1（见 lib/BUILD_FLAGS.txt），调用方不用管。 */
+#ifndef TM_IMU_INVARIANT
+#define TM_IMU_INVARIANT 0
+#endif
+
+#if TM_IMU_INVARIANT
+static void split3(const float *s, double ux, double uy, double uz, double *v, double *h, double *m)
+{
+    const double x = s[0], y = s[1], z = s[2];
+    *v = x * ux + y * uy + z * uz;
+    *m = sqrt(x * x + y * y + z * z);
+    const double h2 = *m * *m - *v * *v;
+    *h = h2 > 0.0 ? sqrt(h2) : 0.0;
+}
+
+static int imu_invariant(const float *raw, int n_t, int n_sensor, float *out)
+{
+    const int n_ch = n_sensor + 2;
+    double gx = 0.0, gy = 0.0, gz = 0.0;
+    for (int t = 0; t < n_t; t++) {
+        const float *s = raw + (size_t)t * n_sensor;
+        gx += s[0];
+        gy += s[1];
+        gz += s[2];
+    }
+    gx /= n_t;
+    gy /= n_t;
+    gz /= n_t;
+    double ux = 0.0, uy = 0.0, uz = 1.0;
+    const double gn = sqrt(gx * gx + gy * gy + gz * gz);
+    if (gn >= 1e-6) {
+        ux = gx / gn;
+        uy = gy / gn;
+        uz = gz / gn;
+    }
+    for (int t = 0; t < n_t; t++) {
+        const float *s = raw + (size_t)t * n_sensor;
+        double v, h, m;
+        split3(s, ux, uy, uz, &v, &h, &m);
+        out[(size_t)0 * n_t + t] = (float)v;
+        out[(size_t)1 * n_t + t] = (float)h;
+        out[(size_t)2 * n_t + t] = (float)m;
+        if (n_sensor == 6) {
+            double wv, wh, wm;
+            split3(s + 3, ux, uy, uz, &wv, &wh, &wm);
+            out[(size_t)3 * n_t + t] = (float)wv;
+            out[(size_t)4 * n_t + t] = (float)wh;
+            out[(size_t)5 * n_t + t] = (float)wm;
+        }
+        out[(size_t)(n_ch - 2) * n_t + t] = (float)atan2(h, v);
+        double j = 0.0;
+        if (t > 0) {
+            const float *p = s - n_sensor;
+            const double dx = (double)s[0] - p[0], dy = (double)s[1] - p[1], dz = (double)s[2] - p[2];
+            j = sqrt(dx * dx + dy * dy + dz * dz);
+        }
+        out[(size_t)(n_ch - 1) * n_t + t] = (float)j;
+    }
+    return n_ch;
+}
+#endif
+
 int tm_imu_channels(const float *raw, int n_t, int n_sensor, float *out)
 {
     if (n_sensor != 3 && n_sensor != 6) return -1;
+#if TM_IMU_INVARIANT
+    return imu_invariant(raw, n_t, n_sensor, out);
+#endif
     const int n_ch = n_sensor + 2;
     float *pitch = out + (size_t)(n_ch - 2) * n_t;
     float *roll = out + (size_t)(n_ch - 1) * n_t;
