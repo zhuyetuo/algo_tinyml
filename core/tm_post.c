@@ -301,16 +301,25 @@ static void bout_paint(tm_post_t *st, long i0, long i1, int cls, int skip_taken)
     }
 }
 
-/* 抓挠 bout 往前后吞掉 absorb_s 以内的甩身体窗口（限制在块内） */
+/* 抓挠 bout 往前后吞掉甩身体窗口（限制在块内）。跟 postprocess.stabilize 一致：
+ * 判据是**从抓挠原来的边界往外累计扩了多少秒**，不是相邻窗口之间的间隔——
+ * 后者在 zone 首尾相接时恒为 0，会一路链式吞到底（一串 4.5 秒的甩身体被 3 秒的参数整段吞掉）。
+ * absorb_s <= 0 = 关闭。 */
 static void absorb_shake(const tm_post_t *st, long *i0, long *i1, long lo, long hi)
 {
-    if (st->cfg.shake < 0) return;
-    while (*i0 - 1 >= lo && is_shake_like(st, *i0 - 1)
-           && gap_s(st, *i0 - 1, *i0) <= st->cfg.shake_absorb_s)
+    if (st->cfg.shake < 0 || st->cfg.shake_absorb_s <= 0.0f) return;
+    const uint32_t lo_edge = zone_start(st, *i0), hi_edge = zone_end(st, *i1);
+    const uint32_t lim = (uint32_t)(st->cfg.shake_absorb_s * 1000.0f + 0.5f);
+    while (*i0 - 1 >= lo && is_shake_like(st, *i0 - 1)) {
+        const uint32_t a = zone_start(st, *i0 - 1);
+        if (a <= lo_edge && lo_edge - a > lim) break;
         --*i0;
-    while (*i1 + 1 <= hi && is_shake_like(st, *i1 + 1)
-           && gap_s(st, *i1, *i1 + 1) <= st->cfg.shake_absorb_s)
+    }
+    while (*i1 + 1 <= hi && is_shake_like(st, *i1 + 1)) {
+        const uint32_t b = zone_end(st, *i1 + 1);
+        if (b >= hi_edge && b - hi_edge > lim) break;
         ++*i1;
+    }
 }
 
 static void process_chunk(tm_post_t *st, long lo, long hi)
@@ -552,6 +561,14 @@ int tm_post_on_window(tm_post_t *st, const float *probs, uint32_t t_ms,
          * 少这一格的话整条链错位一个窗口 */
         int cc = bp_tmp[best];
         for (int k = st->bp_n - 1; k >= 1; --k) cc = bp_at(st, k)[cc];
+        /* 队首指针（第 0 个）指向的是链首窗口 my_i-bp_n-1。开机后路径一直没汇合、
+         * 第一次走到这里时，它（第 0 个窗口）还没定稿——这一格扔掉之前先把它定了，
+         * 不然它永远没有标签，第一段片段从第 2 个窗口才开始 */
+        {
+            const long head = my_i - st->bp_n - 1;
+            const int hs = slot_of(st, head);
+            if (hs >= 0 && !st->dl_fixed[hs]) on_decoded(st, head, bp_at(st, 0)[cc]);
+        }
         on_decoded(st, my_i - st->bp_n, cc);
         st->bp_head = (st->bp_head + 1) % TM_POST_LOOKAHEAD;
         st->bp_n--;

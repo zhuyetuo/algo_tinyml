@@ -46,8 +46,10 @@ extern "C" {
  * 调大只花 RAM（LOOKAHEAD × MAX_CLASSES 字节），不花时间——
  * 汇合检测是从头往回走，汇合了就停。 */
 #ifndef TM_POST_LOOKAHEAD
-#define TM_POST_LOOKAHEAD 48
+#define TM_POST_LOOKAHEAD 128
 #endif
+/* 48 不够：两类概率接近（如静止时 活动 0.58 / 睡觉 0.41）的一长段里，路径要 60 多个窗口
+ * 才汇合，48 时强制定稿、跟离线解码差出一整段；96 起就一致了。128 留余量，RAM 多 ~400 B */
 
 /* 事件组装的延迟线：一个"安全块"最多能有多长。
  * 必须 ≥ ceil((event_gap_s + shake_absorb_s) / stride_s) + 4，
@@ -67,6 +69,9 @@ extern "C" {
 
 /* 一个块里最多几段 bout。块最长 TM_POST_DELAY 个窗口，
  * 一段至少占一个窗口、段间至少隔一个窗口，所以一半足够。 */
+/* 没定稿的窗口要一直留在延迟线里，回溯缓冲不能比延迟线长 */
+typedef char tm_post_lookahead_fits[(TM_POST_LOOKAHEAD < TM_POST_DELAY) ? 1 : -1];
+
 #ifndef TM_POST_MAX_BOUTS
 #define TM_POST_MAX_BOUTS (TM_POST_DELAY / 2 + 1)
 #endif
