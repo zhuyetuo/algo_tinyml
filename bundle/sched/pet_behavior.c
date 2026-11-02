@@ -52,10 +52,15 @@
 #define PB_LIB_VERSION 0x0002u   /* v0.2：调度层 */
 #define PB_N_SENSOR 3
 #define PB_RANGE_G 8
-#define PB_POLL_MS 5000u         /* 取数间隔 */
+/* 定时取数间隔：攒够 64 个样本（常见 FIFO 128 的一半）就读，最长 5 秒。
+ * 31.25 Hz 时 128 个样本 4.1 秒就满了，固定 5 秒读会每次丢近 1 秒；按采样率算：31.25 Hz → 2.05 s，16 Hz → 4 s。
+ * 有 FIFO 水位中断（PB_EVT_IMU_FIFO）更好，定时唤醒只当兜底 */
+#define PB_POLL_SAMPLES 64.0
+#define PB_POLL_MS ((uint32_t)(PB_POLL_SAMPLES * 1000.0 / (double)PB_HZ > 5000.0 ? 5000.0 : PB_POLL_SAMPLES * 1000.0 / (double)PB_HZ))
 #define PB_GAP_MS 3000           /* 样本时间跟 now_ms 差这么多就当断档 */
 #define PB_READ_MAX 128         /* 一次最多读这么多（5 秒 @16Hz 是 80 个），读完一整批再判断有没有断档 */
-#define PB_DRIFT_MS 500         /* 样本时间比 now_ms 超前这么多就往回校（IMU 时钟比标称快） */
+#define PB_DRIFT_MS 500         /* 样本推算时间跟 now_ms 差这么多就校准（IMU 时钟跟标称有偏差，两个方向都校） */
+#define PB_RATE_MHZ ((uint32_t)(PB_HZ * 1000.0 + 0.5))
 #define PB_TMP 48
 #define PB_MAGIC 0x50425332u     /* "PBS2" */
 #define PB_REC 16u
@@ -436,8 +441,10 @@ static void on_rx(const uint8_t *p, uint16_t len)
 /* ── 取数 + 推理 ──────────────────────────────────────────────────────── */
 static uint32_t ms_of(uint32_t g)
 {
-    const int64_t off = (int64_t)(int32_t)(g - S->anchor_g);
-    return S->anchor_ms + (uint32_t)(int32_t)((off * 1000) / PB_HZ);
+    /* PB_HZ 可以是小数（31.25）：按 double 算再四舍五入 */
+    const double off = (double)(int32_t)(g - S->anchor_g);
+    const double d = off * 1000.0 / (double)PB_HZ;
+    return S->anchor_ms + (uint32_t)(int32_t)(d >= 0 ? d + 0.5 : d - 0.5);
 }
 
 static void reset_stream(void)
@@ -501,8 +508,12 @@ static void poll_imu(void)
         more = n == PB_READ_MAX;
         feed(S->rd, n);
     }
-    /* IMU 时钟比标称快：样本时间跑到 now 前面去了，往回校（只会跳回不到一秒） */
-    if ((int32_t)(now - ms_of(S->g - 1)) < -PB_DRIFT_MS) anchor_last(S->g - 1, now);
+    /* IMU 时钟跟标称有偏差（芯片 ODR 常有 ±1~2%）：样本推算的时间跟 now 差到 0.5 秒就校准，
+     * 快了慢了都校。只校超前的话，IMU 偏慢时推算时间越落越后，几分钟后就被当成断档、片段被截断 */
+    {
+        const int32_t drift = (int32_t)(now - ms_of(S->g - 1));
+        if (drift < -PB_DRIFT_MS || (drift > PB_DRIFT_MS && drift <= PB_GAP_MS)) anchor_last(S->g - 1, now);
+    }
 }
 
 /* ── 对外 ──────────────────────────────────────────────────────────────── */
@@ -536,7 +547,7 @@ int pb_init_v(const pb_hal_t *hal, void *mem, uint32_t mem_size, uint32_t header
         s->sync_unix = u;
         s->sync_ms = hal->now_ms();
     }
-    if (hal->imu_config(PB_HZ, PB_RANGE_G) != 0) {
+    if (hal->imu_config(PB_RATE_MHZ, PB_RANGE_G) != 0) {
         S = NULL;
         return PB_ERR_IMU;
     }

@@ -28,23 +28,22 @@ CLASSES = ["睡觉", "未佩戴", "活动", "抓挠"]
 UNIT = 4096
 
 
-def _windows(n, seed=0):
+def _windows(n, seed=0, n_t=N_T):
     rng = np.random.default_rng(seed)
     X, y = [], []
     for i in range(n):
         c = i % len(CLASSES)
         sd = {0: 0.01, 1: 0.0, 2: 0.15, 3: 0.6}[c]
-        w = rng.normal(0, sd, size=(N_T, N_CH)).astype(np.float32)
+        w = rng.normal(0, sd, size=(n_t, N_CH)).astype(np.float32)
         w[:, 2] += np.float32(1.0)
-        w[:, 3] = np.float32(0.1) + rng.normal(0, sd / 5, N_T).astype(np.float32)
-        w[:, 4] = np.float32(-0.1) + rng.normal(0, sd / 5, N_T).astype(np.float32)
+        w[:, 3] = np.float32(0.1) + rng.normal(0, sd / 5, n_t).astype(np.float32)
+        w[:, 4] = np.float32(-0.1) + rng.normal(0, sd / 5, n_t).astype(np.float32)
         X.append(w)
         y.append(c)
     return np.stack(X), np.array(y)
 
 
-@pytest.fixture(scope="module")
-def sim(tmp_path_factory):
+def _build(d, hz, n_t, hop):
     from sklearn.ensemble import RandomForestClassifier
 
     from export_train import nperseg_for
@@ -54,20 +53,19 @@ def sim(tmp_path_factory):
     from tinyml.forest import from_sklearn
     from tinyml.forest_compact import CompactForest
 
-    nps = nperseg_for(N_T)
-    X, y = _windows(400)
-    F = np.stack([extract_one(w, HZ, nps) for w in X])
+    nps = nperseg_for(n_t)
+    X, y = _windows(400, n_t=n_t)
+    F = np.stack([extract_one(w, hz, nps) for w in X])
     model = RandomForestClassifier(n_estimators=8, max_depth=6, random_state=0).fit(F, y)
     cf = CompactForest(from_sklearn(model, class_names=CLASSES))
     files = dict(export_compact(cf, golden_x=F[:16]))
-    files["tm_forest_c_pipeline_golden.h"] = pipeline_golden(cf, X[:16], HZ, nps)
-    files.update(export_feat_cfg(N_T, N_CH, nps, float(HZ)))
-    d = tmp_path_factory.mktemp("sched")
+    files["tm_forest_c_pipeline_golden.h"] = pipeline_golden(cf, X[:16], hz, nps)
+    files.update(export_feat_cfg(n_t, N_CH, nps, float(hz)))
     gen = d / "gen"
     gen.mkdir()
     for name, content in files.items():
         (gen / name).write_text(content, encoding="utf-8")
-    meta = {"hz": HZ, "window_size": N_T, "stride": HOP, "n_channels": N_CH, "classes": CLASSES,
+    meta = {"hz": hz, "window_size": n_t, "stride": hop, "n_channels": N_CH, "classes": CLASSES,
             "train": {"tag": "train8", "kind": "rf"}}
     (gen / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
     out = build_sched(str(gen), "rf", meta, str(d / "build"))
@@ -80,15 +78,26 @@ def sim(tmp_path_factory):
     # IMU：合成数据（静止 → 走动 → 抖动）来几轮，int16 原始计数（±8g）
     rows = []
     for seed in range(1, 9):
-        rows += sample_csv(HZ, 3, seconds=90, seed=seed).splitlines()[1:]
+        rows += sample_csv(hz, 3, seconds=90, seed=seed).splitlines()[1:]
     raw = b"".join(struct.pack("<hhh", *[max(-32768, min(32767, round(float(v) / (8 / 32768))))
                                           for v in ln.split(",")[1:4]]) for ln in rows)
     (d / "imu.bin").write_bytes(raw)
-    return {"exe": str(exe), "imu": str(d / "imu.bin"), "out": out, "seconds": len(rows) / HZ}
+    return {"exe": str(exe), "imu": str(d / "imu.bin"), "out": out, "seconds": len(rows) / hz}
 
 
-def run(sim, script, flash=8 * UNIT, mtu=244, fifo=128, unit=UNIT):
-    r = subprocess.run([sim["exe"], sim["imu"], str(flash), str(unit), str(mtu), str(fifo)],
+@pytest.fixture(scope="module")
+def sim(tmp_path_factory):
+    return _build(tmp_path_factory.mktemp("sched"), HZ, N_T, HOP)
+
+
+@pytest.fixture(scope="module")
+def sim31(tmp_path_factory):
+    """QMI8658 原生 31.25 Hz：窗口 64 点（2.048 s）、步长 32 点（1.024 s）"""
+    return _build(tmp_path_factory.mktemp("sched31"), 31.25, 64, 32)
+
+
+def run(sim, script, flash=8 * UNIT, mtu=244, fifo=128, unit=UNIT, imu_clock=1.0):
+    r = subprocess.run([sim["exe"], sim["imu"], str(flash), str(unit), str(mtu), str(fifo), str(imu_clock)],
                        input=script, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr
     lines = r.stdout.splitlines()
@@ -109,7 +118,7 @@ def test_package(sim):
 def test_runs_offline_then_uploads_everything_once(sim):
     """没连手机时一直在算、存 Flash；连上后全部补发，确认后 unacked 归零；不重不漏"""
     lines, segs, stats, cur = run(sim, "run 300\nstats\nack on\nconnect\nrun 60\nstats\n")
-    assert lines[0] == "IMU 16 8" and "INIT 0" in lines
+    assert lines[0] == "IMU 16000 8" and "INIT 0" in lines
     s0, s1 = stats
     assert s0["windows"] > 250 and s0["segments"] > 0 and s0["unacked"] == s0["segments"]
     seqs = [s[0] for s in segs]
@@ -205,3 +214,49 @@ def test_in_lib_download(sim, tmp_path):
                             str(tmp_path / "main.c"), str(lib), "-lm", "--specs=nosys.specs", "-Wl,--gc-sections",
                             "-o", str(tmp_path / f"{abi}.elf")], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
+
+
+@pytest.mark.parametrize("clock", [0.98, 1.02])
+def test_imu_clock_drift_no_false_gaps(sim, clock):
+    """IMU 实际 ODR 比标称慢 / 快 2%（芯片常见偏差）：跑 10 分钟不能被当成断档截断片段，
+    片段时间以 now_ms 为准，跟实际经过的时间对得上"""
+    _, segs, stats, _ = run(sim, "run 600\nstats\nack on\nconnect\nrun 1\n", imu_clock=clock)
+    assert stats[0]["gaps"] == 0
+    assert segs and all(0 <= s[1] <= 610 for s in segs)
+
+
+def test_31_25hz_native(sim31):
+    """31.25 Hz 模型：imu_config 收到 31250 毫赫兹；窗口 64 点 / 步长 32 点，10 分钟出 ~585 个窗口；
+    存片段、补发、确认照常；时间不漂（不报断档）"""
+    lines, segs, stats, _ = run(sim31, "run 600\nstats\nack on\nconnect\nrun 1\nstats\n", fifo=128)
+    assert lines[0] == "IMU 31250 8"
+    s0, s1 = stats
+    assert abs(s0["windows"] - (600 * 31.25 - 64) / 32) < 8
+    assert s0["gaps"] == 0 and s0["segments"] > 0 and s1["unacked"] == 0
+    assert "PB_SAMPLE_RATE_MHZ  31250u" in open(sim31["out"]["header"], encoding="utf-8").read()
+
+
+def test_31_25hz_lib_download(sim31, tmp_path):
+    """31.25 Hz 模型的「编译库」整包：PC 工具自检 / 跑示例数据 / --post 出片段都正常，窗口时间按 1.024 s 走"""
+    import csv
+    import zipfile
+
+    from footprint import measure, write_lib_bundle
+
+    gen = os.path.dirname(sim31["out"]["inc"]).replace("build", "gen")
+    meta = json.load(open(os.path.join(gen, "meta.json"), encoding="utf-8"))
+    z = str(tmp_path / "lib.zip")
+    write_lib_bundle(gen, "rf", z, meta, measure(gen, "rf", 64, N_CH, len(CLASSES), {}), window=64, n_classes=len(CLASSES))
+    d = tmp_path / "x"
+    zipfile.ZipFile(z).extractall(d)
+    os.chmod(d / "pc" / "edge_cli", 0o755)
+    r = subprocess.run(["./pc/edge_cli", "--selftest"], cwd=d, capture_output=True, text=True)
+    assert r.returncode == 0 and "通过" in r.stdout, r.stdout + r.stderr
+    r = subprocess.run(["./pc/edge_cli", "pc/sample.csv", "--post", "seg.csv"], cwd=d, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "@31.25 Hz" in r.stderr
+    win = list(csv.DictReader(r.stdout.splitlines()))
+    assert float(win[1]["start_s"]) == 1.024 and float(win[0]["end_s"]) == 2.048
+    assert list(csv.DictReader(open(d / "seg.csv", encoding="utf-8")))
+    readme = (d / "sched" / "README.md").read_text(encoding="utf-8")
+    assert "imu_config(31250, 8)" in readme
