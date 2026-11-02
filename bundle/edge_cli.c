@@ -340,11 +340,13 @@ static long gcd_l(long a, long b)
     return a;
 }
 
-static void resample_series(series_t *s, int in_hz, int model_hz)
+/* 采样率可以是小数（QMI8658 原生 31.25 Hz）：按毫赫兹化成整数再约分，50→31.25 = 5:8 */
+static void resample_series(series_t *s, double in_hz, double model_hz)
 {
-    if (in_hz == model_hz || s->n == 0) return;
-    const long g = gcd_l(in_hz, model_hz);
-    const int up = (int)(model_hz / g), down = (int)(in_hz / g);
+    const long a = lround(in_hz * 1000.0), b = lround(model_hz * 1000.0);
+    if (a == b || s->n == 0) return;
+    const long g = gcd_l(a, b);
+    const int up = (int)(b / g), down = (int)(a / g);
     float *vf = malloc(sizeof(float) * s->n);
     for (long i = 0; i < s->n; i++) vf[i] = s->valid[i] ? 1.0f : 0.0f;
     long m;
@@ -379,11 +381,11 @@ static void usage(const char *argv0)
     printf("用法：\n"
            "  %s --selftest\n"
            "  %s [选项] input.csv        （input 用 - 表示 stdin）\n\n"
-           "模型：%d 类，%d 通道 × %d 点 @ %d Hz，步长 %d 点\n"
+           "模型：%d 类，%d 通道 × %d 点 @ %g Hz，步长 %d 点\n"
            "CSV：表头里要有 acc_x,acc_y,acc_z%s（AccX/ax 这类写法也认），其它列忽略；\n"
            "     没表头就按 ax,ay,az%s 的列序读。空格 / NaN 当缺失（前向填充，缺失 > 30%% 的窗口跳过）。\n\n"
            "选项：\n"
-           "  --in-hz N        CSV 的采样率（如 50），默认 = 模型的 %d Hz；按平台同一套方法重采样\n"
+           "  --in-hz N        CSV 的采样率（如 50，可以是小数 31.25），默认 = 模型的 %g Hz；按平台同一套方法重采样\n"
            "                   （整数倍隔点抽，其它比例用 resample_poly 那套 FIR，跟平台逐窗口对得上）\n"
            "  --acc-scale F    加速度乘 F 换成 g。int16 原始计数用 量程/32768，例如 ±16g → 0.00048828125\n"
            "  --gyr-scale F    角速度乘 F 换成 °/s，例如 ±2000dps → 0.06103515625\n"
@@ -393,14 +395,15 @@ static void usage(const char *argv0)
            "                   segment,start_s,end_s,dur_s,class_id,class,conf_mean,conf_max,n_windows\n"
            "                   这就是调度库发给 App 的片段（0x09）；缺失跳过的窗口处当断档，前后各自收尾\n\n"
            "输出 CSV：window,start_s,end_s,class_id,class,conf,<每类置信度…>；汇总打到 stderr。\n",
-           argv0, argv0, N_CLASSES, N_CH, N_T, TM_EDGE_HZ, TM_EDGE_HOP,
-           N_SENSOR == 6 ? ",gyro_x,gyro_y,gyro_z" : "", N_SENSOR == 6 ? ",gx,gy,gz" : "", TM_EDGE_HZ,
+           argv0, argv0, N_CLASSES, N_CH, N_T, (double)TM_EDGE_HZ, TM_EDGE_HOP,
+           N_SENSOR == 6 ? ",gyro_x,gyro_y,gyro_z" : "", N_SENSOR == 6 ? ",gx,gy,gz" : "", (double)TM_EDGE_HZ,
            TM_EDGE_HOP);
 }
 
 int main(int argc, char **argv)
 {
-    int in_hz = TM_EDGE_HZ, hop = TM_EDGE_HOP;
+    double in_hz = TM_EDGE_HZ;
+    int hop = TM_EDGE_HOP;
     float acc_scale = 1.0f, gyr_scale = 1.0f;
     const char *path = NULL, *out_path = NULL, *post_path = NULL;
     for (int i = 1; i < argc; i++) {
@@ -410,7 +413,7 @@ int main(int argc, char **argv)
             usage(argv[0]);
             return 0;
         }
-        if (i + 1 < argc && !strcmp(a, "--in-hz")) in_hz = atoi(argv[++i]);
+        if (i + 1 < argc && !strcmp(a, "--in-hz")) in_hz = atof(argv[++i]);
         else if (i + 1 < argc && !strcmp(a, "--acc-scale")) acc_scale = strtof(argv[++i], NULL);
         else if (i + 1 < argc && !strcmp(a, "--gyr-scale")) gyr_scale = strtof(argv[++i], NULL);
         else if (i + 1 < argc && !strcmp(a, "--hop")) hop = atoi(argv[++i]);
@@ -432,7 +435,7 @@ int main(int argc, char **argv)
 
     series_t s;
     if (read_csv(path, acc_scale, gyr_scale, &s) != 0) return 1;
-    resample_series(&s, in_hz, TM_EDGE_HZ);
+    resample_series(&s, in_hz, (double)TM_EDGE_HZ);
     /* 量纲自检：重力是 1g。原始计数没换算的话这里是几千 */
     if (s.n > 0) {
         double g = 0.0;
@@ -510,7 +513,7 @@ int main(int argc, char **argv)
         fprintf(fo, "\n");
         n_win++;
         if (fp) {
-            const int k = tm_post_on_window(&post, score, (uint32_t)((uint64_t)st * 1000u / TM_EDGE_HZ), segs,
+            const int k = tm_post_on_window(&post, score, (uint32_t)((double)st * 1000.0 / TM_EDGE_HZ + 0.5), segs,
                                             TM_POST_DELAY + 8);
             if (k < 0) {
                 fprintf(stderr, "后处理配置不合法（延迟线不够长）\n");
@@ -527,7 +530,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "行为片段 %ld 段 → %s\n", n_seg, post_path);
     }
 
-    fprintf(stderr, "样本 %ld 个（@%d Hz，%.1f s），窗口 %ld 个，因缺失跳过 %ld 个\n", s.n, TM_EDGE_HZ,
+    fprintf(stderr, "样本 %ld 个（@%g Hz，%.1f s），窗口 %ld 个，因缺失跳过 %ld 个\n", s.n, (double)TM_EDGE_HZ,
             (double)s.n / TM_EDGE_HZ, n_win, n_skip);
     for (int c = 0; c < N_CLASSES; c++)
         fprintf(stderr, "  %-8s %6ld  %5.1f%%\n", CLASS_NAMES[c], count[c], n_win ? 100.0 * count[c] / n_win : 0.0);

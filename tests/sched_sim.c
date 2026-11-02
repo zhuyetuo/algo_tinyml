@@ -30,7 +30,9 @@ static int synced;
 static uint8_t mem[PB_WORK_SIZE] __attribute__((aligned(8)));
 static uint32_t pending_ack;
 
-static long due(void) { return (long)((uint64_t)now * PB_HZ / 1000u); }
+/* IMU 实际出数的速度：标称 PB_HZ × imu_clock（模拟芯片 ODR 偏差，如 0.99 = 慢 1%） */
+static double imu_clock = 1.0;
+static long due(void) { return (long)((double)now * PB_HZ * imu_clock / 1000.0); }
 
 static void fill_fifo(void)
 {
@@ -40,7 +42,7 @@ static void fill_fifo(void)
     if (imu_pos - fifo_head > fifo_cap) fifo_head = imu_pos - fifo_cap;   /* 溢出：丢最旧的 */
 }
 
-static int h_imu_config(uint16_t hz, uint8_t g) { printf("IMU %u %u\n", hz, g); return 0; }
+static int h_imu_config(uint32_t mhz, uint8_t g) { printf("IMU %u %u\n", (unsigned)mhz, g); return 0; }
 static uint16_t h_imu_read(pb_sample_t *buf, uint16_t max)
 {
     fill_fifo();
@@ -143,6 +145,7 @@ int main(int argc, char **argv)
     erase_unit = (uint32_t)atol(argv[3]);
     mtu = (uint16_t)atoi(argv[4]);
     fifo_cap = atol(argv[5]);
+    if (argc > 6) imu_clock = atof(argv[6]);
     flash = malloc(flash_size);
     memset(flash, 0xFF, flash_size);
     if (do_init() != 0) return 1;

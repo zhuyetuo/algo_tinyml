@@ -60,7 +60,7 @@ def rf_curve(model_pkl: str, processed_dir: str, remap: str | None, imu_train: s
     with open(meta_json, encoding="utf-8") as f:
         meta = json.load(f)
     classes = list(meta["classes"])
-    window, hz = int(meta["window_size"]), int(meta["hz"])
+    window, hz = int(meta["window_size"]), float(meta["hz"])
     n_ch = int(meta.get("n_channels") or 8)
     nps = 1
     while nps * 2 <= min(window, 32):

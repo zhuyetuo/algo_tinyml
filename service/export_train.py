@@ -50,6 +50,9 @@ GEN_ROOT = os.path.join(ROOT, "core", "models")
 # ── 纯函数（不依赖 sklearn，测试能覆盖） ──────────────────────────────────
 
 
+from footprint import as_hz  # noqa: E402
+
+
 def nperseg_for(window: int) -> int:
     """Welch 段长：不超过窗口、不超过 32 的最大 2 的幂。
     板上现役的 16 点窗口用 16，32 点用 32——跟以前手填的一致。"""
@@ -197,7 +200,7 @@ def export_cnn(model_pt: str, tag: str, processed_dir: str, remap: str | None,
     model_pt = os.path.abspath(os.path.expanduser(model_pt))
     net, meta = load_cnn(model_pt)
     classes = list(meta["classes"])
-    window, hz, n_ch = int(meta["window_size"]), int(meta["hz"]), int(meta["n_channels"])
+    window, hz, n_ch = int(meta["window_size"]), as_hz(meta["hz"]), int(meta["n_channels"])
     stem = model_pt.replace("_best.pt", "")
     metrics = {}
     if os.path.exists(f"{stem}.json"):
@@ -318,7 +321,7 @@ def export(model_pkl: str, tag: str, processed_dir: str, remap: str | None,
         meta = json.load(f)
     classes = list(meta["classes"])
     window = int(meta["window_size"])
-    hz = int(meta["hz"])
+    hz = as_hz(meta["hz"])
     n_ch = int(meta.get("n_channels") or 8)
     nps = nperseg_for(window)
 

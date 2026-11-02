@@ -172,7 +172,7 @@ class EdgeRunner:
         self.is_dl = (kind != "sk")
         self.classes = list(meta["classes"])
         self.window_size = int(meta["window_size"])
-        self.model_hz = int(meta["hz"])
+        self.model_hz = float(meta["hz"]) if not float(meta["hz"]).is_integer() else int(meta["hz"])
         self.stride = int(meta.get("stride") or max(self.window_size // 2, 1))
         self.gravity_aligned = bool(meta.get("gravity_aligned", True))
         # 输入通道：tilt（重力对齐 + 姿态角）/ inv（方向无关）。照训练时的来，老模型没有就是 tilt

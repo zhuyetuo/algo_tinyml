@@ -50,6 +50,12 @@ TABLE_FILES = {"rf": ["tm_feat_cfg.c"], "cnn": []}
 GOLDEN_HEADERS = {"rf": ["tm_forest_c_golden.h", "tm_forest_c_pipeline_golden.h"], "cnn": ["tm_golden.h"]}
 
 
+def as_hz(v):
+    """采样率可以是小数（QMI8658 原生 31.25 / 15.625 Hz）；整数还是 int（目录名 16hz 不变）"""
+    x = float(v)
+    return int(x) if x.is_integer() else x
+
+
 def imu_defines(gen_dir: str) -> dict:
     """这一版模型的输入映射要哪套：训练时 channel_mode=inv（方向无关）的，tm_imu.c 要带
     -DTM_IMU_INVARIANT=1 编。读导出目录的 meta.json；老模型没有这一项，就是原来那套。"""
@@ -1003,7 +1009,8 @@ def build_sched(gen_dir: str, kind: str, meta: dict, out_dir: str) -> dict:
 
     def header(work):
         h = open(os.path.join(SCHED_SRC, "pet_behavior.h"), encoding="utf-8").read()
-        return h.replace("@WORK_SIZE@", str(work)).replace("@HEADER_VERSION@", f"0x{hver:08X}")
+        return (h.replace("@WORK_SIZE@", str(work)).replace("@HEADER_VERSION@", f"0x{hver:08X}")
+                .replace("@RATE_MHZ@", str(int(round(float(hz) * 1000)))))
 
     inc = os.path.join(out_dir, "inc")
     os.makedirs(inc, exist_ok=True)
@@ -1118,8 +1125,12 @@ pb_on_event(PB_EVT_WAKEUP, NULL, 0);       /* 事件发生时，在任务 / 主�
 
 ## 2. 库的行为
 
-- 开机 `imu_config({info['hz']}, 8)`：只开加速度计，{info['hz']} Hz、±8 g。
-- 每 5 秒唤醒一次读 FIFO（FIFO 至少要装得下 5 秒 = {info['hz'] * 5} 个样本），逐窗口识别，合成行为片段写 Flash。
+- 开机 `imu_config({int(round(float(info['hz']) * 1000))}, 8)`：只开加速度计，{info['hz']} Hz（采样率单位是毫赫兹）、±8 g。
+  QMI8658 的 31.25 Hz 是原生档位，直接配，不要软件抽样。
+- 读 FIFO：收到 `PB_EVT_IMU_FIFO`（水位中断，推荐）或每 5 秒的定时唤醒时把 FIFO 读空；`imu_read` 每次返回几个都行，库会读到空为止。
+  FIFO 在 {info['hz']} Hz 下装满约 {128 / float(info['hz']):.1f} 秒（按 128 个样本算），水位设成 80 个左右即可。
+- 片段时间以 `now_ms`（RTC）为准：每次读完 FIFO 用 now_ms 校准，IMU 时钟有 ±1~2% 偏差也不会漂；读 FIFO 间隔超过 3 秒、数据丢了记一次断档。
+- 逐窗口识别，合成行为片段写 Flash。
 - 连着手机时：每个窗口推一条当前行为（0x07），新片段和没确认的片段随时补发（0x09）；App 回确认（0x0A）后才可覆盖。
 - 断开、断电都不丢：重连 / 重启后从没确认的接着发。Flash 写满时覆盖最旧的，丢失数见 `pb_get_stats()`。
 - FIFO 溢出（取数中断超过 3 秒）记一次断档，前后两段各自收尾。
@@ -1308,7 +1319,7 @@ def bundle_geometry(gen_dir: str, kind: str) -> dict:
         "n_ch": n_ch or int(meta.get("n_channels") or 8),
         "n_t": n_t,
         "n_classes": n_cls or len(meta.get("classes") or []) or 2,
-        "hz": int(meta.get("hz") or 16),
+        "hz": as_hz(meta.get("hz") or 16),
         "hop": int(meta.get("stride") or max(n_t // 2, 1)),
     }
 
@@ -1322,7 +1333,7 @@ def _edge_cfg_h(geo: dict) -> str:
             "#endif\n")
 
 
-def sample_csv(hz: int, n_sensor: int, seconds: int = 60, seed: int = 0) -> str:
+def sample_csv(hz: float, n_sensor: int, seconds: int = 60, seed: int = 0) -> str:
     """合成的示例 CSV（g / °/s）：静止趴着 → 走动 → 高频抖动。**不是真数据**，只用来验证能跑通。"""
     import math
     import random
@@ -1330,7 +1341,7 @@ def sample_csv(hz: int, n_sensor: int, seconds: int = 60, seed: int = 0) -> str:
     rnd = random.Random(seed)
     cols = ["timestamp", "acc_x", "acc_y", "acc_z"] + (["gyro_x", "gyro_y", "gyro_z"] if n_sensor == 6 else [])
     rows = [",".join(cols)]
-    n = seconds * hz
+    n = int(round(seconds * hz))
     for i in range(n):
         t = i / hz
         phase = 3 * i // n
@@ -1433,7 +1444,7 @@ def bundle_readme(kind: str, meta: dict, fp: dict) -> str:
     n_ch = int(meta.get("n_channels") or 8)
     n_sensor = n_ch - 2
     n_t = int(meta.get("window_size") or 16)
-    hz = int(meta.get("hz") or 16)
+    hz = as_hz(meta.get("hz") or 16)
     hop = int(meta.get("stride") or max(n_t // 2, 1))
     six = n_sensor == 6
     api = (

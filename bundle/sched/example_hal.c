@@ -3,10 +3,11 @@
 #include "pet_behavior.h"
 
 /* ── 硬件接口 ─────────────────────────────────────────────────────────── */
-static int my_imu_config(uint16_t rate_hz, uint8_t range_g)
+static int my_imu_config(uint32_t rate_mhz, uint8_t range_g)
 {
-    /* 只开加速度计：ODR = rate_hz，量程 ±range_g，开 FIFO（建议水位 ≥ 5 秒的数据）；成功返回 0 */
-    (void)rate_hz; (void)range_g;
+    /* 只开加速度计：ODR = rate_mhz / 1000 Hz（31250 → QMI8658 的 31.25 Hz 档），量程 ±range_g，
+     * 开 FIFO + 水位中断（水位如 80 个样本 ≈ 2.5 秒，INT 接可唤醒的 GPIO，触发 PB_EVT_IMU_FIFO）；成功返回 0 */
+    (void)rate_mhz; (void)range_g;
     return 0;
 }
 

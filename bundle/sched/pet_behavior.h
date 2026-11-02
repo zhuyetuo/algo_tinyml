@@ -15,6 +15,7 @@ extern "C" {
 
 #define PB_HEADER_VERSION   @HEADER_VERSION@u   /* 头文件与库须同一版本，否则 pb_init 返回 PB_ERR_VERSION */
 #define PB_WORK_SIZE        @WORK_SIZE@u        /* 库的工作内存（字节），4 字节对齐 */
+#define PB_SAMPLE_RATE_MHZ  @RATE_MHZ@u         /* 这一版模型的采样率（毫赫兹）：31250 = 31.25 Hz，imu_config 会传这个值 */
 
 /* 错误码 */
 #define PB_ERR_PARAM        (-1)   /* 参数错误（hal 缺函数、内存不够、Flash 区域不合规） */
@@ -36,8 +37,9 @@ typedef struct {
 } pb_sample_t;
 
 typedef struct {
-    /* IMU：只开加速度计，按 rate_hz / range_g 配置并启动 FIFO，成功返回 0 */
-    int      (*imu_config)(uint16_t rate_hz, uint8_t range_g);
+    /* IMU：只开加速度计，按 rate_mhz（毫赫兹，31250 = 31.25 Hz）/ range_g 配置并启动 FIFO，成功返回 0。
+     * 采样率用毫赫兹是因为 QMI8658 这类芯片的原生档位是小数（31.25 / 62.5 Hz） */
+    int      (*imu_config)(uint32_t rate_mhz, uint8_t range_g);
     /* 从 FIFO 读出最多 max 个样本（按采样先后），返回实际个数；FIFO 空返回 0 */
     uint16_t (*imu_read)(pb_sample_t *buf, uint16_t max);
 
