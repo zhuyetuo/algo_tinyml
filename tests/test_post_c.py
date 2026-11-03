@@ -145,6 +145,8 @@ def py_stabilize(probs, ts_ms, **kw):
     ls_config, ls_post = _load_postprocess()
     windows, t0 = _windows(probs, ts_ms)
     params = ls_post.StableParams(
+        # 「短未佩戴并回静止」只在服务端做，板上 tm_post 还没有——对拍时关掉，比的是其余规则
+        **({"notworn_min_s": 0.0} if "notworn_min_s" in ls_post.StableParams.__dataclass_fields__ else {}),
         event_labels=(CLASSES[SCRATCH], CLASSES[SHAKE]),
         event_gap_s=kw.get("gap_s", 4.0),
         shake_absorb_s=kw.get("absorb_s", 3.0),
