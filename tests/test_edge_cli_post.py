@@ -71,7 +71,9 @@ def test_matches_server_stable_v2(run):
     windows = [{"ts": (t0 + dt.timedelta(seconds=float(w["start_s"]))).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
                 "probs": {c: float(w[f"p_{c}"]) for c in classes}, "label": w["class"], "spec": None} for w in win]
     _, post = _load_postprocess()
-    params = post.StableParams(event_labels=("抓挠", "甩身体"), spectral_min=0.0)
+    params = post.StableParams(event_labels=("抓挠", "甩身体"), spectral_min=0.0,
+                               # 短未佩戴并回静止只在服务端做，板上还没有：对拍时关掉
+                               **({"notworn_min_s": 0.0} if "notworn_min_s" in post.StableParams.__dataclass_fields__ else {}))
     srv = post.stabilize(windows, classes, classes, 1.0, 0.5, "majority", params, algo="viterbi")
     want = sorted((round(_secs(s["start_ts"], t0), 3), round(_secs(s["end_ts"], t0), 3), lab)
                   for lab, ss in srv.items() for s in ss)
