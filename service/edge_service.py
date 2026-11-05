@@ -42,6 +42,7 @@
 
 import argparse
 import contextlib
+import csv
 import glob
 import io
 import json
@@ -431,6 +432,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(self.reload())
         if u.path == "/api/v1/label/infer":
             return self._send(self._one(body))
+        if u.path == "/api/v1/label/infer_samples":
+            return self._send(self._samples(body))
         if u.path == "/api/v1/label/infer_batch":
             items = body.get("items") or []
             out = []
@@ -452,14 +455,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(out)
         self._send({"error": "no such path"}, 404)
 
-    def _one(self, body, raise_on_error=False):
+    def _one(self, body, raise_on_error=False, resolved=False, keep_windows=False):
         try:
             mode = str(body.get("mode") or "raw")
             if mode not in ("raw", "stable", "viterbi", "board"):
                 raise ValueError(
                     f"mode 只支持 raw / stable / viterbi / board，给的是 {mode}")
             r = self._runner(body.get("model"))
-            path = self._resolve(str(body["path"]))
+            # resolved：自己写的临时文件（infer_samples），不是平台给的 NAS 相对路径
+            path = str(body["path"]) if resolved else self._resolve(str(body["path"]))
             device_hz = _as_hz(body.get("device_hz") or r.model_hz)
             # **默认所有类别**。原来写死 ["抓挠"]，于是平台上只出抓挠的片段，
             # 活动/睡觉/未佩戴/甩身体一个都没有——而那几类占了绝大多数窗口。
@@ -468,8 +472,9 @@ class Handler(BaseHTTPRequestHandler):
                           int(body.get("min_windows") or 1),
                           int(body.get("max_gap") or 2),
                           list(targets), mode=mode)
-            # windows 是给后处理用的中间量，几千条，没必要回给平台
-            res.pop("windows", None)
+            # windows 是给后处理用的中间量，几千条，没必要回给平台（设备调试要逐窗口画，留着）
+            if not keep_windows:
+                res.pop("windows", None)
             if mode == "board":
                 # 这两个计数是"板上这份跟离线算法可能分家"的**唯一**依据，
                 # 回给平台，别让它只存在于本机日志里
@@ -488,6 +493,70 @@ class Handler(BaseHTTPRequestHandler):
                 raise
             traceback.print_exc()
             return {"error": f"{type(e).__name__}: {e}"}
+
+
+    def _samples(self, body):
+        """一段原始采样直接跑（平台「设备调试」页：浏览器直连项圈收到的数据）。
+
+        跟 label_service 的 /api/v1/label/infer_samples 同一个契约：写成采集 CSV 同样的列，
+        走同一条推理链，每个窗口、片段多带 *_ms（Unix 毫秒），前端拿去跟板子的 0x07/0x09 对齐。
+        这样同一段数据能同时看三个：服务器模型、服务器上跑的端侧 C、板子自己报的。
+        """
+        try:
+            t_ms, acc, gyro = body.get("t_ms") or [], body.get("acc") or [], body.get("gyro")
+            if len(t_ms) < 2 or len(acc) != len(t_ms) or (gyro is not None and len(gyro) != len(t_ms)):
+                raise ValueError("t_ms / acc / gyro 长度不对（至少 2 个，三者一样长）")
+            if len(t_ms) > 60_000:
+                raise ValueError("一次最多 60000 个样本")
+            path = write_samples_csv(t_ms, acc, gyro)
+            try:
+                res = self._one({**body, "path": path, "device_hz": body.get("hz")},
+                                raise_on_error=True, resolved=True, keep_windows=True)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+            for w in res.get("windows") or []:
+                w["ts_ms"] = utc_str_to_ms(w.get("ts"))
+            for segs in (res.get("segments") or {}).values():
+                for sg in segs:
+                    sg["start_ms"] = utc_str_to_ms(sg.get("start_ts"))
+                    sg["end_ms"] = utc_str_to_ms(sg.get("end_ts"))
+            r = self._runner(body.get("model"))
+            res.update({"classes": r.classes, "hz_model": r.model_hz,
+                        "window_s": r.window_size / float(r.model_hz),
+                        "stride_s": r.stride / float(r.model_hz),
+                        "n_windows": len(res.get("windows") or [])})
+            return res
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            return {"error": f"{type(e).__name__}: {e}"}
+
+
+def write_samples_csv(t_ms, acc, gyro=None):
+    """写成采集 CSV 的列。时间戳写 UTC 墙上时间、回来按 UTC 换回毫秒——不经过本地时区"""
+    from datetime import datetime, timezone
+    fd, path = tempfile.mkstemp(prefix="devdebug_", suffix=".csv")
+    with os.fdopen(fd, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["timestamp", "acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"])
+        for i, t in enumerate(t_ms):
+            ts = datetime.fromtimestamp(t / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            a = acc[i]
+            g = gyro[i] if gyro is not None else (0.0, 0.0, 0.0)
+            w.writerow([ts, a[0], a[1], a[2], g[0], g[1], g[2]])
+    return path
+
+
+def utc_str_to_ms(s):
+    if not s:
+        return None
+    from datetime import datetime, timezone
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return int(datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp() * 1000)
+        except ValueError:
+            continue
+    return None
 
 
 def _pick_one(pattern, what):

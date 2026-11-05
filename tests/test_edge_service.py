@@ -1447,3 +1447,42 @@ def test_board_build_keeps_the_fp_flags():
     src = inspect.getsource(post_board._build)
     assert "-ffp-contract=off" in src, "编译开关丢了，跟板上不再逐位一致"
     assert "-fno-math-errno" in src
+
+
+# ── 设备调试：原始采样直接跑（不经过 NAS 上的 CSV）──────────────────────────
+
+
+def _handler(runner, tmp_path):
+    import edge_service
+    h = edge_service.Handler.__new__(edge_service.Handler)
+    h.runners = {"edge_cnn_i8": runner}
+    h.default_tag = "edge_cnn_i8"
+    h.nas_root = str(tmp_path)
+    return h
+
+
+def test_infer_samples_returns_windows_with_unix_ms(runner, tmp_path):
+    """平台拿 ts_ms 跟板子的 0x07 对齐：窗口时间要落回送进来的那段时间里，不能被时区挪几小时"""
+    h = _handler(runner, tmp_path)
+    rng = np.random.default_rng(3)
+    t0 = 1_793_000_000_000
+    n = HZ * 60
+    t_ms = [t0 + int(i * 1000 / HZ) for i in range(n)]
+    acc = (rng.normal(0, 0.2, (n, 3)) + [0, 0, 1]).tolist()
+    gyro = rng.normal(0, 5, (n, 3)).tolist()
+    r = h._samples({"t_ms": t_ms, "acc": acc, "gyro": gyro, "hz": HZ, "mode": "raw"})
+    assert "error" not in r, r
+    assert r["n_windows"] > 50 and len(r["windows"]) == r["n_windows"]
+    ts = [w["ts_ms"] for w in r["windows"]]
+    assert ts[0] >= t0 and ts[-1] <= t_ms[-1]
+    assert all(b > a for a, b in zip(ts, ts[1:]))
+    assert r["window_s"] == pytest.approx(N_T / HZ) and r["classes"] == CLASSES
+    for segs in r["segments"].values():
+        for sg in segs:
+            assert t0 <= sg["start_ms"] <= sg["end_ms"] <= t_ms[-1] + 1000
+
+
+def test_infer_samples_rejects_mismatched_lengths(runner, tmp_path):
+    h = _handler(runner, tmp_path)
+    r = h._samples({"t_ms": [1, 2, 3], "acc": [[0, 0, 1]] * 2, "hz": HZ})
+    assert "长度" in r["error"]
