@@ -145,6 +145,88 @@ def _mtime(p):
         return None
 
 
+class _Capture:
+    """包一层模型，把 infer_file 喂进来的窗口（已经重力对齐 / 映射好通道的）记下来，给诊断用"""
+
+    def __init__(self, model, sink):
+        self.model, self.sink = model, sink
+        self.is_dl = getattr(model, "is_dl", True)
+
+    def predict_proba(self, X):
+        self.sink.append(np.asarray(X, np.float32).copy())
+        return self.model.predict_proba(X)
+
+
+_SK_CACHE = {}
+
+
+def diagnose_rf(runner, X, edge_proba=None):
+    """端侧（服务器上跑的 C）跟服务端 sklearn 对不上时，查是**特征**还是**森林**的问题。
+
+    同一批窗口：
+      edge      = C 算特征 + C 的森林（就是端侧那一行）
+      sk(py)    = imu_train 的 Python 特征 + sklearn 森林（服务端那一行）
+      sk(C特征) = C 算的特征 + sklearn 森林
+    sk(C特征) ≈ edge 而 ≠ sk(py)  → 两边**特征算得不一样**，列出差得最多的几维
+    sk(C特征) ≈ sk(py) 而 ≠ edge  → 特征没问题，**森林移植 / 压缩**有问题
+    """
+    import joblib
+    from features import extract_features
+    try:
+        from features import feature_names
+    except ImportError:  # noqa: BLE001
+        feature_names = None
+    X = np.asarray(X, np.float32)
+    n = len(X)
+    if n == 0:
+        return {"n": 0}
+    mp = (runner.train or {}).get("model_path")
+    if not mp or not os.path.isfile(mp):
+        return {"n": n, "error": f"找不到这个端侧模型对应的 sklearn 模型（{mp}），没法对照"}
+    sk = _SK_CACHE.get(mp)
+    if sk is None:
+        sk = _SK_CACHE[mp] = joblib.load(mp)
+    with contextlib.redirect_stdout(io.StringIO()):
+        f_py = np.asarray(extract_features(X, runner.model_hz, show_progress=False), np.float64)
+    f_c = np.stack([runner.engine.features(np.ascontiguousarray(x.T)) for x in X]).astype(np.float64)
+    if f_c.shape != f_py.shape:
+        return {"n": n, "error": f"特征维度不一样：C {f_c.shape[1]}，Python {f_py.shape[1]}"}
+    if edge_proba is None:
+        _, edge_proba = runner.engine.infer(np.ascontiguousarray(X.transpose(0, 2, 1)))
+    cls = list(runner.classes)
+    sk_cls = [str(c) for c in getattr(sk, "classes_", range(len(cls)))]
+    # sklearn 的 classes_ 可能是下标也可能是名字：统一成名字
+    to_name = (lambda i: cls[int(sk_cls[i])]) if all(c.isdigit() for c in sk_cls) else (lambda i: sk_cls[i])
+    p_py = [to_name(i) for i in np.argmax(sk.predict_proba(f_py), 1)]
+    p_c = [to_name(i) for i in np.argmax(sk.predict_proba(f_c), 1)]
+    p_edge = [cls[i] for i in np.argmax(np.asarray(edge_proba), 1)]
+    agree = lambda a, b: round(float(np.mean([x == y for x, y in zip(a, b)])), 4)  # noqa: E731
+    # 每一维差多少：按 Python 那边这批窗口的离散程度归一（一维本来就几乎不变的话，用它自己的量级）
+    sd = f_py.std(0)
+    scale = np.where(sd > 1e-9, sd, np.maximum(np.abs(f_py).mean(0), 1e-9))
+    z = np.abs(f_c - f_py).mean(0) / scale
+    names = None
+    if feature_names:
+        try:
+            names = list(feature_names(int(runner.n_channels)))
+        except Exception:  # noqa: BLE001
+            names = None
+    order = np.argsort(-z)[:10]
+    top = [{"idx": int(i), "name": (names[i] if names and i < len(names) else f"#{i}"),
+            "c": round(float(f_c[:, i].mean()), 5), "py": round(float(f_py[:, i].mean()), 5),
+            "z": round(float(z[i]), 3)} for i in order]
+    a_ce, a_cp, a_pe = agree(p_c, p_edge), agree(p_c, p_py), agree(p_py, p_edge)
+    if a_pe >= 0.95:
+        verdict = "端侧跟服务端基本一致"
+    elif a_ce >= a_cp + 0.1:
+        verdict = "特征：C 算的特征跟训练用的 Python 特征不一样（见差得最多的几维），森林本身没问题"
+    elif a_cp >= a_ce + 0.1:
+        verdict = "森林：特征对得上，是森林导出成 C（压缩 / 量化）之后判得不一样"
+    else:
+        verdict = "特征和森林都有差异，看下面几维"
+    return {"n": n, "edge_vs_sk": a_pe, "skC_vs_edge": a_ce, "skC_vs_sk": a_cp, "verdict": verdict, "top": top}
+
+
 class EdgeRunner:
     """一个端侧模型 + 一套推理参数。"""
 
@@ -194,7 +276,7 @@ class EdgeRunner:
         self.lock = threading.Lock()
 
     def infer(self, csv_path, device_hz, min_windows, max_gap, targets,
-              mode="raw"):
+              mode="raw", capture=None):
         from infer_csv_scratch import infer_file, load_csv
 
         # missing_seconds 要自己算：infer_file 不返回它，但平台要这个字段
@@ -212,8 +294,9 @@ class EdgeRunner:
             noise = io.StringIO()
             try:
                 with contextlib.redirect_stdout(noise):
+                    model = self.model if capture is None else _Capture(self.model, capture)
                     res = infer_file(
-                        csv_path, self.model, self.classes,
+                        csv_path, model, self.classes,
                         window_size=self.window_size, stride=self.stride,
                         device_hz=device_hz, model_hz=self.model_hz,
                         gravity_aligned=self.gravity_aligned,
@@ -455,7 +538,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(out)
         self._send({"error": "no such path"}, 404)
 
-    def _one(self, body, raise_on_error=False, resolved=False, keep_windows=False):
+    def _one(self, body, raise_on_error=False, resolved=False, keep_windows=False, capture=None):
         try:
             mode = str(body.get("mode") or "raw")
             if mode not in ("raw", "stable", "viterbi", "board"):
@@ -464,14 +547,17 @@ class Handler(BaseHTTPRequestHandler):
             r = self._runner(body.get("model"))
             # resolved：自己写的临时文件（infer_samples），不是平台给的 NAS 相对路径
             path = str(body["path"]) if resolved else self._resolve(str(body["path"]))
-            device_hz = _as_hz(body.get("device_hz") or r.model_hz)
+            raw_hz = float(body.get("device_hz") or r.model_hz)
+            # 跟模型采样率差不到 2%（31.25 的设备 vs 31.25 的模型）就按模型的来、不重采样——板子和服务端都不重采样。
+            # 以前一律取整：31.25 → 31，再从 31 重采样到 31.25，平白多一道滤波
+            device_hz = r.model_hz if abs(raw_hz / float(r.model_hz) - 1) < 0.02 else _as_hz(raw_hz)
             # **默认所有类别**。原来写死 ["抓挠"]，于是平台上只出抓挠的片段，
             # 活动/睡觉/未佩戴/甩身体一个都没有——而那几类占了绝大多数窗口。
             targets = body.get("labels") or list(r.classes)
             res = r.infer(path, device_hz,
                           int(body.get("min_windows") or 1),
                           int(body.get("max_gap") or 2),
-                          list(targets), mode=mode)
+                          list(targets), mode=mode, capture=capture)
             # windows 是给后处理用的中间量，几千条，没必要回给平台（设备调试要逐窗口画，留着）
             if not keep_windows:
                 res.pop("windows", None)
@@ -509,9 +595,11 @@ class Handler(BaseHTTPRequestHandler):
             if len(t_ms) > 60_000:
                 raise ValueError("一次最多 60000 个样本")
             path = write_samples_csv(t_ms, acc, gyro)
+            r = self._runner(body.get("model"))
+            cap = [] if body.get("diagnose") and r.kind == "rf" else None
             try:
                 res = self._one({**body, "path": path, "device_hz": body.get("hz")},
-                                raise_on_error=True, resolved=True, keep_windows=True)
+                                raise_on_error=True, resolved=True, keep_windows=True, capture=cap)
             finally:
                 with contextlib.suppress(OSError):
                     os.remove(path)
@@ -521,7 +609,14 @@ class Handler(BaseHTTPRequestHandler):
                 for sg in segs:
                     sg["start_ms"] = utc_str_to_ms(sg.get("start_ts"))
                     sg["end_ms"] = utc_str_to_ms(sg.get("end_ts"))
-            r = self._runner(body.get("model"))
+            if cap is not None:
+                try:
+                    res["diagnose"] = diagnose_rf(r, np.concatenate(cap) if cap else np.empty((0, r.window_size, r.n_channels)))
+                except Exception as e:  # noqa: BLE001  诊断失败不影响结果本身
+                    traceback.print_exc()
+                    res["diagnose"] = {"error": f"{type(e).__name__}: {e}"}
+            elif body.get("diagnose"):
+                res["diagnose"] = {"error": f"这个端侧模型是 {r.kind}，诊断目前只支持 rf"}
             res.update({"classes": r.classes, "hz_model": r.model_hz,
                         "window_s": r.window_size / float(r.model_hz),
                         "stride_s": r.stride / float(r.model_hz),
