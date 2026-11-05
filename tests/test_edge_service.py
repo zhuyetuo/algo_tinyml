@@ -1486,3 +1486,77 @@ def test_infer_samples_rejects_mismatched_lengths(runner, tmp_path):
     h = _handler(runner, tmp_path)
     r = h._samples({"t_ms": [1, 2, 3], "acc": [[0, 0, 1]] * 2, "hz": HZ})
     assert "长度" in r["error"]
+
+
+def test_infer_samples_diagnose_compares_c_features_with_python(tmp_path):
+    """诊断：同一批窗口，C 特征 + C 森林 / Python 特征 + sklearn / C 特征 + sklearn 三个一起比。
+    用一个真的 sklearn 森林导成 C，两边应该基本一致；输出要带结论和差得最多的几维"""
+    import joblib
+    import edge_service
+    import serve
+    from sklearn.ensemble import RandomForestClassifier
+    from tinyml.export_features_c import export as export_feat_cfg
+    from tinyml.export_forest_c import export as export_forest
+    from tinyml.forest import from_sklearn
+
+    edge_service.add_imu_train(IMU_TRAIN)
+    from features import extract_features
+
+    rng = np.random.default_rng(11)
+    # 两类：安静（小噪声）/ 动（大幅正弦），窗口 [N, T, C]
+    quiet = rng.normal(0, 0.02, (80, N_T, N_CH))
+    t = np.arange(N_T) / HZ
+    busy = rng.normal(0, 0.3, (80, N_T, N_CH)) + np.sin(2 * np.pi * 3 * t)[None, :, None]
+    X = np.concatenate([quiet, busy]).astype(np.float32)
+    y = np.array([0] * 80 + [1] * 80)
+    sk = RandomForestClassifier(n_estimators=8, max_depth=5, random_state=0).fit(
+        extract_features(X, HZ, show_progress=False), y)
+    mp = tmp_path / "ml_rf.pkl"
+    joblib.dump(sk, mp)
+
+    classes = ["睡觉", "活动"]
+    gen = tmp_path / "gen"
+    gen.mkdir()
+    files = export_forest(from_sklearn(sk, class_names=classes))
+    files.update(export_feat_cfg(N_T, N_CH, N_T, float(HZ)))
+    for name, content in files.items():
+        (gen / name).write_text(content, encoding="utf-8")
+    eng = serve.RfEngine(serve.build_rf(str(gen), out_so=str(gen / "rf.so")))
+    meta = {"classes": classes, "window_size": N_T, "hz": HZ, "stride": N_T // 2, "n_channels": N_CH,
+            "gravity_aligned": True, "label_mode": "majority", "train": {"job_id": 1, "model_path": str(mp)}}
+    r = edge_service.EdgeRunner("train1", eng, meta, IMU_TRAIN, kind="rf")
+
+    h = edge_service.Handler.__new__(edge_service.Handler)
+    h.runners, h.default_tag, h.nas_root = {"train1": r}, "train1", str(tmp_path)
+    n = HZ * 40
+    t_ms = [1_793_000_000_000 + int(i * 1000 / HZ) for i in range(n)]
+    acc = (rng.normal(0, 0.02, (n, 3)) + [0, 0, 1]).tolist()
+    gyro = rng.normal(0, 1, (n, 3)).tolist()
+    res = h._samples({"t_ms": t_ms, "acc": acc, "gyro": gyro, "hz": HZ, "mode": "raw", "diagnose": True})
+    assert "error" not in res, res
+    d = res["diagnose"]
+    assert "error" not in d, d
+    assert d["n"] == res["n_windows"] > 10
+    assert d["edge_vs_sk"] >= 0.9 and d["skC_vs_edge"] >= 0.9, d
+    assert d["verdict"] and len(d["top"]) > 0 and {"name", "c", "py", "z"} <= set(d["top"][0])
+
+
+def test_device_rate_close_to_model_rate_is_not_resampled(runner, tmp_path):
+    """设备 31.25 / 模型 31.25 这种：按模型的来、不重采样（板子和服务端都不重采样）。
+    以前一律取整成 31 再重采样回 31.25，平白多一道滤波"""
+    h = _handler(runner, tmp_path)
+    seen = {}
+    real = runner.infer
+
+    def spy(path, device_hz, *a, **k):
+        seen["hz"] = device_hz
+        return real(path, device_hz, *a, **k)
+
+    runner.infer = spy
+    try:
+        n = HZ * 20
+        t_ms = [1_793_000_000_000 + int(i * 1000 / HZ) for i in range(n)]
+        h._samples({"t_ms": t_ms, "acc": [[0, 0, 1]] * n, "hz": HZ * 1.01, "mode": "raw"})
+    finally:
+        runner.infer = real
+    assert seen["hz"] == runner.model_hz
