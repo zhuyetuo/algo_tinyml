@@ -45,9 +45,11 @@ RUNTIME = {
     "rf": ["tm_imu.c", "tm_features.c", "tm_forest_c.c", "tm_window.c", "tm_post.c", "tm_post_cfg.c"],
     "cnn": ["tm_imu.c", "tm_prep.c", "tm_runtime.c", "tm_window.c", "tm_post.c", "tm_post_cfg.c"],
 }
-MODEL_FILES = {"rf": ["tm_forest_c_model.c"], "cnn": ["tm_model.c"]}
-TABLE_FILES = {"rf": ["tm_feat_cfg.c"], "cnn": []}
-GOLDEN_HEADERS = {"rf": ["tm_forest_c_golden.h", "tm_forest_c_pipeline_golden.h"], "cnn": ["tm_golden.h"]}
+RUNTIME["gbdt"] = ["tm_imu.c", "tm_features.c", "tm_gbdt_c.c", "tm_window.c", "tm_post.c", "tm_post_cfg.c"]
+MODEL_FILES = {"rf": ["tm_forest_c_model.c"], "cnn": ["tm_model.c"], "gbdt": ["tm_gbdt_c_model.c"]}
+TABLE_FILES = {"rf": ["tm_feat_cfg.c"], "cnn": [], "gbdt": ["tm_feat_cfg.c"]}
+GOLDEN_HEADERS = {"rf": ["tm_forest_c_golden.h", "tm_forest_c_pipeline_golden.h"], "cnn": ["tm_golden.h"],
+                  "gbdt": ["tm_gbdt_c_golden.h", "tm_gbdt_c_pipeline_golden.h"]}
 
 
 def as_hz(v):
@@ -104,6 +106,7 @@ def _compile_all(files: list[str], include: list[str], defines: dict, arm: bool,
 ROOTS = {
     "rf": ["tm_features", "tm_forest_c_predict", "tm_window_push", "tm_post_on_window"],
     "cnn": ["tm_prep", "tm_invoke", "tm_window_push", "tm_post_on_window"],
+    "gbdt": ["tm_features", "tm_gbdt_c_predict", "tm_window_push", "tm_post_on_window"],
 }
 
 
@@ -239,7 +242,7 @@ def measure(gen_dir: str, kind: str, window: int, n_ch: int, n_classes: int,
             accel["agree_with_plain"] = extra["cmsis_agree"]
 
     infer: dict = {}
-    if kind == "rf":
+    if kind in ("rf", "gbdt"):
         n_sensor = n_ch - 2 if n_ch % 3 == 2 else n_ch
         ffts = n_sensor + (2 if n_ch >= 6 else 0)
         infer = {
@@ -288,6 +291,8 @@ def measure(gen_dir: str, kind: str, window: int, n_ch: int, n_classes: int,
 def _export_supports_cmsis(gen_dir: str, kind: str) -> bool:
     """cnn 的 CMSIS 路要导出脚本给的第二套权重排法（tm_model.c 里有 #if TM_CMSIS_NN）；
     老导出没有，开了开关会算错——那就不报这条，让人重导。rf 不需要导出配合。"""
+    if kind == "gbdt":
+        return False        # GBDT 这条还没接 CMSIS（特征那段可以跟 rf 一样换，后面再说）
     if kind != "cnn":
         return True
     p = os.path.join(gen_dir, "tm_model.c")

@@ -327,6 +327,8 @@ def export(model_pkl: str, tag: str, processed_dir: str, remap: str | None,
 
     bundle = joblib.load(model_pkl)
     model = bundle.get("model", bundle) if isinstance(bundle, dict) else bundle
+    if hasattr(model, "get_booster"):
+        return export_gbdt(model, model_pkl, meta, tag, processed_dir, remap, imu_train, out, local_json)
     forest = from_sklearn(model, class_names=classes)
     want = n_features(n_ch)
     if forest.n_features != want:
@@ -423,6 +425,109 @@ def export(model_pkl: str, tag: str, processed_dir: str, remap: str | None,
               "edge": edge}
     print(f"已登记到 {local_json}；端侧服务 reload 之后平台上就能选「edge:{tag}」")
     return result
+
+
+def export_gbdt(model, model_pkl: str, meta: dict, tag: str, processed_dir: str, remap: str | None,
+                imu_train: str, out: str | None = None, local_json: str = LOCAL_JSON) -> dict:
+    """XGBoost（imu_train train_v2 model=xgb 训的）→ GBDT 紧凑编码 C（6 B/节点）+ 特征配置表
+    + 两份 golden → 用编出来的 C 在留出集上算端侧 F1 → 登记成 kind=gbdt。跟 RF 那条一个套路。"""
+    import serve
+    from tinyml.export_features_c import export as export_feat_cfg
+    from tinyml.export_gbdt_compact_c import export as export_compact, pipeline_golden
+    from tinyml.features import extract_one, n_features
+    from tinyml.gbdt import from_xgboost
+    from tinyml.gbdt_compact import CompactBooster
+
+    classes = list(meta["classes"])
+    window = int(meta["window_size"])
+    hz = as_hz(meta["hz"])
+    n_ch = int(meta.get("n_channels") or 8)
+    nps = nperseg_for(window)
+    b = from_xgboost(model, class_names=classes)
+    if b.n_classes != len(classes):
+        raise SystemExit(f"模型是 {b.n_classes} 类，ml_xgb.json 里是 {len(classes)} 类 {classes}")
+    want = n_features(n_ch)
+    if b.n_features != want:
+        raise SystemExit(f"模型要 {b.n_features} 维特征，但 {n_ch} 通道的端侧特征是 {want} 维")
+    cb = CompactBooster(b)
+    flash = int(sum(cb.flash_bytes().values()))
+    rounds = cb.n_trees // max(cb.n_classes, 1)
+
+    X, y, hold_classes, split = _load_holdout(imu_train, processed_dir, hz, remap)
+    if X.shape[1] != window and X.shape[2] == window:
+        X = X.transpose(0, 2, 1)
+    if X.shape[1:] != (window, n_ch):
+        raise SystemExit(f"留出集窗口是 {X.shape[1:]}，模型要 ({window}, {n_ch})")
+    if hold_classes != classes:
+        if set(hold_classes) != set(classes):
+            raise SystemExit(f"留出集类别 {hold_classes} 跟模型类别 {classes} 对不上")
+        y = np.array([classes.index(c) for c in hold_classes])[y]
+    print(f"模型 {os.path.relpath(model_pkl, os.path.expanduser('~'))}：{n_ch} 通道 × {window} 点 @{hz}Hz，"
+          f"{len(classes)} 类，GBDT {cb.n_trees} 棵树（{rounds} 轮）{cb.n_nodes} 节点；留出集 {len(y)} 窗（{split}）")
+    print(f"紧凑编码 {flash:,} B（{flash / 1024:.1f} KB）")
+
+    rng = np.random.default_rng(0)
+    picked, seen = [], {}
+    for i in rng.permutation(len(X)):
+        c = int(y[i])
+        if seen.get(c, 0) < 8:
+            picked.append(i)
+            seen[c] = seen.get(c, 0) + 1
+        if len(picked) >= 32:
+            break
+    gold_w = X[picked]
+    gold_f = np.stack([extract_one(w, hz, nps) for w in gold_w])
+    files = dict(export_compact(cb, golden_x=gold_f))
+    files["tm_gbdt_c_pipeline_golden.h"] = pipeline_golden(cb, gold_w[:16], hz, nps)
+    files.update(export_feat_cfg(window, n_ch, nps, float(hz)))
+    out = os.path.abspath(out or gen_dir_for(tag))
+    os.makedirs(out, exist_ok=True)
+    for name, content in files.items():
+        with open(os.path.join(out, name), "w", encoding="utf-8") as f:
+            f.write(content)
+
+    eng = serve.RfEngine(serve.build_gbdt(out))
+    for name, n, bad in eng.selftest():
+        if bad != 0:
+            raise SystemExit(f"导出后的自检没过：{name} {bad}（共 {n} 条）")
+    pred = np.empty(len(X), np.int64)
+    for i in range(0, len(X), 512):
+        cls_i, _ = eng.infer(np.ascontiguousarray(X[i:i + 512].transpose(0, 2, 1)))
+        pred[i:i + 512] = cls_i
+    edge = per_class_report(y, pred, classes)
+    edge["flash_bytes"] = flash
+    edge["split"] = split
+    try:
+        from features import extract_features as _imu_feats  # imu_train src/ml
+        sk_pred = model.predict(_imu_feats(X, hz, show_progress=False))
+        edge["agree_with_sklearn"] = round(float(np.mean(sk_pred == pred)), 4)
+    except Exception as e:  # noqa: BLE001
+        print(f"（跟 xgboost 对判决这步跳过：{e}）")
+    print(f"端侧 F1（板上那份 C 在 {split} 上）：macro {edge['macro_f1']}，准确率 {edge['accuracy']}"
+          + (f"，跟 xgboost 判决一致 {edge['agree_with_sklearn']:.1%}" if "agree_with_sklearn" in edge else ""))
+    for c, m in edge["per_class"].items():
+        print(f"  {c:<12} P {m['precision']:.2f}  R {m['recall']:.2f}  F1 {m['f1-score']:.2f}  (n={m['support']})")
+    try:
+        from footprint import bench_host, measure
+        Xb = np.ascontiguousarray(X[:256].transpose(0, 2, 1))
+        edge["footprint"] = measure(out, "gbdt", window, n_ch, len(classes), {
+            "trees": cb.n_trees, "depth": int((meta.get("xgb") or {}).get("max_depth") or 6), "nodes": int(cb.n_nodes),
+            "host_us_per_window": bench_host(lambda w: eng.infer(w), Xb)})
+        fp = edge["footprint"]
+        print(f"板上占用（{fp['toolchain']}）：flash {fp['flash']['total_without_golden'] / 1024:.1f} KB"
+              f"（模型 {fp['flash']['model'] / 1024:.1f} + 代码 {fp['flash']['runtime'] / 1024:.1f}），"
+              f"RAM {fp['ram']['total_without_post'] / 1024:.1f} KB")
+    except Exception as e:  # noqa: BLE001
+        print(f"（板上占用这步跳过：{e}）")
+    meta_out = _job_meta(tag, model_pkl, meta, n_ch, {"kind": "gbdt"})
+    meta_out["edge"] = edge
+    meta_path = os.path.join(out, "meta.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta_out, f, ensure_ascii=False, indent=2)
+    register_local(tag, out, meta_path, local_json, kind="gbdt")
+    print(f"已登记到 {local_json}；端侧服务 reload 之后平台上就能选「edge:{tag}」")
+    return {"tag": tag, "spec": f"edge:{tag}", "gen": out, "meta": meta_path, "kind": "gbdt",
+            "n_channels": n_ch, "window": window, "hz": hz, "classes": classes, "edge": edge}
 
 
 def remove(tag: str, local_json: str = LOCAL_JSON) -> dict:

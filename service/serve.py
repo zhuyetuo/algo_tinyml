@@ -95,6 +95,43 @@ def build(gen_dir, out_so=None, cc="gcc", use_cmsis=False):
     return out_so
 
 
+def _feat_defines(gen_dir):
+    """tm_features 的静态缓冲按 TM_FEAT_MAX_T（默认 64 点）开。窗口比这长（20Hz × 4s = 80 点）
+    的话 tm_features 直接返回错误——编的时候按导出的窗口长度把上限抬上去。板上固件同理，
+    要带同样的 -D（GR5515 的 256KB RAM 里多几百字节不是问题）。"""
+    import re
+    p = os.path.join(gen_dir, "tm_feat_cfg.h")
+    n_t = 0
+    if os.path.exists(p):
+        m = re.search(r"#define\s+TM_FEAT_N_T\s+(\d+)", open(p, encoding="utf-8").read())
+        n_t = int(m.group(1)) if m else 0
+    if n_t <= 64:
+        return []
+    return [f"-DTM_FEAT_MAX_T={n_t}"]
+
+
+def build_gbdt(gen_dir, out_so=None, cc="gcc"):
+    """编 GBDT（XGBoost 紧凑编码）那条路线的 .so。符号跟 RF 那条一样，用 RfEngine 包"""
+    gen_dir = os.path.abspath(os.path.expanduser(gen_dir))
+    need = ["tm_gbdt_c_model.c", "tm_gbdt_c_model.h", "tm_feat_cfg.c", "tm_feat_cfg.h"]
+    missing = [f for f in need if not os.path.exists(os.path.join(gen_dir, f))]
+    if missing:
+        sys.exit(f"{gen_dir} 里缺 {missing}。\n  先跑 export_train.py（XGBoost 模型）生成。")
+    out_so = out_so or os.path.join(tempfile.mkdtemp(), "tm_host_gbdt.so")
+    cmd = [cc, "-O2", "-std=c99", "-Wall", "-Wextra", "-Werror",
+           "-ffp-contract=off", "-fno-math-errno", "-fPIC", "-shared", *_feat_defines(gen_dir),
+           f"-I{FW}", f"-I{gen_dir}",
+           os.path.join(FW, "tm_features.c"), os.path.join(FW, "tm_gbdt_c.c"),
+           os.path.join(gen_dir, "tm_gbdt_c_model.c"),
+           os.path.join(gen_dir, "tm_feat_cfg.c"),
+           os.path.join(ROOT, "host", "tm_host_gbdtc.c"),
+           "-Wl,--gc-sections", "-lm", "-o", out_so]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"编译失败：\n{r.stderr}")
+    return out_so
+
+
 def build_rf(gen_dir, out_so=None, cc="gcc", use_cmsis=False):
     """编 RF 那条路线的 .so。紧凑编码和老 SoA 编码**自动识别**。
 
@@ -126,7 +163,7 @@ def build_rf(gen_dir, out_so=None, cc="gcc", use_cmsis=False):
     out_so = out_so or os.path.join(tempfile.mkdtemp(), "tm_host_rf.so")
     cflags, csrcs = _cmsis_args("rf", use_cmsis)
     cmd = [cc, "-O2", "-std=c99", "-Wall", "-Wextra", "-Werror",
-           "-ffp-contract=off", "-fno-math-errno", "-fPIC", "-shared", *cflags,
+           "-ffp-contract=off", "-fno-math-errno", "-fPIC", "-shared", *cflags, *_feat_defines(gen_dir),
            f"-I{FW}", f"-I{gen_dir}",
            os.path.join(FW, "tm_features.c"), os.path.join(FW, runtime),
            os.path.join(gen_dir, model_c),

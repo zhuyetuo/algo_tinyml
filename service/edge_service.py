@@ -770,9 +770,9 @@ def load_models_config(path, local=None):
         # （acc_only_rf 就是）会被猜成 C 那条 rf 路线，然后报"找不到
         # tm_forest_model.c"——而那个错误跟"忘了写 kind"看不出关系
         kind = str(m.get("kind") or ("rf" if "rf" in tag.lower() else "cnn"))
-        if kind not in ("cnn", "rf", "sk"):
+        if kind not in ("cnn", "rf", "sk", "gbdt"):
             sys.exit(f"{path} 里模型 {tag} 的 kind={kind!r} 不认识，"
-                     "只有 cnn / rf / sk")
+                     "只有 cnn / rf / gbdt / sk")
         # optional：文件不在就跳过这个模型，别让服务起不来。
         # 只给实验模型用——**默认是 False**，正式模型路径写错了必须当场报错，
         # 不然的话平台上少一个模型，而没有任何人会注意到
@@ -797,7 +797,8 @@ def build_runner(spec, imu_train, resample, quiet=False):
     # 两条路线的元数据字段不同：CNN 要 ch_mean/ch_std（tm_prep 用），
     # RF 不做归一化所以没有那两项。按路线读，别用同一套必填项
     # sk 的 meta 就是 imu_train 的 ml_*.json，跟 C 那条 rf 路线同一份格式
-    meta = load_meta(spec["meta"], kind="rf" if kind == "sk" else kind)
+    # gbdt 的 meta 跟 rf 同一种格式（imu_train 的 ml_*.json + 导出那几节）
+    meta = load_meta(spec["meta"], kind="rf" if kind in ("sk", "gbdt") else kind)
     if kind == "sk":
         from tinyml import sk_model
         # feature_select 是训练时存进 ml_*.json 的（acc3 那条路会存）。
@@ -815,9 +816,10 @@ def build_runner(spec, imu_train, resample, quiet=False):
         # 不说的话，启动日志里它跟验过的模型长得一样
         say(f"    {'逐位自检':<18} — 这条跑的是服务器上的 sklearn，"
               "没有 C 可对，导出成 C 之后才谈得上逐位一致")
-    elif kind == "rf":
-        eng = serve.RfEngine(serve.build_rf(spec["gen"]))
-        say(f"  {tag:<16} [RF] {eng.n_ch}×{eng.n_t}，{eng.n_classes} 类，"
+    elif kind in ("rf", "gbdt"):
+        # GBDT 那份 .so 导出的符号跟 RF 一模一样，同一个 RfEngine 包
+        eng = serve.RfEngine(serve.build_gbdt(spec["gen"]) if kind == "gbdt" else serve.build_rf(spec["gen"]))
+        say(f"  {tag:<16} [{'GBDT' if kind == 'gbdt' else 'RF'}] {eng.n_ch}×{eng.n_t}，{eng.n_classes} 类，"
               f"{eng.n_features} 维特征（在 C 里算）")
         fatal = False
         for name, n, bad in eng.selftest():

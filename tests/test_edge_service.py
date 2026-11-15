@@ -1169,7 +1169,7 @@ def test_unknown_kind_is_refused(tmp_path):
     (tmp_path / "m.json").write_text("{}", encoding="utf-8")
     with pytest.raises(SystemExit, match="不认识"):
         edge_service.load_models_config(_cfg(tmp_path, [
-            {"tag": "m1", "kind": "gbdt", "gen": "g", "meta": "m.json"}]))
+            {"tag": "m1", "kind": "gdbt", "gen": "g", "meta": "m.json"}]))
 
 
 def test_config_order_decides_the_default_model(tmp_path):

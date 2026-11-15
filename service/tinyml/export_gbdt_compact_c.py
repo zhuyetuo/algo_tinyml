@@ -83,3 +83,35 @@ def export(c: CompactBooster, golden_x=None, name="tm_gbdt_c_model") -> dict:
             + ", ".join(f32(v) for v in marg.reshape(-1)) + "};\n"
             + "\n#endif\n")
     return files
+
+
+def pipeline_golden(c: CompactBooster, windows, hz, nperseg) -> str:
+    """整条链的 golden：原始窗口 → 193 维特征 → GBDT → **类别**。
+
+    比只验模型（从特征进）多覆盖**特征的排列顺序**——错位不会崩，只会让每个阈值
+    对到别的特征上。比判决而不比 margin：特征那段 Python 参考和 C 末位可能差一点，
+    只要没恰好落在阈值上就走同一条路径；真错位的话判决成片地翻。
+    """
+    from .features import extract_one
+
+    ws = np.asarray(windows, np.float32)
+    if ws.ndim != 3:
+        raise ValueError(f"windows 要 [N, T, C]，给的是 {ws.shape}")
+    feats = np.stack([extract_one(w, hz, nperseg) for w in ws])
+    if feats.shape[1] != c.n_features:
+        raise ValueError(f"算出来 {feats.shape[1]} 维特征，模型要 {c.n_features} 维。"
+                         "通道数或窗口长度跟训练时不一致")
+    cls = [c.predict(f) for f in feats]
+    flat_in = np.stack([w.T.reshape(-1) for w in ws]).reshape(-1)   # 板上是 [n_ch][n_t]
+    n, t_len, n_ch = ws.shape
+
+    def f32(v):
+        return f"{float(np.float32(v)).hex()}f"
+    return (
+        "/* 自动生成。整条链：原始窗口 → 特征 → GBDT → 类别。 */\n"
+        "#ifndef TM_GBDT_C_PIPELINE_GOLDEN_H\n#define TM_GBDT_C_PIPELINE_GOLDEN_H\n\n"
+        "#include <stdint.h>\n\n"
+        f"#define TM_GCP_GOLDEN_N {n}\n#define TM_GCP_N_CH {n_ch}\n#define TM_GCP_N_T {t_len}\n\n"
+        "static const float tm_gbdt_c_pipeline_in[] = {" + ", ".join(f32(v) for v in flat_in) + "};\n"
+        "static const int32_t tm_gbdt_c_pipeline_cls[] = {" + ", ".join(str(int(x)) for x in cls) + "};\n"
+        "\n#endif\n")
