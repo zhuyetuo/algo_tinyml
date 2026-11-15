@@ -130,7 +130,11 @@ static uint32_t ms_at(const tm_post_t *st, long abs_i)
  *
  * 端上是流式的，"下一个窗口的 ts"要么已经在延迟线里，要么还没来。
  * 还没来的时候用 ts + stride_s 顶上——**这跟离线那份的唯一差别**，
- * 而且只影响最后一个窗口的结束时间。 */
+ * 而且只影响最后一个窗口的结束时间。
+ *
+ * imu_train train_v2 训的模型（meta 里 label_mode=segment）：离线那份把整条时间轴往后挪了
+ * (window_s - stride_s)/2（窗口代表的是中间那段，不是起点）。这里不改——**调用方喂进来的
+ * 窗口时间戳加上这个偏移**就一样了（整条轴平移，间隔判断不受影响）。 */
 static uint32_t zone_start(const tm_post_t *st, long abs_i)
 {
     return ms_at(st, abs_i);

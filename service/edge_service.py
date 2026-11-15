@@ -377,7 +377,8 @@ class EdgeRunner:
             # 这里如果用另一套默认值，比出来的差异就分不清是后处理实现不同
             # 还是参数不同了
             return post_board.stabilize(
-                windows, self.classes, targets, window_s, stride_s, params)
+                windows, self.classes, targets, window_s, stride_s, params,
+                label_mode=self.label_mode)
         return ls_post.stabilize(
             windows, self.classes, targets, window_s, stride_s,
             self.label_mode, params, algo=algo)

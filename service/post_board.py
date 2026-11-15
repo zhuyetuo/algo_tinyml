@@ -83,7 +83,7 @@ def _fmt_ts(t: _dt.datetime) -> str:
 
 
 def stabilize(windows, classes, target_labels, window_s, stride_s,
-              params, scratch="抓挠", shake="甩身体"):
+              params, scratch="抓挠", shake="甩身体", label_mode="majority"):
     """跟 postprocess.stabilize 同样的入参和返回结构，但跑的是 tm_post.c。
 
     返回 {label: [{start_ts, end_ts, conf_max, conf_mean, n_windows, spec}]}。
@@ -103,7 +103,12 @@ def stabilize(windows, classes, target_labels, window_s, stride_s,
     # 直接塞 Unix 毫秒会溢出（1.7e12 > 2^32）。溢出之后所有间隔判断都是错的，
     # 而且不报错
     t0 = _parse_ts(windows[0]["ts"])
-    ts = np.array([int((_parse_ts(w["ts"]) - t0).total_seconds() * 1000)
+    # label_mode=segment（imu_train train_v2 的模型）：窗口代表的是中间那段，时间轴整体往后挪
+    # (window_s - stride_s)/2，跟 label_service/postprocess._zones 一致。整条轴平移不改任何
+    # 间隔判断，所以挪起点就够了；**真板子上同理：喂给 tm_post 的窗口时间戳加这个偏移**
+    if label_mode == "segment":
+        t0 = t0 + _dt.timedelta(seconds=(float(window_s) - float(stride_s)) / 2)
+    ts = np.array([int((_parse_ts(w["ts"]) - _parse_ts(windows[0]["ts"])).total_seconds() * 1000)
                    for w in windows], np.uint32)
 
     try:
