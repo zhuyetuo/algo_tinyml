@@ -230,13 +230,18 @@ def export_cnn(model_pt: str, tag: str, processed_dir: str, remap: str | None,
     # 量程按 min/max 定的话抓挠尖峰会把小信号压没，int8 比 float 掉十几个点。
     # 几档分位数都试一遍，用留出集（Python 参考实现，跟 C 逐位一致）挑掉点最少的
     f_pred = np.fromiter((int(np.argmax(net.forward(x))) for x in Xn), dtype=np.int64, count=len(Xn))
+    # 挑量程只在分层抽样的子集上比（每类最多 SWEEP_PER_CLASS 窗）：Python 整数参考是单线程的，
+    # 18 万参数的 CNN × 4 万多窗的留出集要跑半小时以上。最后的端侧 F1 还是编出来的 C 在**整个**留出集上算
+    per_c = max(1, 4000 // len(classes))
+    sw = np.concatenate([rng.choice(np.flatnonzero(y == c), size=min(per_c, int(np.sum(y == c))), replace=False)
+                         for c in range(len(classes)) if np.any(y == c)])
     best = None
     for pct in (100.0, 99.9, 99.5, 99.0):
         q = quantize(net, calib, class_names=classes, percentile=pct)
-        pq = np.concatenate([np.argmax(forward_int_batch(q, np.stack([q.quantize_input(x) for x in Xn[s:s + 512]])), axis=1)
-                             for s in range(0, len(Xn), 512)])
-        f1 = per_class_report(y, pq, classes)["macro_f1"]
-        print(f"  量程分位数 {pct}：int8 macro-F1 {f1:.4f}（跟 float 一致 {np.mean(pq == f_pred):.1%}）")
+        pq = np.concatenate([np.argmax(forward_int_batch(q, np.stack([q.quantize_input(x) for x in Xn[sw][s:s + 512]])), axis=1)
+                             for s in range(0, len(sw), 512)])
+        f1 = per_class_report(y[sw], pq, classes)["macro_f1"]
+        print(f"  量程分位数 {pct}：int8 macro-F1 {f1:.4f}（{len(sw)} 窗抽样；跟 float 一致 {np.mean(pq == f_pred[sw]):.1%}）")
         if best is None or f1 > best[1]:
             best = (pct, f1, q)
     pct, _, qnet = best
