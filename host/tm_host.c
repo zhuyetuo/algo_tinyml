@@ -24,6 +24,15 @@
 #include "tm_model.h"
 #include "tm_golden.h"
 
+/* 动作门（train_v2 训的端侧 CNN 才有，见 core/tm_gate.h）：导出目录里有 tm_gate_cfg.h 就用 */
+#if defined(__has_include)
+#if __has_include("tm_gate_cfg.h")
+#include "tm_gate.h"
+#include "tm_gate_cfg.h"
+#define TM_HAS_GATE 1
+#endif
+#endif
+
 static int8_t g_arena[TM_ARENA_BYTES];
 static int8_t g_xq[TM_N_CH * TM_N_T];
 static int8_t g_out[TM_N_CLASSES];
@@ -50,6 +59,24 @@ int th_infer(const float *win, int8_t *scores)
     if (tm_invoke(&tm_model, g_xq, g_out, g_arena, (int)sizeof g_arena)) {
         return -1;
     }
+#if defined(TM_HAS_GATE)
+    {
+        const int g = tm_motion_gate(win + (size_t)TM_GATE_CH * TM_N_T, TM_N_T, TM_GATE_NOTWORN_G, TM_GATE_STILL_G,
+                                     TM_GATE_NOTWORN_CLS, TM_GATE_STILL_CLS);
+        if (g >= 0) {
+            memset(scores, -128, TM_N_CLASSES);
+            scores[g] = 127;
+            return g;
+        }
+        /* 动起来了：未佩戴 / 静止 不参与 argmax */
+        if (TM_GATE_NOTWORN_CLS >= 0) {
+            g_out[TM_GATE_NOTWORN_CLS] = -128;
+        }
+        if (TM_GATE_STILL_CLS >= 0) {
+            g_out[TM_GATE_STILL_CLS] = -128;
+        }
+    }
+#endif
     memcpy(scores, g_out, TM_N_CLASSES);
     return tm_argmax(g_out, TM_N_CLASSES);
 }

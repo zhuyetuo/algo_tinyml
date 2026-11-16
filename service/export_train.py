@@ -161,6 +161,7 @@ def _cmsis_bench(kind, gen_dir, windows, plain_cls):
     """CMSIS 那条路在 PC 上也编一份，量每窗耗时、顺便看判决跟朴素实现一致多少。
     编不出来（没带 third_party）就跳过，不影响导出。"""
     try:
+        import serve
         from footprint import bench_host
         from tinyml import cmsis
         if not cmsis.available():
@@ -248,6 +249,19 @@ def export_cnn(model_pt: str, tag: str, processed_dir: str, remap: str | None,
 
     picked = [qnet.quantize_input(Xn[i]) for i in rng.choice(len(Xn), size=min(16, len(Xn)), replace=False)]
     files = export_net(qnet, golden_x_i8=np.stack(picked), prep=meta)
+    gate = meta.get("motion_gate")
+    if gate:
+        # 动作门（imu_train train_v2 的端侧 CNN）：参数写进头文件，host / 固件都 include 同一份（core/tm_gate.h）
+        files["tm_gate_cfg.h"] = (
+            "/* 自动生成：动作门参数，来自模型的 dl_cnn_best.json（motion_gate）。见 core/tm_gate.h */\n"
+            "#ifndef TM_GATE_CFG_H\n#define TM_GATE_CFG_H\n"
+            f"#define TM_GATE_CH {int(gate.get('channel', 2))}\n"
+            f"#define TM_GATE_NOTWORN_G {float(gate['notworn_g'])!r}\n"
+            f"#define TM_GATE_STILL_G {float(gate.get('still_g') or 0.0)!r}\n"
+            f"#define TM_GATE_NOTWORN_CLS {int(gate['notworn']) if gate.get('notworn') is not None else -1}\n"
+            f"#define TM_GATE_STILL_CLS {int(gate['still']) if gate.get('still') is not None and gate.get('still_g') else -1}\n"
+            "#endif\n")
+        print(f"  动作门：{gate}")
     out = os.path.abspath(out or gen_dir_for(tag))
     os.makedirs(out, exist_ok=True)
     for name, content in files.items():
