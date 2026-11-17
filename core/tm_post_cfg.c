@@ -34,9 +34,16 @@ int tm_post_cfg_from_names(tm_post_cfg_t *cfg, const char *const *names, int n,
     return (sl >= 0 ? 1 : 0) | (sh >= 0 ? 2 : 0);
 }
 
+/* 手写，不用 strncmp / strlen：编译库版（Keil 目标文件）只能从 newlib 里带很少几个函数 */
 static int starts_with(const char *s, const char *p)
 {
-    return s && strncmp(s, p, strlen(p)) == 0;
+    if (!s) return 0;
+    while (*p) {
+        if (*s != *p) return 0;
+        ++s;
+        ++p;
+    }
+    return 1;
 }
 
 int tm_post_cfg_precise(tm_post_cfg_t *cfg, const char *const *names, int n, float window_s)
