@@ -198,6 +198,30 @@ def _job_meta(tag: str, model_path: str, meta: dict, n_ch: int, extra: dict) -> 
     return out
 
 
+def _gated_argmax(scores: np.ndarray, X_raw: np.ndarray, gate: dict | None) -> np.ndarray:
+    """跟板上 core/tm_gate.h、平台推理同一个动作门：窗口内第 gate.channel 路（|a|）的标准差
+    < notworn_g → 未佩戴，< still_g → 静止，其余窗口在剩下的类别里取最大。
+    X_raw: [N, T, C] 没归一化的窗口。没有门就是普通 argmax。
+
+    为什么评估也要过门：未佩戴 / 静止在板上根本不归 CNN 判（int8 下这两类只差一两个 LSB，CNN 看不见），
+    float 不过门、int8 过门再比，这两类必然对不上——2026-11-17 报的「跟 float 一致 89%」其实是 99%，
+    挑量程那几档也被这部分噪声带着乱跳（50%~89%）。"""
+    s = np.asarray(scores, np.float64).copy()
+    if not gate:
+        return s.argmax(1)
+    mot = np.asarray(X_raw, np.float64)[:, :, int(gate.get("channel", 2))].std(axis=1)
+    nw, st = gate.get("notworn"), gate.get("still") if gate.get("still_g") else None
+    for k in (nw, st):
+        if k is not None and k >= 0:
+            s[:, k] = -np.inf
+    out = s.argmax(1)
+    if st is not None and st >= 0:
+        out[mot < float(gate["still_g"])] = st
+    if nw is not None and nw >= 0:
+        out[mot < float(gate["notworn_g"])] = nw
+    return out
+
+
 def export_cnn(model_pt: str, tag: str, processed_dir: str, remap: str | None,
                imu_train: str, out: str | None = None, local_json: str = LOCAL_JSON) -> dict:
     """1D-CNN：float 权重 → 训练后量化 int8 → 导 C（tm_model.c）→ 用编出来的 C 在留出集上算端侧 F1。
@@ -238,7 +262,8 @@ def export_cnn(model_pt: str, tag: str, processed_dir: str, remap: str | None,
     calib = Xn[np.concatenate(idx)]
     # 量程按 min/max 定的话抓挠尖峰会把小信号压没，int8 比 float 掉十几个点。
     # 几档分位数都试一遍，用留出集（Python 参考实现，跟 C 逐位一致）挑掉点最少的
-    f_pred = np.fromiter((int(np.argmax(net.forward(x))) for x in Xn), dtype=np.int64, count=len(Xn))
+    gate = meta.get("motion_gate")
+    f_pred = _gated_argmax(np.stack([net.forward(x) for x in Xn]), X, gate)
     # 挑量程只在分层抽样的子集上比（每类最多 SWEEP_PER_CLASS 窗）：Python 整数参考是单线程的，
     # 18 万参数的 CNN × 4 万多窗的留出集要跑半小时以上。最后的端侧 F1 还是编出来的 C 在**整个**留出集上算
     per_c = max(1, 4000 // len(classes))
@@ -247,10 +272,11 @@ def export_cnn(model_pt: str, tag: str, processed_dir: str, remap: str | None,
     best = None
     for pct in (100.0, 99.9, 99.5, 99.0):
         q = quantize(net, calib, class_names=classes, percentile=pct)
-        pq = np.concatenate([np.argmax(forward_int_batch(q, np.stack([q.quantize_input(x) for x in Xn[sw][s:s + 512]])), axis=1)
+        sc = np.concatenate([forward_int_batch(q, np.stack([q.quantize_input(x) for x in Xn[sw][s:s + 512]]))
                              for s in range(0, len(sw), 512)])
+        pq = _gated_argmax(sc, X[sw], gate)
         f1 = per_class_report(y[sw], pq, classes)["macro_f1"]
-        print(f"  量程分位数 {pct}：int8 macro-F1 {f1:.4f}（{len(sw)} 窗抽样；跟 float 一致 {np.mean(pq == f_pred[sw]):.1%}）")
+        print(f"  量程分位数 {pct}：int8 macro-F1 {f1:.4f}（{len(sw)} 窗抽样；跟 float 一致 {np.mean(pq == f_pred[sw]):.1%}，都过了动作门）")
         if best is None or f1 > best[1]:
             best = (pct, f1, q)
     pct, _, qnet = best
@@ -296,7 +322,7 @@ def export_cnn(model_pt: str, tag: str, processed_dir: str, remap: str | None,
     edge["agree_with_float"] = round(float(np.mean(f_pred == pred)), 4)
     edge["quant_percentile"] = pct
     print(f"端侧 F1（板上那份 C，int8）：macro {edge['macro_f1']}，准确率 {edge['accuracy']}，"
-          f"跟 float 判决一致 {edge['agree_with_float']:.1%}")
+          f"跟 float 判决一致 {edge['agree_with_float']:.1%}（都过动作门）")
     for c, m in edge["per_class"].items():
         print(f"  {c:<12} P {m['precision']:.2f}  R {m['recall']:.2f}  F1 {m['f1-score']:.2f}  (n={m['support']})")
 
