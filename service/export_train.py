@@ -86,11 +86,20 @@ def per_class_report(y, p, classes) -> dict:
             "n_windows": int(len(y))}
 
 
+def _rel_to(path: str, local_json: str) -> str:
+    base = os.path.dirname(os.path.abspath(local_json))
+    p = os.path.abspath(path)
+    return os.path.relpath(p, base) if p.startswith(base + os.sep) else path
+
+
 def register_local(tag: str, gen: str, meta_path: str, local_json: str = LOCAL_JSON, kind: str = "rf") -> dict:
     """登记/更新 edge_models.local.json 里的一条。同 tag 覆盖。"""
     cfg = _read_local(local_json)
     models = [m for m in cfg.get("models", []) if m.get("tag") != tag]
-    models.append({"tag": tag, "kind": kind, "gen": gen, "meta": meta_path})
+    # 在清单所在目录（仓库根）底下的就记相对路径：宿主机上导、容器里挂（/algo_tinyml）都找得到。
+    # 记绝对路径的话，宿主机上导出来的 /home/... 在容器里不存在，模型就挂不上
+    models.append({"tag": tag, "kind": kind, "gen": _rel_to(gen, local_json),
+                   "meta": _rel_to(meta_path, local_json)})
     cfg["models"] = models
     _write_local(cfg, local_json)
     return cfg
