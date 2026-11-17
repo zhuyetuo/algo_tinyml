@@ -48,7 +48,7 @@ def _build():
     so = os.path.join(tempfile.mkdtemp(prefix="tm_post_"), "tm_post.so")
     cmd = ["gcc", "-O2", "-std=c99", "-Wall", "-Wextra", "-Werror",
            "-ffp-contract=off", "-fno-math-errno", "-fPIC", "-shared",
-           f"-I{CORE}", os.path.join(CORE, "tm_post.c"),
+           f"-I{CORE}", os.path.join(CORE, "tm_post.c"), os.path.join(CORE, "tm_post_cfg.c"),
            os.path.join(HERE, "host_post.c"), "-lm", "-o", so]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:

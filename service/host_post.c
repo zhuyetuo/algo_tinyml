@@ -9,6 +9,31 @@
 #include <string.h>
 
 #include "tm_post.h"
+#include "tm_post_cfg.h"
+
+/* 精准版平移量（测试用）：tm_post_run 会把它们拷进 cfg。默认全 0 = 稳定版 v2 */
+static int g_shift_start[TM_POST_MAX_CLASSES], g_shift_end[TM_POST_MAX_CLASSES];
+
+void host_post_set_shift(const int *start_ms, const int *end_ms, int n)
+{
+    for (int i = 0; i < TM_POST_MAX_CLASSES; ++i) {
+        g_shift_start[i] = (start_ms && i < n) ? start_ms[i] : 0;
+        g_shift_end[i] = (end_ms && i < n) ? end_ms[i] : 0;
+    }
+}
+
+/* tm_post_cfg_precise 按名字填出来的平移量，给测试看 */
+int host_cfg_precise(const char *const *names, int n, float window_s, int *start_ms, int *end_ms)
+{
+    tm_post_cfg_t cfg;
+    tm_post_cfg_default(&cfg, n, -1, -1, window_s, 1.0f);
+    const int k = tm_post_cfg_precise(&cfg, names, n, window_s);
+    for (int i = 0; i < n && i < TM_POST_MAX_CLASSES; ++i) {
+        start_ms[i] = cfg.shift_start_ms[i];
+        end_ms[i] = cfg.shift_end_ms[i];
+    }
+    return k;
+}
 
 /* 一次跑完整条序列，片段写进调用方给的数组。返回片段数，-1 = 配置不合法。
  *
@@ -33,6 +58,10 @@ int tm_post_run(const float *probs, const unsigned int *ts_ms, int n,
     cfg.event_min_windows = event_min_windows;
     cfg.event_min_mean = event_min_mean;
     cfg.event_single_conf = event_single_conf;
+    for (int i = 0; i < TM_POST_MAX_CLASSES; ++i) {
+        cfg.shift_start_ms[i] = g_shift_start[i];
+        cfg.shift_end_ms[i] = g_shift_end[i];
+    }
 
     tm_post_t st;
     tm_post_init(&st, &cfg);

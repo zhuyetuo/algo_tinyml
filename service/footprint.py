@@ -68,7 +68,18 @@ def imu_defines(gen_dir: str) -> dict:
             mode = (json.load(f) or {}).get("channel_mode")
     except (OSError, ValueError):
         mode = None
-    return {"TM_IMU_INVARIANT": 1} if mode == "inv" else {}
+    out = {"TM_IMU_INVARIANT": 1} if mode == "inv" else {}
+    # 精准版起止（板上只做平移）：8 s 窗口、label_mode=segment 的模型才打开，见 core/tm_post_cfg.h。
+    # 只进给设备的包；平台上「板上整条链」那一列（edge_service）不走这里，仍跟稳定版 v2 对拍
+    try:
+        with open(os.path.join(gen_dir, "meta.json"), encoding="utf-8") as f:
+            m = json.load(f) or {}
+        w = float(m.get("window_size") or 0) / float(m.get("hz") or 1)
+        if m.get("label_mode") == "segment" and abs(w - 8.0) <= 0.5:
+            out["TM_POST_PRECISE"] = 1
+    except (OSError, ValueError, TypeError):
+        pass
+    return out
 
 _CTYPE_BYTES = {"int8_t": 1, "uint8_t": 1, "int16_t": 2, "uint16_t": 2, "int32_t": 4, "uint32_t": 4,
                 "float": 4, "int": 4, "double": 8}

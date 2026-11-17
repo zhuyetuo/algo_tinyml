@@ -370,6 +370,25 @@ static void process_chunk(tm_post_t *st, long lo, long hi)
     }
 }
 
+/* 精准版平移（cfg.shift_*，默认 0 = 不动）。挪完不到 0.5 s 的留原片段中间 0.5 s，
+ * 跟 postprocess.precise_boundaries 一样——短片段别被平移收没了 */
+static void apply_shift(const tm_post_cfg_t *c, tm_seg_t *o)
+{
+    if (o->cls < 0 || o->cls >= TM_POST_MAX_CLASSES) return;
+    const int32_t ds = c->shift_start_ms[o->cls], de = c->shift_end_ms[o->cls];
+    if (ds == 0 && de == 0) return;
+    int64_t s = (int64_t)o->start_ms + ds, e = (int64_t)o->end_ms + de;
+    if (e - s < 500) {
+        const int64_t mid = ((int64_t)o->start_ms + (int64_t)o->end_ms) / 2;
+        s = mid - 250;
+        e = mid + 250;
+    }
+    if (s < 0) s = 0;
+    if (e < s) e = s;
+    o->start_ms = (uint32_t)s;
+    o->end_ms = (uint32_t)e;
+}
+
 /* 把绝对序号 i 的窗口吐成片段 */
 static int emit_one(tm_post_t *st, long i, tm_seg_t *out, int max_out, int n_out)
 {
@@ -392,6 +411,7 @@ static int emit_one(tm_post_t *st, long i, tm_seg_t *out, int max_out, int n_out
         out[n_out].n_windows = st->run_n;
         out[n_out].conf_max = st->run_cmax;
         out[n_out].conf_mean = st->run_n ? st->run_csum / (float)st->run_n : 0.0f;
+        apply_shift(&st->cfg, &out[n_out]);
         ++n_out;
     }
     st->run_cls = lab;
@@ -658,6 +678,7 @@ int tm_post_flush(tm_post_t *st, tm_seg_t *out, int max_out)
         out[n_out].n_windows = st->run_n;
         out[n_out].conf_max = st->run_cmax;
         out[n_out].conf_mean = st->run_n ? st->run_csum / (float)st->run_n : 0.0f;
+        apply_shift(&st->cfg, &out[n_out]);
         ++n_out;
         st->run_cls = -1;
     }

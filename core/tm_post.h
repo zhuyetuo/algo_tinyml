@@ -93,6 +93,13 @@ typedef struct {
 
     float window_s;             /* 窗口长度（秒） */
     float stride_s;             /* 步长（秒） */
+
+    /* 精准版起止：吐片段时每一类的起点 / 终点各挪多少毫秒（正 = 往后）。默认全 0 = 跟稳定版 v2 一模一样。
+     * 由 tm_post_cfg_precise() 按类别名填（8 s 窗口的模型：抓挠 +750 / -1700，甩* +500 / -1450），
+     * 跟服务端 label_service/postprocess.py 的「精准版」平移那一步同一组数。服务端还会再按陀螺仪 3–9 Hz
+     * 能量对齐，板上没做（要缓存几分钟的能量包络，内存另算）。 */
+    int32_t shift_start_ms[TM_POST_MAX_CLASSES];
+    int32_t shift_end_ms[TM_POST_MAX_CLASSES];
 } tm_post_cfg_t;
 
 /* 配好 5 类模型的默认参数，值跟 label_service/config.py 的 STABLE_* 一致。
